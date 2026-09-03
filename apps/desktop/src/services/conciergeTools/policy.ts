@@ -1248,19 +1248,18 @@ export function strictestDecision(...decisions: PolicyDecision[]): PolicyDecisio
   return out;
 }
 
-/** Trim + lowercase a slug, rejecting anything that is not exactly `owner/repo`.
- *  GitHub compares slugs case-insensitively, so every comparison in this module lowercases first. */
-function normalizeSlug(slug: string | null | undefined): string | null {
-  if (typeof slug !== "string") return null;
-  // Destructured rather than indexed: under `noUncheckedIndexedAccess` an array read is typed
-  // possibly-undefined, and the `!owner || !repo` guard below narrows both halves in one step.
-  // `...rest` is what rejects `a/b/c` — a three-part path is not a slug, and guessing at one would
-  // point the policy at a repo nobody named.
-  const [owner, repo, ...rest] = slug.trim().toLowerCase().split("/");
-  if (rest.length > 0) return null;
-  if (!owner || !repo) return null;
-  return `${owner}/${repo}`;
-}
+// MOVED TO A LEAF MODULE, RE-EXPORTED HERE so every existing importer is unaffected.
+//
+// `normalizeSlug`, `MERGE_PROTECTED_SLUGS` and `isPinnedMergeProtectedSlug` now live in
+// `./mergeProtected`, which imports NOTHING. They were defined here, and `goalContinuationRunner`
+// importing them created the cycle policy.ts → lifecycle.ts → epicSweepRunner.ts →
+// goalContinuationRunner.ts → policy.ts. `policy.ts` does real work at module-init, so entering
+// that cycle from the `lifecycle` side left its risk tables undefined and killed module init
+// outright. See `./mergeProtected` for the full account.
+export { MERGE_PROTECTED_SLUGS, normalizeSlug, isPinnedMergeProtectedSlug } from "./mergeProtected";
+// Only what this file USES internally — the re-export above already publishes all three, and a
+// value import for a name that is merely re-exported is an unused binding.
+import { normalizeSlug, isPinnedMergeProtectedSlug } from "./mergeProtected";
 
 /** The `owner` half of `owner/repo`, lowercased, or null when there isn't one to read. */
 export function ownerOfSlug(slug: string | null): string | null {
@@ -1274,34 +1273,14 @@ export function ownerOfSlug(slug: string | null): string | null {
  * NULL IS FOREIGN, and that is the fail-closed rule rather than an edge case. "We could not work
  * out which repo this is" and "this is somebody else's repo" get the same answer, because the
  * expensive mistake in both is the same mistake: merging on somebody else's behalf.
+ *
+ * Stays HERE rather than moving to `./mergeProtected` with its neighbours: it reads `ownOrgs`,
+ * which is configuration, and the leaf module is deliberately data-and-parsing only.
  */
 export function isForeignSlug(slug: string | null, ownOrgs: readonly string[]): boolean {
   const owner = ownerOfSlug(slug);
   if (owner === null) return true;
   return !ownOrgs.some((o) => typeof o === "string" && o.trim().toLowerCase() === owner);
-}
-
-/**
- * Repos where Sparkle will NEVER merge on its own authority, whatever any config says.
- *
- * A FLOOR COMPILED INTO THE BUILD, not a default: config can tighten past it and nothing can
- * loosen it. That is what makes the owner's standing rule survive a future change to the global
- * default, a reset config file, or a hand-edit. Declared here rather than imported from the JSON so
- * `policy.ts` needs no build-config change (`resolveJsonModule`, bundler asset handling); the test
- * `policy.pinnedRepos.test.ts` reads `shared/merge-protected-repos.json` FROM DISK and pins this
- * list against it, exactly as `worktree.rs` pins `SPARKLE_DENY_RULES` against
- * `destructive-commands.json`. A slug added on one side and forgotten here fails a test.
- */
-export const MERGE_PROTECTED_SLUGS: readonly string[] = Object.freeze([
-  "plow-pbc/tkmx-client",
-  "plow-pbc/tkmx-server",
-]);
-
-/** Is this slug on the shipped merge-protected list? A null slug is NOT pinned — it cannot name a
- *  pinned repo — and does not need to be: null is foreign, which floors it at `ask` anyway. */
-export function isPinnedMergeProtectedSlug(slug: string | null): boolean {
-  const normalized = normalizeSlug(slug);
-  return normalized !== null && MERGE_PROTECTED_SLUGS.includes(normalized);
 }
 
 /** Per-project context for one call. Supplied by policyBinding; absent in most tests, and its

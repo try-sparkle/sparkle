@@ -75,6 +75,14 @@ import { useSettingsStore } from "../../stores/settingsStore";
 import type { BranchStatus, WorkflowState } from "../branchStatus";
 import type { FeedbackEvidence } from "../../engine/retroEvidence";
 import type { AgentTabStatus } from "../../types";
+import { useBeadsStore } from "../../stores/beadsStore";
+// EPIC-COMPLETE IS THE UNIT FOR STAFFING (bead sparkle-hrzitj, failure 5) — the ledger the retire
+// seam writes to, read back below as the SIDE EFFECT of retiring an epic's bound orchestrator.
+import {
+  epicStaffingRecords,
+  resetEpicStaffingLedger,
+  unstaffedEpicsFromReleases,
+} from "../epicStaffing";
 import { closeAgent, retireAgent } from "./lifecycle";
 import { evaluateToolPolicy, NO_TOOL_POLICY_OVERRIDES } from "./policy";
 import {
@@ -517,5 +525,97 @@ describe("policy", () => {
     // flips to `allow`, the concierge has regained the unattended power to stop work in flight.
     const d = evaluateToolPolicy("close_agent", { overrides: NO_TOOL_POLICY_OVERRIDES });
     expect(d.decision).toBe("ask");
+  });
+});
+
+// ── EPIC-COMPLETE IS THE UNIT FOR STAFFING (bead `sparkle-hrzitj`, failure 5) ────────────────────
+// "Retiring an agent whose single goal was met silently unstaffed epics with 57, 39 and 3 open
+// children. Nothing noticed until the pusher escalated them to the founder as 'Blocked'."
+//
+// Every case asserts the RECORD — the thing whose absence was the bug — and never that the
+// retirement was refused, which it must not be. Note what the first case also pins for free: the
+// row is GONE by the time it reads the ledger, so a reading taken after the teardown could only
+// have answered `not-bound`. The ordering of the call is therefore load-bearing and asserted.
+describe("retire_agent records the epic it leaves unstaffed", () => {
+  /** This project's board: one epic, two open children and one closed. */
+  const seedEpicBoard = (projectId: string): void => {
+    useBeadsStore.setState({
+      byProject: {
+        [projectId]: {
+          beads: [
+            { id: "e1", title: "Ship it", description: "", status: "open", type: "epic", labels: [], parent: null, commentCount: 0 },
+            { id: "e1.1", title: "one", description: "", status: "open", labels: [], parent: "e1", commentCount: 0 },
+            { id: "e1.2", title: "two", description: "", status: "in_progress", labels: [], parent: "e1", commentCount: 0 },
+            { id: "e1.3", title: "three", description: "", status: "closed", labels: [], parent: "e1", commentCount: 0 },
+          ],
+          board: { columns: [] },
+        },
+      },
+    } as never);
+  };
+
+  beforeEach(() => {
+    resetEpicStaffingLedger();
+    useBeadsStore.setState({ byProject: {} } as never);
+  });
+
+  it("THE MEASURED FAILURE: the epic is recorded UNSTAFFED, with its open-child count", async () => {
+    const p = seedProject();
+    const id = seedBuild(p);
+    useProjectStore.getState().setAgentEpicId(p, id, "e1");
+    seedEpicBoard(p);
+
+    const r = await retireAgent(id, { reason: REASON });
+
+    // The retirement still happens — the agent did finish its goal.
+    expect(r.ok).toBe(true);
+    expect(rowExists(p, id)).toBe(false);
+    // …and the epic no longer goes quiet with it. TWO open children, not three.
+    expect(unstaffedEpicsFromReleases()).toEqual({
+      epicIds: ["e1"],
+      couldNotTellEpicIds: [],
+      count: 1,
+    });
+    expect(epicStaffingRecords()[0]?.openChildren).toBe(2);
+    expect(epicStaffingRecords()[0]?.cause).toBe("retired");
+  });
+
+  it("FAILS CLOSED: an unread board records COULD-NOT-TELL rather than nothing", async () => {
+    const p = seedProject();
+    const id = seedBuild(p);
+    useProjectStore.getState().setAgentEpicId(p, id, "e1");
+    // No board seeded — an absent snapshot is not an empty epic.
+
+    const r = await retireAgent(id, { reason: REASON });
+
+    expect(r.ok).toBe(true);
+    expect(unstaffedEpicsFromReleases()).toEqual({
+      epicIds: [],
+      couldNotTellEpicIds: ["e1"],
+      count: 1,
+    });
+  });
+
+  it("A REFUSED retirement records nothing — the agent is still on its epic", async () => {
+    const p = seedProject();
+    const id = seedBuild(p, { cached: CLEAN });
+    useProjectStore.getState().setAgentEpicId(p, id, "e1");
+    seedEpicBoard(p);
+    liveBranchStatus = () => Promise.resolve(DIRTY);
+
+    const r = await retireAgent(id, { reason: REASON });
+
+    expect(r.ok).toBe(false);
+    expect(rowExists(p, id)).toBe(true);
+    expect(unstaffedEpicsFromReleases().count).toBe(0);
+  });
+
+  it("an agent bound to NO epic records nothing", async () => {
+    const p = seedProject();
+    const id = seedBuild(p);
+    seedEpicBoard(p);
+
+    expect((await retireAgent(id, { reason: REASON })).ok).toBe(true);
+    expect(unstaffedEpicsFromReleases().count).toBe(0);
   });
 });

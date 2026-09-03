@@ -71,7 +71,11 @@ import { localAgentCapacity } from "./agentCapacity";
 import { goalStateOf, type AgentGoal } from "../engine/agentGoal";
 import type { AgentTabStatus } from "../types";
 import { epicIndexOf } from "./beads";
+// `staffingAgentsFor` is main's rename of `boundAgentsFor` (sparkle-n2feho.5) — theirs wins, and the
+// body below already calls it with its new signature. The epicStaffing import is this branch's and
+// is additive; the two changes are in the same file for unrelated reasons.
 import { staffingAgentsFor } from "./epicSweepRunner";
+import { mergeUnstaffedEpicCount, unstaffedEpicsFromReleases } from "./epicStaffing";
 import {
   epicOrchestratorLiveness,
   orchestratorLivenessOf,
@@ -571,7 +575,28 @@ function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number | null }
     if (liveness !== false) continue;
     count += 1;
   }
-  return { unstaffedBuildableEpicCount: count };
+  // COMPOSE THE RELEASE-TIME LEDGER IN (roborev 79285, bead sparkle-hrzitj spec F).
+  //
+  // Without this line the ledger `noteEpicRelease` writes is DEAD: `mergeUnstaffedEpicCount` and
+  // `unstaffedEpicsFromReleases` had no production caller at all, so the alarm still evaluated the
+  // board-derived count alone and `0 > 0` stayed silent in exactly the window the ledger exists to
+  // cover — an epic whose orchestrator has just left and whose `in_progress` status or child index
+  // has not been re-read yet. That window is the measured failure: three epics went unstaffed and
+  // nothing noticed until the pusher escalated them to the founder as "Blocked".
+  //
+  // `null` (unreadable board) is preserved by the merge and must be: `improveNudge` carries it on
+  // `boardReadable` and nudges on its own arm, so replacing it with a number here would assert a
+  // board nobody read AND silence the unreadable arm at once. The unhydrated early-return above
+  // stays `null` for the same reason.
+  // SCOPED TO THIS BOARD (roborev 79589). The board count above reads ONE project; the ledger is
+  // fleet-wide. Folding an unscoped ledger count in here told the Improve Sparkle agent to staff
+  // epics in projects it cannot see, and the alarm never self-cleared.
+  return {
+    unstaffedBuildableEpicCount: mergeUnstaffedEpicCount(
+      count,
+      unstaffedEpicsFromReleases(SPARKLE_PROJECT_ID),
+    ),
+  };
 }
 
 /**

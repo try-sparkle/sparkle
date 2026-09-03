@@ -30,7 +30,9 @@ import {
   AWAITING_CLOSE_STATE,
   type AgentGoal,
   type AwaitingCloseEvidence,
+  type MergeAuthorityEvidence,
   goalStateOf,
+  unsatisfiableGoalRemedy,
 } from "./agentGoal";
 // BOTH, and they are two halves of one rule rather than two rules. `agentOriginated` says text
 // SPARKLE authored carries no information about the agent (so a resume is neither a repeated command
@@ -192,12 +194,43 @@ export type NoContinueReason =
    * still unmet — while {@link MAX_CONTINUES_TOTAL} still bounds a genuinely wedged agent once it
    * stops delegating.
    */
-  | "in-motion";
+  | "in-motion"
+  /**
+   * THE GOAL IS MIS-SPECIFIED: SATISFYING IT WOULD REQUIRE AN ACTION THIS AGENT IS FORBIDDEN TO
+   * TAKE — a merge in a repo on the shipped merge-protected list. See
+   * `agentGoal.unsatisfiableGoalRemedy` for the whole argument and bead `sparkle-hrzitj` failure 4
+   * for the fourteen auto-continues this cost.
+   *
+   * ⚠️ NEITHER CONTINUED NOR ESCALATED, and BOTH halves are the requirement rather than a
+   * convenience. Continuing spends allowance on a goal no restart can move; escalating tells a human
+   * "something is blocking it that restarting cannot fix", which is a claim about the AGENT and is
+   * false — nothing is blocking the agent, the goal asks for something no agent may do. That page
+   * sends its reader inside the agent's work, where there is nothing to find.
+   *
+   * ⚠️ DISTINCT FROM `external-wait`, and the distinction is what makes it actionable. `external-wait`
+   * says WAIT — the gate answers by itself and the ladder un-parks. This says nothing will ever
+   * answer: the fix is a human REWRITING the goal, and until they do the row is correctly quiet.
+   * The reason is carried out of this module alongside {@link ContinuationDecision}'s `remedy`,
+   * which is the sentence that says so.
+   */
+  | "goal-misspecified";
 
 export type ContinuationDecision =
   | { action: "continue"; prompt: string; attempt: number }
   | { action: "escalate"; reason: string }
-  | { action: "none"; reason: NoContinueReason };
+  | {
+      action: "none";
+      reason: NoContinueReason;
+      /**
+       * A SENTENCE FOR A HUMAN, present only on the arms where the ladder's own vocabulary cannot
+       * say what to do about it. `not-idle` explains itself; `goal-misspecified` does not — the row
+       * goes quiet and nothing else in the app would ever say why, so the reason token alone would
+       * reproduce the silence this arm exists to end.
+       *
+       * OPTIONAL, so every existing arm and every existing reader is unchanged.
+       */
+      remedy?: string;
+    };
 
 /**
  * AN EXTERNAL GATE THE AGENT'S WORK IS SITTING BEHIND — something neither a restart nor the human
@@ -499,6 +532,17 @@ export interface ContinuationInput {
    * never escalates.
    */
   inMotion?: { since: number | null };
+  /**
+   * Whether this agent's repo is one Sparkle may merge in — see `agentGoal.MergeAuthorityEvidence`.
+   *
+   * OPTIONAL AND FAIL-OPEN, the same direction as `externalWait?` / `awaitingClose?` and the
+   * opposite of {@link cloud}'s fail-closed rule. A caller that never wires it gets today's
+   * behaviour exactly; a caller that wires it but could not resolve the repo passes
+   * `mergeProtectedRepo: undefined`, which is also today's behaviour. Only a POSITIVE reading
+   * classifies, because the gate it feeds STOPS the ladder and a false positive silences a real
+   * stall.
+   */
+  mergeAuthority?: MergeAuthorityEvidence;
 }
 
 /**
@@ -544,6 +588,30 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // the state machine ever grows an arm.
   if (goal === undefined) return { action: "none", reason: "no-goal" };
   const live = goal;
+
+  // ══ THE GOAL ASKS FOR SOMETHING NO AGENT MAY DO (bead `sparkle-hrzitj`, failure 4) ═════════════
+  // "Land PR #91 on main", in a repo on the shipped merge-protected list. Fourteen auto-continues
+  // were spent on that goal before a human was paged with a diagnosis about the agent. Nothing was
+  // wrong with the agent.
+  //
+  // WITH THE GOAL GATES AND AHEAD OF EVERY STATUS GATE, the same placement argument
+  // `goal-awaiting-close` makes above: this is a fact about the GOAL, and falling through to the
+  // status checks would answer a mis-specified row with "it isn't idle" or "the sandbox is paused",
+  // sending whoever reads the reason to look at the wrong thing entirely.
+  //
+  // AHEAD OF THE BOUNDS, which is the requirement rather than a preference. Below them this gate
+  // would be reached only after the streak or the ceiling had already escalated — i.e. after the
+  // whole allowance had been spent and the false page already sent, which is precisely the measured
+  // failure. Here, no continue is issued and no escalation fires: the row is quiet, and the reason
+  // and its remedy say why.
+  //
+  // AFTER `escalated`, deliberately. An escalation is a fact that has already happened and a human
+  // already owns; re-labelling it would destroy the record of what the fleet did. This gate is for
+  // the population still being spent on.
+  const misspecified = unsatisfiableGoalRemedy(live, input.mergeAuthority);
+  if (misspecified !== undefined) {
+    return { action: "none", reason: "goal-misspecified", remedy: misspecified };
+  }
 
   // `idle` OR `unmerged`. Not `waiting`/`approval`/`blocked`/`errored` — those are the red tier,
   // where the agent is genuinely stuck on the human and typing an unrelated "continue" would answer

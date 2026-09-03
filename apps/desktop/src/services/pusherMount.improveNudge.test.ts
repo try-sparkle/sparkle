@@ -16,6 +16,7 @@ vi.mock("../logger", () => ({
 import { buildImproveNudgeDeps } from "./pusherMount";
 import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID, PIPELINE_HEALTH_LABEL } from "./sparkleAgent";
 import { useBeadsStore } from "../stores/beadsStore";
+import { recordEpicStaffing, resetEpicStaffingLedger } from "./epicStaffing";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -49,6 +50,10 @@ beforeEach(() => {
   useBeadsStore.setState({ byProject: {} });
   useRuntimeStore.setState({ status: {}, agentMovement: {} } as never);
   useProjectStore.setState({ selectedProjectId: null, projects: [] } as never);
+  // The release-time ledger is MODULE state shared across this file's tests — its own docblock
+  // names that as the classic order-dependent suite. Without this, a seeded record leaks forward
+  // and every later epic-count assertion in this file reads one higher.
+  resetEpicStaffingLedger();
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -414,6 +419,94 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     useRuntimeStore.setState({ status: {} });
     expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
       unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  // THE RELEASE-TIME LEDGER MUST REACH THE ALARM (roborev 79285, bead sparkle-hrzitj spec F).
+  //
+  // `noteEpicRelease` records an epic the moment its orchestrator leaves — which is EARLIER than the
+  // board can know: the epic's `in_progress` status and child index have not been re-read yet, so
+  // the board-derived count is still 0 and the alarm's `> 0` gate stays silent. That window is the
+  // measured failure (three epics unstaffed, nothing noticed until the pusher escalated them to the
+  // founder as "Blocked"). Before this was wired, `mergeUnstaffedEpicCount` had NO production caller
+  // and the whole ledger was dead outside its own tests.
+  //
+  // Driven through the REAL dep the nudge reads, not the merge helper in isolation — a helper test
+  // is green over an unwired feature, which is precisely how this was missed.
+  it("counts an epic the RELEASE LEDGER knows about even when the board still reads 0", () => {
+    // A board on which nothing is unstaffed: the epic is staffed by a live orchestrator.
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    useRuntimeStore.setState({ status: {} });
+    expect(
+      buildImproveNudgeDeps().unstaffedBuildableEpics(),
+      "precondition: the BOARD alone sees nothing wrong",
+    ).toEqual({ unstaffedBuildableEpicCount: 0 });
+
+    // …and now the release seam records one. The alarm must see it.
+    recordEpicStaffing({
+      epicId: "e2",
+      projectId: SPARKLE_PROJECT_ID,
+      state: "unstaffed",
+      openChildren: 7,
+      releasedAgentId: "orch-2",
+      cause: "goal-met",
+      at: Date.now(),
+      why: "its orchestrator marked its goal met with open children",
+    });
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
+  // ANOTHER PROJECT'S RELEASE MUST NOT RAISE THIS BOARD'S ALARM (roborev 79589).
+  //
+  // `noteEpicRelease` records whichever project the leaving agent belonged to, fleet-wide, while
+  // this count is scoped to the Sparkle board. Folded in unscoped, one release anywhere took the
+  // LOUDEST push here — pre-empting concierge-notify, respin and generic — about an epic the
+  // Improve Sparkle agent cannot see and cannot staff, and it never self-cleared.
+  it("ignores a release recorded for a DIFFERENT project", () => {
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    useRuntimeStore.setState({ status: {} });
+    recordEpicStaffing({
+      epicId: "foreign-epic",
+      projectId: "some-other-project",
+      state: "unstaffed",
+      openChildren: 9,
+      releasedAgentId: "orch-9",
+      cause: "retired",
+      at: Date.now(),
+      why: "a release in a project this board knows nothing about",
+    });
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  // …and an UNREADABLE board still wins, because `improveNudge` carries that on its own arm. A
+  // number here would assert a board nobody read AND silence the unreadable arm at the same time.
+  it("keeps null when the board is unreadable, even with a seeded ledger", () => {
+    // The real key is `byProject`; an unhydrated snapshot is simply no entry for this project.
+    useBeadsStore.setState({ byProject: {} });
+    recordEpicStaffing({
+      epicId: "e3",
+      projectId: SPARKLE_PROJECT_ID,
+      state: "unstaffed",
+      openChildren: 2,
+      releasedAgentId: "orch-3",
+      cause: "retired",
+      at: Date.now(),
+      why: "seeded",
+    });
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: null,
     });
   });
 

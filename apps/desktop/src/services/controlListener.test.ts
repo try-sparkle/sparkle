@@ -302,6 +302,15 @@ import {
 } from "./conciergeReceipts";
 import type { ConciergeToolReply } from "./conciergeTools/registry";
 import { auditLandedClaims } from "@sparkle/core/testing/landedClaim";
+import { __clearRepoSlugCache, __setRepoSlugForTest } from "./conciergeTools/repoSlug";
+// EPIC-COMPLETE IS THE UNIT FOR STAFFING (bead sparkle-hrzitj, failure 5) — the ledger the
+// `set_agent_goal_met` seam writes to, read back below as the SIDE EFFECT of marking a goal met.
+import {
+  epicStaffingRecords,
+  resetEpicStaffingLedger,
+  unstaffedEpicsFromReleases,
+} from "./epicStaffing";
+import { useBeadsStore } from "../stores/beadsStore";
 
 
 
@@ -2054,6 +2063,97 @@ describe("controlListener", () => {
       await flush();
       expect(lastReply()).toMatchObject({ ok: true, goal: { text: "land the retry PR", state: "unmet" } });
       expect(goalOf(callerId)).toMatchObject({ text: "land the retry PR", continues: 0, totalContinues: 0 });
+    });
+
+    // ── EPIC-COMPLETE IS NOT AGENT-GOAL-MET (bead `sparkle-hrzitj`, failure 5) ──────────────────
+    // Retiring an agent whose single goal was met silently unstaffed epics with 57, 39 and 3 open
+    // children. Both cases below assert the SIDE EFFECT the defect was the absence of — a record in
+    // the staffing ledger, which is what the `unstaffed-epic-alarm` nudge composes — and NOT that
+    // the mark itself was refused, which it must never be.
+    describe("the epic the goal-met agent was carrying", () => {
+      /** An epic with two open children and one closed, hydrated as this project's board. */
+      const seedEpicBoard = (): void => {
+        useBeadsStore.setState({
+          byProject: {
+            [projectId]: {
+              beads: [
+                { id: "e1", title: "Ship it", description: "", status: "open", type: "epic", labels: [], parent: null, commentCount: 0 },
+                { id: "e1.1", title: "one", description: "", status: "open", labels: [], parent: "e1", commentCount: 0 },
+                { id: "e1.2", title: "two", description: "", status: "in_progress", labels: [], parent: "e1", commentCount: 0 },
+                { id: "e1.3", title: "three", description: "", status: "closed", labels: [], parent: "e1", commentCount: 0 },
+              ],
+              board: { columns: [] },
+            },
+          },
+        } as never);
+      };
+
+      beforeEach(() => {
+        resetEpicStaffingLedger();
+        useBeadsStore.setState({ byProject: {} } as never);
+      });
+
+      it("RECORDS IT UNSTAFFED, with the open-child count, and still marks the goal met", async () => {
+        useProjectStore.getState().setAgentGoal(projectId, callerId, "decompose the epic");
+        useProjectStore.getState().setAgentEpicId(projectId, callerId, "e1");
+        seedEpicBoard();
+
+        fire({ reqId: "sgE1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+
+        // NOT REFUSED. The agent genuinely finished its goal; the defect was that nothing noticed
+        // the EPIC had not. Blocking the mark would trade a silent epic for a stuck agent.
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        expect(goalOf(callerId)?.metAt).toEqual(expect.any(Number));
+
+        // THE SIDE EFFECT: the epic is on the record as unstaffed, with the count that makes it
+        // actionable. TWO open children, not three — the closed one is finished work.
+        expect(unstaffedEpicsFromReleases()).toEqual({
+          epicIds: ["e1"],
+          couldNotTellEpicIds: [],
+          count: 1,
+        });
+        expect(epicStaffingRecords()[0]?.openChildren).toBe(2);
+      });
+
+      it("FAILS CLOSED: an unread board records COULD-NOT-TELL rather than saying nothing", async () => {
+        useProjectStore.getState().setAgentGoal(projectId, callerId, "decompose the epic");
+        useProjectStore.getState().setAgentEpicId(projectId, callerId, "e1");
+        // No board seeded — the snapshot is absent, exactly as it is before the first poll lands.
+
+        fire({ reqId: "sgE2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        expect(unstaffedEpicsFromReleases()).toEqual({
+          epicIds: [],
+          couldNotTellEpicIds: ["e1"],
+          count: 1,
+        });
+      });
+
+      it("REOPENING a goal records nothing — an agent going back to work restaffs, it does not release", async () => {
+        useProjectStore.getState().setAgentGoal(projectId, callerId, "decompose the epic");
+        useProjectStore.getState().setAgentEpicId(projectId, callerId, "e1");
+        seedEpicBoard();
+
+        fire({ reqId: "sgE3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: false } });
+        await flush();
+
+        expect(lastReply()).toMatchObject({ ok: true, met: false });
+        expect(unstaffedEpicsFromReleases().count).toBe(0);
+      });
+
+      it("an agent bound to NO epic records nothing at all", async () => {
+        useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+        seedEpicBoard();
+
+        fire({ reqId: "sgE4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        expect(unstaffedEpicsFromReleases().count).toBe(0);
+      });
     });
 
     it("marks the goal met, which is what makes goalStateOf answer 'met'", async () => {
@@ -4623,6 +4723,22 @@ describe("controlListener", () => {
       store.escalateAgentGoal(projectId, id, "three continues, no progress", Date.now());
     };
 
+    // The repo-slug cache is GLOBAL and "/tmp/demo" is this suite's shared project root, so a slug
+    // primed by the mis-specified-goal tests below would change what every later test in this file
+    // resolves. Cleared on both sides rather than only after, so an earlier suite cannot prime it
+    // either.
+    beforeEach(__clearRepoSlugCache);
+    afterEach(__clearRepoSlugCache);
+
+    /** `escalateMachine`, but around a CALLER-CHOSEN goal text — the goal is what is under test in
+     *  the mis-specified cases, and it must be in place BEFORE the escalation, not set after it. */
+    const escalateWithGoal = (id: string, goal: string, spent = 20) => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, id, goal);
+      for (let i = 0; i < spent; i++) store.noteAgentGoalContinue(projectId, id, "stuck");
+      store.escalateAgentGoal(projectId, id, "three continues, no progress", Date.now());
+    };
+
     const clear = (reqId: string, callerAgentId: string, reason = "unblocked the login dialog") =>
       fire({
         reqId,
@@ -4851,6 +4967,60 @@ describe("controlListener", () => {
       expect(reply).toMatchObject({ ok: true, willResume: false, blockedBy: "goal-awaiting-close" });
       // THE HALF THAT USED TO DISAGREE.
       expect(reply.goal?.state).toBe("awaiting_close");
+    });
+
+    // A REMEDY THE READER NEVER SEES IS THE SAME AS NO REMEDY (roborev 78716, bead sparkle-hrzitj).
+    //
+    // `goal-misspecified` is the one `none` arm whose whole purpose is to say WHY, and it is the arm
+    // that fires on the measured failure: "Land PR #91 on main" in a repo only a person may merge,
+    // which burned fourteen auto-continues. The sweep composes a remedy — and the production tick
+    // calls `await sweepGoalContinuations();` and DISCARDS the outcomes, so that copy reaches nobody.
+    // THIS reply is the surface a human actually reads, and it used to drop `decision.remedy` and
+    // hand back the bare token.
+    //
+    // That is a REGRESSION in the direction this bead exists to close, not merely a smaller message:
+    // before the gate existed the row at least reached a human through the streak escalation —
+    // wrongly diagnosed, but audible. With the gate and without the remedy it just goes quiet.
+    // So this asserts the ACTIONABLE STRING is on the wire, not that some field is non-empty.
+    it("hands back the REWRITE remedy, not just the blockedBy token, for a goal no agent may satisfy", async () => {
+      // `plow-pbc/tkmx-client` is on the shipped merge-protected list: Sparkle will never merge
+      // there on its own authority, so this goal is unsatisfiable BY AUTHORITY, not merely hard.
+      __setRepoSlugForTest("/tmp/demo", "plow-pbc/tkmx-client");
+      // `escalateMachine` sets a goal of ITS own, and setting ours afterwards re-arms the goal and
+      // clears the escalation — so the op answers `{ ok: false }` and the assertions below pass
+      // vacuously. Drive the identical escalation around OUR goal text instead.
+      escalateWithGoal(callerId, "Land PR #91 on main");
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+
+      clear("mis", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      const reply = lastReply() as { blockedBy?: string; remedy?: string; willResume?: boolean };
+      expect(reply).toMatchObject({ ok: true, willResume: false, blockedBy: "goal-misspecified" });
+      // THE ACTIONABLE HALF. Asserted on CONTENT: the reader must be told to rewrite the goal and
+      // which repo made it impossible — a truthy-but-empty string would satisfy a bare existence
+      // check while delivering exactly the silence this test exists to prevent.
+      expect(reply.remedy).toMatch(/rewrite/i);
+      expect(reply.remedy).toContain("plow-pbc/tkmx-client");
+    });
+
+    // THE PAIRED CONTROL — without it, a gate that refused EVERY goal would pass the test above.
+    // The identical goal text in a repo Sparkle MAY merge must not be classified mis-specified, and
+    // must carry no rewrite remedy.
+    it("does NOT call the identical goal mis-specified in a repo Sparkle may merge", async () => {
+      __setRepoSlugForTest("/tmp/demo", "drodio/sparkle");
+      escalateWithGoal(callerId, "Land PR #91 on main");
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+
+      clear("mis2", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      const reply = lastReply() as { ok?: boolean; blockedBy?: string; remedy?: string };
+      // `ok: true` FIRST. Without it a refused op ({ ok: false }) satisfies both assertions below
+      // while proving nothing about the gate — the vacuous shape this file keeps catching.
+      expect(reply.ok).toBe(true);
+      expect(reply.blockedBy).not.toBe("goal-misspecified");
+      expect(reply.remedy).toBeUndefined();
     });
 
     // ── THE PREDICTION AND THE SWEEP MUST AGREE (roborev 65440, High) ────────────────────────────

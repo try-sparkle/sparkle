@@ -57,6 +57,12 @@ import {
 } from "./beads";
 import { EPIC_STALL_MS } from "../engine/epicContinuation";
 import { EPIC_BEADS_FRESHNESS_MS } from "./epicSweepRunner";
+// The release-seam ledger this sweep RETRACTS from (bead sparkle-hrzitj, failure 5).
+import {
+  recordEpicStaffing,
+  resetEpicStaffingLedger,
+  unstaffedEpicsFromReleases,
+} from "./epicStaffing";
 import { useBeadsStore, __setBeadsReadStartedAtForTest } from "../stores/beadsStore";
 import { MountRefusedError } from "./sendToBuild";
 import type { AgentTab } from "../types";
@@ -1932,5 +1938,67 @@ describe("sweepEpics measures board age against a LIVE clock", () => {
 
     expect(out.find((x) => x.epicId === "e1")?.action).toBe("restart");
     expect(s.restart).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── THE SWEEP RETRACTS A RELEASE-TIME UNSTAFFED RECORD (bead `sparkle-hrzitj`) ───────────────────
+// The release seam records an epic as unstaffed the moment its orchestrator marks its goal met or
+// is retired. That is a fact about THAT MOMENT, and restating it later as a present-tense claim is
+// failure 2 of the same bead. This loop is the only place that re-reads both halves per epic, so it
+// is where the claim is withdrawn — and every case below asserts the LEDGER, not the sweep's
+// decision, because the decision was already correct while the record went stale.
+describe("sweepEpics retracts a stale unstaffed-epic record", () => {
+  const seedRecord = (epicId = "e1"): void => {
+    resetEpicStaffingLedger();
+    recordEpicStaffing({
+      epicId,
+      projectId: "p1",
+      state: "unstaffed",
+      openChildren: 2,
+      releasedAgentId: "a1",
+      cause: "goal-met",
+      at: NOW - 60_000,
+      why: "test",
+    });
+  };
+  const closedEpic = (): Bead[] => [
+    bead({ id: "e1", title: "Ship the thing", type: "epic", labels: [PROMOTED_LABEL] }),
+    bead({ id: "e1.1", parent: "e1", status: "closed", updatedAt: iso(STALE) }),
+  ];
+
+  it("RETRACTS when an orchestrator is observed on the epic again", async () => {
+    seedRecord();
+    const s = scenario({ alive: () => true });
+    await s.run();
+    expect(unstaffedEpicsFromReleases().count).toBe(0);
+  });
+
+  it("KEEPS it while the epic is still unstaffed with open children", async () => {
+    seedRecord();
+    const s = scenario({ agents: [], alive: () => false });
+    await s.run();
+    expect(unstaffedEpicsFromReleases().count).toBe(1);
+  });
+
+  it("RETRACTS when the epic's children have all closed", async () => {
+    seedRecord();
+    const s = scenario({ beads: closedEpic(), agents: [], alive: () => false });
+    await s.run();
+    expect(unstaffedEpicsFromReleases().count).toBe(0);
+  });
+
+  it("MIRROR: a board that is NOT a current reading retracts NOTHING, even with every child closed", async () => {
+    // The identical fixture as the case above, differing only in the freshness of the reading. An
+    // unread board must never be the evidence that an epic's work is finished — the same direction
+    // `improveNudge.boardReadable` fails in, citing this same bead.
+    seedRecord();
+    const s = scenario({
+      beads: closedEpic(),
+      agents: [],
+      alive: () => false,
+      beadsReadAt: NOW - EPIC_BEADS_FRESHNESS_MS - 60_000,
+    });
+    await s.run();
+    expect(unstaffedEpicsFromReleases().count).toBe(1);
   });
 });

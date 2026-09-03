@@ -108,6 +108,8 @@ import { feedbackEvidenceFor } from "../feedbackEvidenceRead";
 import { recordRetroConciergeOverride } from "../retroReceipts";
 import { recordAgentRetirement } from "../deathRecordWriter";
 import { recordConciergeActionReceipt, nextReceiptId } from "../conciergeReceipts";
+// EPIC-COMPLETE IS THE UNIT FOR STAFFING — see the call in `retireAgent` (bead sparkle-hrzitj).
+import { noteEpicReleaseFromStores } from "../epicSweepRunner";
 import { notifyConcierge } from "../conciergeNotifier";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
 import { recordDispatch } from "../dispatchLedger";
@@ -1939,6 +1941,21 @@ export async function retireAgent(
         `while you're not watching — the record is the only thing that would have told you.`,
     );
   }
+
+  // ── THE EPIC QUESTION, ASKED BEFORE THE ROW IS DESTROYED ────────────────────────────────────────
+  // AGENT-GOAL-MET IS NOT EPIC-COMPLETE (bead `sparkle-hrzitj`, failure 5): retiring an agent whose
+  // single goal was met silently unstaffed epics with 57, 39 and 3 open children, and nothing
+  // noticed until the pusher escalated them to the founder as "Blocked". The staffing unit is the
+  // epic's OPEN CHILDREN, not the retiring agent's goal.
+  //
+  // ⚠️ HERE, NOT AFTER THE TEARDOWN, AND THAT ORDERING IS THE WHOLE THING. The epic binding is a
+  // field on the agent's ROSTER ROW, and `closeBuildAgent` removes that row — asked afterwards this
+  // resolves no agent, answers `not-bound`, and produces exactly the silence it exists to end.
+  //
+  // AFTER the durable record, which is what gates the teardown: past this line the retirement is
+  // committed, so the reading is not a claim about an agent that might still be working. It records
+  // and never refuses — retirement is the founder's call and this is bookkeeping about the epic.
+  noteEpicReleaseFromStores(agentId, "retired");
 
   // ── THE READABLE RECORD ─────────────────────────────────────────────────────────────────────────
   // The durable write above is the one that survives a restart and gates the teardown; this is the

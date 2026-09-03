@@ -371,6 +371,191 @@ export function statusNoteMarker(text: string): string | undefined {
   return m ? m[1] : undefined;
 }
 
+/**
+ * ── THE SECOND FAMILY OF UNSATISFIABLE GOAL: ONE THAT DEMANDS A FORBIDDEN ACTION ────────────────
+ *
+ * {@link STATUS_NOTE_MARKERS} above catches a goal that is unsatisfiable BY CONSTRUCTION — a
+ * tautology no state of the world can make true. This is the OTHER family, and it belongs beside
+ * that one rather than anywhere else: the end state here is perfectly well formed and perfectly
+ * reachable, only not BY THIS AGENT, because reaching it requires an action Sparkle is forbidden to
+ * take on its own authority. Unsatisfiable BY AUTHORITY rather than by construction.
+ *
+ * MEASURED (bead `sparkle-hrzitj`, failure 4). Babysit #69 burned FOURTEEN auto-continues against
+ * "Land PR #91 on main". That repo is on the shipped merge-protected list
+ * (`services/conciergeTools/policy.MERGE_PROTECTED_SLUGS`), where `merge_pr` is floored at `deny` by
+ * a pin compiled into the build that no config can loosen — only a person may merge there. So every
+ * restart re-ran an agent whose goal required the one thing it is not allowed to do, and the ladder
+ * eventually paged a human with "Something is blocking it that restarting cannot fix". That sentence
+ * was TRUE and its diagnosis was WRONG: nothing was blocking the agent. The goal was wrong. An
+ * unreachable goal is a DEFECT, not a stall.
+ *
+ * ⚠️ THIS MODULE STAYS PURE. The repo fact arrives as {@link MergeAuthorityEvidence}, exactly the way
+ * `landed` arrives in {@link AwaitingCloseEvidence} and for the same reason: whether a slug is
+ * merge-protected is a question for `policy.isPinnedMergeProtectedSlug`, over a slug this module has
+ * no way to resolve and must not try to.
+ *
+ * ⚠️ AND THE TWO FAMILIES ARE HANDLED IN OPPOSITE DIRECTIONS, deliberately. A status note is refused
+ * at the WRITE ({@link newGoal} throws) because the text alone proves it can never be satisfied. This
+ * one cannot be: the identical goal text is entirely legitimate in the repo next door, so the defect
+ * is in the PAIR (text, repo) and the repo half is not known at the moment the goal is written — a
+ * project can even be re-pointed afterwards. So this is a READING, taken at decision time, never a
+ * refusal at the write. Throwing here would reject a goal that is correct wherever the agent may
+ * actually merge.
+ */
+
+/**
+ * Verbs-plus-object phrases whose completion REQUIRES A MERGE — "land PR #91 on main", "merge the
+ * pull request", "get it merged into main".
+ *
+ * Matched on word boundaries against the normalized text, the same discipline
+ * {@link STATUS_NOTE_MARKERS} uses. Narrow on purpose: a goal that merely MENTIONS a PR ("open a PR
+ * for the fix", "get PR #91 reviewed") is not asking anyone to merge, and calling it mis-specified
+ * would silence a real stall.
+ *
+ * ⚠️ THIS LIST ALONE CLASSIFIES NOTHING. It is only ever read in conjunction with a POSITIVE reading
+ * that the repo is merge-protected (see {@link unsatisfiableGoalRemedy}), so a merge goal in a repo
+ * Sparkle may merge stays an ordinary goal and keeps today's behaviour exactly.
+ */
+const MERGE_INTENT_MARKERS: readonly string[] = [
+  "merge pr",
+  "merge prs",
+  "merge the pr",
+  "merge this pr",
+  "merge that pr",
+  "merge pull request",
+  "merge the pull request",
+  "merge to main",
+  "merge into main",
+  "merge onto main",
+  "merge to master",
+  "merge into master",
+  "merged to main",
+  "merged into main",
+  "merged onto main",
+  "merged on main",
+  "merged to master",
+  "merged into master",
+  "land pr",
+  "land prs",
+  "land the pr",
+  "land this pr",
+  "land that pr",
+  "land pull request",
+  "land the pull request",
+  "land on main",
+  "land it on main",
+  "land the branch on main",
+  "landed on main",
+  "landed on master",
+];
+
+const MERGE_INTENT_RE = new RegExp(
+  "\\b(" +
+    MERGE_INTENT_MARKERS.map((m) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") +
+    ")\\b",
+  "u",
+);
+
+/**
+ * The shapes the flat phrase list cannot reach, because a PR NUMBER sits between the verb and its
+ * object: "land PR #91 on main" is caught by the list, but "merge #2946" and "get PR #91 merged"
+ * are not — the number breaks the phrase.
+ *
+ * Two alternatives, deliberately kept to one clause each (`[^.;]{0,24}` rather than an unbounded
+ * gap) so a sentence that mentions a PR early and the word "merged" thirty words later about
+ * something else does not join them up.
+ */
+const MERGE_INTENT_NUMBERED_RE =
+  /\b(?:merge|merges|merging|land|lands|landing)\s+(?:the\s+|this\s+|that\s+|its\s+|my\s+|our\s+)?#\d+|\b(?:pr|prs|pull\s+requests?)\b[^.;]{0,24}?\b(?:merged|landed)\b/u;
+
+/**
+ * The offending merge phrase if `text` describes an end state that REQUIRES A MERGE, or `undefined`
+ * if it does not. Pure; the caller decides what to do with a hit.
+ *
+ * Compared against the text lowercased with whitespace collapsed, so casing and spacing cannot
+ * smuggle one past — same normalization as {@link statusNoteMarker}.
+ */
+export function mergeIntentMarker(text: string): string | undefined {
+  const norm = text.trim().toLowerCase().replace(/\s+/g, " ");
+  const phrase = MERGE_INTENT_RE.exec(norm);
+  if (phrase) return phrase[1];
+  const numbered = MERGE_INTENT_NUMBERED_RE.exec(norm);
+  return numbered ? numbered[0] : undefined;
+}
+
+/**
+ * What a caller has RESOLVED about whether this agent's repo is one Sparkle may merge in.
+ *
+ * ⚠️ TRI-STATE, AND THE UNKNOWN ARM IS THE POINT. `mergeProtectedRepo: undefined` means NOBODY COULD
+ * TELL — the slug cache was cold, the root was unknown, the repo is not a GitHub repo we recognise —
+ * and it must leave the goal ORDINARY, i.e. auto-continued and escalated exactly as today.
+ *
+ * That is the opposite of this repo's usual fail-closed rule, and the direction is chosen the same
+ * way {@link AwaitingCloseEvidence} chooses its own: classifying a goal UNSATISFIABLE STOPS the
+ * ladder, so a false positive silences a real stall — an agent that genuinely needed a human sits
+ * quiet forever wearing a label that says nothing is wrong. A false negative costs only the status
+ * quo: the row keeps being resumed, which is what it does today. The expensive direction here is the
+ * confident wrong answer, so only a POSITIVE reading classifies.
+ */
+export interface MergeAuthorityEvidence {
+  /** Is the repo this agent works in on the shipped merge-protected list
+   *  (`policy.isPinnedMergeProtectedSlug`)? `undefined` = nobody could tell. */
+  mergeProtectedRepo: boolean | undefined;
+  /** `owner/repo` for the remedy sentence, or `null` when it could not be resolved. Required-but-
+   *  nullable so forgetting to pass it is a compile error rather than an anonymous message. */
+  repo: string | null;
+}
+
+/**
+ * THE REMEDY IS A REWRITE, AND THE STRING SAYS SO IN THOSE WORDS.
+ *
+ * ⚠️ WHAT THIS SENTENCE MUST NEVER SAY, and it is not a style preference (AGENTS.md, "User-facing
+ * copy is code"): a remedy message is an instruction somebody follows, and it has to be safe under
+ * the SAME condition that produced it. Here that condition is "retrying cannot work", so any
+ * sentence containing "try again", "restart it", "resume it" or "give it another go" prescribes
+ * EXACTLY the loop this classification exists to stop — fourteen auto-continues, then a page. The
+ * words are therefore absent from the string outright rather than hedged, and
+ * `agentGoal.misspecified.test.ts` pins that absence with a NEGATIVE ratchet paired to a POSITIVE
+ * one asserting the rewrite instruction is present, because deleting a lie is not the same fact as
+ * stating the truth: copy trimmed to silence leaves the reader with the same wrong inference.
+ *
+ * It also names WHO may merge instead, because "you cannot" with no "so do this" is the shape people
+ * route around.
+ */
+export const GOAL_REWRITE_INSTRUCTION = "REWRITE THE GOAL";
+
+/**
+ * Is this goal unsatisfiable BY AUTHORITY — and if so, what should the human be told?
+ *
+ * Returns the remedy sentence, or `undefined` for an ordinary goal. BOTH conjuncts are required:
+ *
+ *   1. The goal's text asks for a MERGE ({@link mergeIntentMarker}).
+ *   2. The repo is POSITIVELY known to be merge-protected — `mergeProtectedRepo === true`, the same
+ *      `=== true` discipline `awaitingClose` applies to `landed`. `false` and `undefined` both
+ *      refuse, and absent evidence refuses too. See {@link MergeAuthorityEvidence}.
+ *
+ * Pure, and a READING rather than a write: nothing latches, so a goal that stops qualifying (it is
+ * rewritten, the project is re-pointed, the slug finally resolves to an unprotected repo) falls
+ * straight back to ordinary with no state to unwind.
+ */
+export function unsatisfiableGoalRemedy(
+  goal: AgentGoal | undefined,
+  evidence: MergeAuthorityEvidence | undefined,
+): string | undefined {
+  if (goal === undefined) return undefined;
+  if (evidence?.mergeProtectedRepo !== true) return undefined;
+  const marker = mergeIntentMarker(goal.text);
+  if (marker === undefined) return undefined;
+  const named = evidence.repo ?? "this repo";
+  return (
+    `No agent can satisfy this goal: "${goal.text}" needs a merge in ${named}, which is a ` +
+    `merge-protected repo — Sparkle will never merge there on its own authority, whatever the ` +
+    `settings say, and only a person may. That makes it a mis-specified goal rather than a stalled ` +
+    `agent. ${GOAL_REWRITE_INSTRUCTION} to name an end state this agent can reach by itself — for ` +
+    `example "the PR is open, green and handed to a human to merge" — or hand the merge to a person.`
+  );
+}
+
 /** Build a fresh goal. Counters start at zero; a new goal is never born escalated or met.
  *
  *  THROWS on empty/whitespace text, rather than producing a goal nobody can act on. An empty goal

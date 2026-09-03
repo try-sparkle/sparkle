@@ -19,7 +19,7 @@
 // epic to file a new child under — i.e. file time. So the guidance is computed from counts already
 // in hand, with no extra store read and no extra call. It is ADVISORY: `engine/epicSizeGuidance`
 // returns a sentence, never a verdict, and nothing here may be read as a reason to refuse a create.
-import { childrenOf, isEpic, type Bead } from "../beads";
+import { childrenOf, isEpic, openChildCount, type Bead } from "../beads";
 import { assessEpicForNewChild, type EpicSizeAssessment } from "../../engine/epicSizeGuidance";
 
 /** Words that overlap between ANY two work items and therefore carry no signal. Kept short on
@@ -134,7 +134,12 @@ export function candidateEpics(
       title: bead.title,
       score: Math.min(1, Math.round(score * 1000) / 1000),
       totalChildren: kids.length,
-      openChildren: kids.filter((k) => k.status !== "closed").length,
+      // ONE COUNT OF OPEN CHILDREN, not a second copy of the filter. `beads.openChildCount` is the
+      // resolver's own answer (index-backed, so this costs a map lookup rather than a scan) and it
+      // is what the epic card, the staffing ledger and this refusal all now read — bead
+      // `sparkle-hrzitj`, where the release seam needed exactly this number and the obvious move
+      // was to write a third copy of it.
+      openChildren: openChildCount(beads, bead.id),
       sizeIfFiledHere: assessEpicForNewChild(kids.length),
       overlap: [...strong, ...weak].sort(),
     });

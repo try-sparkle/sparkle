@@ -136,6 +136,8 @@ import { PUBLISH_OPS, PUBLISH_RISK, type PublishOp } from "./conciergeTools/publ
 import type { ConciergeToolDomain } from "./conciergeTools/registry";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
+// EPIC-COMPLETE IS THE UNIT FOR STAFFING — see the call in `handleSetGoalMet` (bead sparkle-hrzitj).
+import { noteEpicReleaseFromStores } from "./epicSweepRunner";
 // The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
 // the roster sweep and the single-agent read cannot disagree about who is stalled.
 import {
@@ -2359,6 +2361,21 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
     };
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);
+  // ── AGENT-GOAL-MET IS NOT EPIC-COMPLETE (bead `sparkle-hrzitj`, failure 5) ──────────────────────
+  // The mark above answers the AGENT question and is right to. The EPIC question — is the WORK
+  // finished? — was asked by nobody here, so an orchestrator marking its single goal met walked away
+  // from epics holding 57, 39 and 3 open children in silence, until the pusher escalated them to the
+  // founder as "Blocked".
+  //
+  // AFTER the mark and NOT gating it: the agent genuinely finished, and refusing a truthful
+  // `set_agent_goal_met` would trade a silent unstaffed epic for a stuck agent. Running after is
+  // also what makes the reading correct — the liveness join reads a QUIET goal as not staffing, so
+  // the epic is judged against the state that now holds.
+  //
+  // Only on `met`. A reopen is an agent going BACK to work, which restaffs rather than releases.
+  // `noteEpicReleaseFromStores` never throws and answers `not-bound` for anything that is not a
+  // build agent carrying an epic, so an unbound agent pays one roster scan and nothing else.
+  if (met) noteEpicReleaseFromStores(targetId, "goal-met");
   return { ok: true, met };
 }
 
@@ -2383,7 +2400,7 @@ function resumeReading(
   projectId: string,
   agent: AgentTab,
   now: number,
-): { willResume: boolean; blockedBy?: NoContinueReason | "would-re-escalate" } {
+): { willResume: boolean; blockedBy?: NoContinueReason | "would-re-escalate"; remedy?: string } {
   const rt = useRuntimeStore.getState();
   const raw = rt.status;
   const openIds = new Set(mergeOpenAgentIds(rt.openAgentIds ?? [], readPersistedOpenAgentIds()));
@@ -2424,7 +2441,25 @@ function resumeReading(
     ...(awaitingClose === undefined ? {} : { awaitingClose }),
   });
   if (decision.action === "continue") return { willResume: true };
-  if (decision.action === "none") return { willResume: false, blockedBy: decision.reason };
+  // THE REMEDY TRAVELS WITH THE REASON, BECAUSE THIS IS THE SURFACE THAT IS READ (roborev 78716).
+  //
+  // `sweepGoalContinuations` returns its outcomes and the production tick discards the array, so the
+  // sweep's `none` detail reaches nobody. THIS reply does reach somebody — it is what the concierge
+  // is handed the moment it sets a goal — and dropping `decision.remedy` here left the one arm whose
+  // whole purpose is to say WHY going out as a bare token.
+  //
+  // That is not merely less helpful, it is a REGRESSION in the direction this bead exists to close:
+  // before the `goal-misspecified` gate existed, "Land PR #91 on main" in a merge-protected repo at
+  // least reached a human through the streak escalation — wrongly diagnosed, but audible. With the
+  // gate and without the remedy the row simply goes quiet and nobody is told why, which is the
+  // silence itself. A remedy the reader never sees is the same as no remedy.
+  if (decision.action === "none") {
+    return {
+      willResume: false,
+      blockedBy: decision.reason,
+      ...(decision.remedy === undefined ? {} : { remedy: decision.remedy }),
+    };
+  }
   // THE `escalate` ARM, and it is reachable after a clear rather than theoretical: `conciergeRearmGoal` hands
   // back `REARM_GRANT` continues off a `totalContinues` that may be far past `MAX_CONTINUES_TOTAL`,
   // so the very next sweep can decide to escalate again. Saying `willResume: true` there would be
@@ -2645,6 +2680,9 @@ function handleSetEscalation(req: ControlRequest): Record<string, unknown> {
     rearmsRemaining: remainingRearmsFor(after?.agent),
     willResume: resume.willResume,
     ...(resume.blockedBy !== undefined ? { blockedBy: resume.blockedBy } : {}),
+    // Beside `blockedBy`, never instead of it: the token says WHICH gate closed, the remedy says
+    // what the human must DO about it, and only the second is actionable for a mis-specified goal.
+    ...(resume.remedy !== undefined ? { remedy: resume.remedy } : {}),
     ...(reading ? { goal: reading } : {}),
   };
 }

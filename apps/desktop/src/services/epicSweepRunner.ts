@@ -36,6 +36,7 @@
 import {
   childrenOf,
   commentBead,
+  openChildCount,
   isAutoRestartOptedOut,
   isEpic,
   isPromotedToBuild,
@@ -89,6 +90,13 @@ import {
   requestDecomposeMessage,
   requestDecomposeNote,
 } from "./epicDecomposeRequest";
+import {
+  clearEpicStaffingRecord,
+  noteEpicRelease,
+  type EpicReleaseCause,
+  type EpicStaffingDeps,
+  type EpicStaffingOutcome,
+} from "./epicStaffing";
 import type { AgentTab } from "../types";
 import { log } from "../logger";
 
@@ -1156,6 +1164,17 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
         now,
         silentMs: orchestratorSilentMs,
       });
+      // ── RETRACT A RELEASE-TIME ALARM THIS EPIC HAS OUTGROWN ───────────────────────────────────
+      // The release seam records an epic as unstaffed the moment its orchestrator leaves; this is
+      // the only loop that re-reads both halves of that claim per epic, so it is where the claim is
+      // withdrawn. Bookkeeping only — it starts nothing, notifies nobody, and is not counted
+      // against MAX_ACTIONS_PER_SWEEP. `beadsObserved` gates the child-count arm: an unread board
+      // must never be the evidence that an epic's work is finished.
+      reconcileEpicStaffingRecord(
+        epic.id,
+        candidate.orchestratorAlive,
+        beadsObserved ? beads : undefined,
+      );
       const decision = decideEpicSweep(candidate, now, stallMs, maxAgeMs, hollowMs);
       const out: EpicSweepOutcome = { ...decision, projectId: project.id, performed: "none" };
 
@@ -1568,4 +1587,90 @@ export function stopEpicSweepRunner(): void {
 /** Test/introspection helper: is the sweep armed? */
 export function isEpicSweepRunnerRunning(): boolean {
   return timer !== null;
+}
+
+// ── THE RELEASE SEAM'S EPIC QUESTION, BOUND TO THE LIVE STORES ──────────────────────────────────
+// `services/epicStaffing` is deliberately store-free and takes `boundAgentsFor` as a dependency, so
+// the ONE definition of "bound to this epic" is shared without a cycle: the edge runs
+// epicSweepRunner -> epicStaffing and never back. The readers below are the same ones `sweepEpics`
+// binds for its own liveness join a few hundred lines above; they are re-derived here rather than
+// hoisted because that function resolves them per-tick against per-call overrides, and hoisting
+// would give the sweep a second configuration surface it does not want.
+
+/** Everything {@link noteEpicRelease} needs, read off the live stores. */
+export function buildEpicStaffingDeps(): EpicStaffingDeps {
+  return {
+    now: Date.now,
+    boundAgents: boundAgentsFor,
+    locate: (agentId) => {
+      for (const p of useProjectStore.getState().projects) {
+        const agent = p.agents.find((a) => a.id === agentId);
+        if (agent) return { agent, agents: p.agents, projectId: p.id };
+      }
+      return undefined;
+    },
+    // `undefined` FOR AN UNHYDRATED BOARD, never `[]`. An empty array would flow into
+    // `openChildCount` as a confident zero — "this epic has no work left" — which is the exact
+    // false absence bead `sparkle-hrzitj` records. See `EpicReleaseReading.openChildren`.
+    beadsFor: (projectId) => useBeadsStore.getState().byProject[projectId]?.beads,
+    aliveFor: (agentId) => {
+      const rt = useRuntimeStore.getState();
+      return processAliveFor(agentId, rt.status, new Set(rt.openAgentIds));
+    },
+    statusFor: (agentId) => useRuntimeStore.getState().status[agentId],
+    attentionFor: (agentId) => useRuntimeStore.getState().observedAttention[agentId]?.verdict,
+    deathRecordedFor: (agentId) => deathCauseForAgent(agentId) !== undefined,
+    lastHookEventFor: (agentId) => useRuntimeStore.getState().agentMovement[agentId]?.lastEventMs,
+  };
+}
+
+/**
+ * ASK THE EPIC QUESTION FOR ONE AGENT THAT IS LEAVING — the entry point the two release seams call.
+ *
+ * ⚠️ CALL IT BEFORE THE TEARDOWN. The epic binding is a field on the agent's ROSTER ROW, so once
+ * `closeBuildAgent` has removed the row there is nothing left to read and the answer silently
+ * degrades to `not-bound` — which is the silence this whole change exists to end.
+ *
+ * Never throws; see `epicStaffing.noteEpicRelease`.
+ */
+export function noteEpicReleaseFromStores(
+  agentId: string,
+  cause: EpicReleaseCause,
+  deps: EpicStaffingDeps = buildEpicStaffingDeps(),
+): EpicStaffingOutcome {
+  return noteEpicRelease(agentId, cause, deps);
+}
+
+/**
+ * RETRACT the release-time alarm for epics that no longer need one.
+ *
+ * A record is a fact about the MOMENT of release. Left standing it becomes a stale reading asserted
+ * as a present-tense fact — failure 2 of the same bead — so the sweep, which already computes both
+ * halves per epic, clears it the moment either becomes untrue:
+ *   • the epic is staffed again (`orchestratorAlive === true`, the sweep's own liveness join), or
+ *   • it has no open children left (`openChildCount`), i.e. the work finished without a successor.
+ *
+ * ⚠️ THE CHILD-COUNT ARM REQUIRES A CURRENT BOARD. A stale or unread snapshot reports every child as
+ * whatever it was hours ago, and clearing an alarm on that would use an unreadable board to prove
+ * the epic is done — the same fail-open the `boardReadable` gate exists to prevent. The staffing arm
+ * has no such gate because it reads the in-memory roster, which cannot be stale here.
+ *
+ * Returns the epic ids it retracted, so the caller can report them rather than clearing silently.
+ */
+export function reconcileEpicStaffingRecord(
+  epicId: string,
+  orchestratorAlive: boolean | null,
+  beads: readonly Bead[] | undefined,
+): boolean {
+  const staffedAgain = orchestratorAlive === true;
+  const workDone = beads !== undefined && openChildCount(beads, epicId) === 0;
+  if (!staffedAgain && !workDone) return false;
+  const cleared = clearEpicStaffingRecord(epicId);
+  if (cleared) {
+    log.info("epics", "retracting the unstaffed-epic record", {
+      epic: epicId,
+      why: staffedAgain ? "an orchestrator is on it again" : "no open children remain",
+    });
+  }
+  return cleared;
 }

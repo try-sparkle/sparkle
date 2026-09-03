@@ -42,7 +42,13 @@ import {
 } from "../engine/goalExpiry";
 import { awaitingCloseEvidenceFor, expiryProofFor } from "./agentGoalReading";
 import type { WorkflowState } from "./branchStatus";
-import { hasUnmetGoal } from "../engine/agentGoal";
+import { hasUnmetGoal, type MergeAuthorityEvidence } from "../engine/agentGoal";
+// THE MERGE FLOOR, READ FROM THE ONE PLACE THAT OWNS IT. `MERGE_PROTECTED_SLUGS` is compiled into
+// the build and pinned against `shared/merge-protected-repos.json` by policy's own test; a second
+// copy of the list here is exactly the drift that file's header forbids. `slugForRoot` is the
+// synchronous, never-throwing cache the tool policy already resolves the same question through.
+import { isPinnedMergeProtectedSlug } from "./conciergeTools/mergeProtected";
+import { slugForRoot } from "./conciergeTools/repoSlug";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
 import { isInMotion } from "../engine/inMotion";
@@ -374,6 +380,26 @@ const suppressedUntil = new Map<string, number>();
  *  `_resetGoalContinuationRunnerForTests` is a TEST seam and was never the production answer. */
 const loggedExpiryRefusal = new Set<string>();
 
+/** ONCE PER AGENT PER REASON, for the `none` arms that carry a REMEDY (roborev 78977).
+ *
+ *  `goal-misspecified` is a function of the goal text and the repo's merge protection, evaluated
+ *  ahead of every status gate, and NOTHING CLEARS IT — the goal stands until a human rewrites it. So
+ *  an ungated log re-emits an identical line every sweep (15s), ~5.7k lines/day/agent, which is
+ *  precisely the wall of repeated noise `isStuckRefusal` above exists to prevent: it trains the
+ *  reader to skip the band, and the band is the surface this remedy was routed to in the first
+ *  place. Same key shape and same prune site as `loggedExpiryRefusal`; see that Set's note for why
+ *  the key carries the REASON and not the agent id alone. */
+const loggedRemedy = new Set<string>();
+
+/** A short, colon-free identity for a goal's text — see `remedyKey`'s note for why the key needs
+ *  one and why it must not contain a colon. Not a hash for security, only for distinguishing one
+ *  goal from the next on the same agent. */
+function goalFingerprint(text: string | undefined): string {
+  let h = 5381;
+  for (let i = 0; i < (text?.length ?? 0); i++) h = ((h << 5) + h + (text as string).charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16);
+}
+
 /**
  * Is this refusal worth telling anyone about?
  *
@@ -411,6 +437,7 @@ function noteExpiryRefusal(agent: AgentTab, reason: NoExpiryReason, now: number)
 export function _resetGoalContinuationRunnerForTests(): void {
   idleClock = new Map();
   loggedExpiryRefusal.clear();
+  loggedRemedy.clear();
   inFlight.clear();
   undelivered.clear();
   suppressedUntil.clear();
@@ -563,6 +590,16 @@ export interface ContinuationEvidence {
    *  Built here so the sweep and `resumeReading` apply the identical park; presence live, age from
    *  the ledger the sweep folds. */
   inMotion: { since: number | null } | undefined;
+  /**
+   * Whether this agent's repo is one Sparkle may merge in — see `agentGoal.MergeAuthorityEvidence`.
+   *
+   * ⚠️ BUILT HERE RATHER THAN AT THE SWEEP'S CALL SITE, and that is the whole reason this field is on
+   * the shared builder. `controlListener.resumeReading` PREDICTS what the sweep will decide and
+   * spreads this object wholesale; wiring the gate into the sweep alone would make the prediction
+   * answer `willResume: true` for an agent the sweep declines as `goal-misspecified` — the exact
+   * drift roborev 65440 (High) recorded for the mark and the external gate. One builder, one answer.
+   */
+  mergeAuthority: MergeAuthorityEvidence | undefined;
 }
 
 /**
@@ -604,7 +641,44 @@ export function continuationEvidenceFor(agent: AgentTab): ContinuationEvidence {
     }),
     externalWait: externalWaitOf(ws, agent.id),
     inMotion: inMotionOf(agent),
+    mergeAuthority: mergeAuthorityFor(agent.id),
   };
+}
+
+/**
+ * Is the repo this agent works in one Sparkle is FORBIDDEN to merge in?
+ *
+ * ⚠️ EVERY UNCERTAINTY RESOLVES TO `undefined`, WHICH MEANS "LEAVE THE GOAL ORDINARY" — the opposite
+ * of this file's usual fail-closed direction, and chosen for the reason
+ * `agentGoal.MergeAuthorityEvidence` sets out: the gate this feeds STOPS the ladder, so a false
+ * positive silences a real stall while a false negative costs only the status quo.
+ *
+ * `slugForRoot` is a CACHE and its `null` is genuinely ambiguous — "we have not resolved this root
+ * yet" and "this root has no GitHub slug we recognise" are the same value at that seam (see its own
+ * header). Both are "could not tell" here, and both are `undefined`. That ambiguity is safe in this
+ * direction and would not be in the other, which is why the positive arm requires a RESOLVED slug.
+ *
+ * READ-ONLY AND SYNCHRONOUS, like everything else this builder touches: no git call, no network, no
+ * prime. The cache is filled at hydrate by the tool-policy binding; a cold one costs a sweep in
+ * which the goal is treated as ordinary, which is what it is treated as today.
+ */
+function mergeAuthorityFor(agentId: string): MergeAuthorityEvidence | undefined {
+  let root: string | null = null;
+  try {
+    for (const project of useProjectStore.getState().projects) {
+      if (project.agents.some((a) => a.id === agentId)) {
+        root = project.rootPath ?? null;
+        break;
+      }
+    }
+  } catch {
+    // An unreadable project store is "we don't know which repo" — ordinary, never unsatisfiable.
+    return undefined;
+  }
+  if (root === null) return undefined;
+  const slug = slugForRoot(root);
+  if (slug === null) return undefined;
+  return { mergeProtectedRepo: isPinnedMergeProtectedSlug(slug), repo: slug };
 }
 
 /**
@@ -1100,6 +1174,18 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
   for (const key of loggedExpiryRefusal) {
     if (!composite.has(key.slice(0, key.lastIndexOf(":")))) loggedExpiryRefusal.delete(key);
   }
+  // …and the remedy ledger. Same PURPOSE as the prune above — without it the bound is every agent
+  // id seen since app start, and a row recreated under the same id is permanently silent for a
+  // remedy it already emitted — but NOT the same key arithmetic, and that difference bit.
+  //
+  // This key has THREE segments (`<agentId>:<reason>:<goalFingerprint>`), so `lastIndexOf(":")`
+  // yields `<agentId>:<reason>`, which is never in `composite`. Every entry was therefore pruned on
+  // every sweep and the line re-logged each tick — the exact flood the ledger exists to prevent,
+  // reintroduced by the fix for roborev 79562 and caught by its own two-sweep test. An agent id is
+  // a UUID and contains no colon, so the id is everything before the FIRST one.
+  for (const key of loggedRemedy) {
+    if (!composite.has(key.slice(0, key.indexOf(":")))) loggedRemedy.delete(key);
+  }
   // …and the tool-burst ledger, where the SAME argument bites HARDER than for either sibling
   // (roborev 65483). What it holds is a LEVEL, not a counter: a row torn down and recreated under
   // the same id would inherit its predecessor's `lastSeen` — say 41 — so the new agent's own
@@ -1175,7 +1261,7 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
       // ONE builder, shared with the prediction surface, so the two cannot drift. Computed ONCE
       // here and passed below rather than re-derived: two reads of the same store can disagree,
       // and the mark that is DECIDED on must be the mark that is RECORDED.
-      const { mark, externalWait, inMotion } = continuationEvidenceFor(agent);
+      const { mark, externalWait, inMotion, mergeAuthority } = continuationEvidenceFor(agent);
 
       // STATED, not inferred — see ContinuationInput.runtime. `AgentTab.runtime` is the store's own
       // record of where the agent runs, and the same field `getTransport` selects a transport by.
@@ -1267,10 +1353,49 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         // `{kind:"human"}` check it could not close itself, so every pass here spent a continue on
         // an agent with nothing left to do until the streak bound escalated it to the founder.
         ...(awaitingClose === undefined ? {} : { awaitingClose }),
+        // WHETHER THE GOAL ASKS FOR A MERGE THIS AGENT MAY NEVER PERFORM. Without this line the
+        // `goal-misspecified` gate is dead code that still typechecks — the same shape
+        // `ContinuationInput.quotaBlock` warns about. This is the sweep that burned fourteen
+        // auto-continues on "Land PR #91 on main" in a merge-protected repo (bead sparkle-hrzitj).
+        ...(mergeAuthority === undefined ? {} : { mergeAuthority }),
       });
 
       if (decision.action === "none") {
-        outcomes.push({ agentId: agent.id, action: "none", detail: decision.reason });
+        // THE REMEDY TRAVELS WITH THE REASON. A mis-specified goal makes the row go quiet, and a
+        // bare reason token would reproduce the silence the classification exists to end — the human
+        // has to be told the goal needs rewriting and why. Every other `none` arm carries no remedy
+        // and is unchanged.
+        const detail =
+          decision.remedy === undefined
+            ? decision.reason
+            : `${decision.reason}: ${decision.remedy}`;
+        // AND LOG IT, because the returned array has no production reader: the tick calls
+        // `await sweepGoalContinuations();` and discards it (roborev 78716). A remedy that exists
+        // only in a value nobody consumes is dead outside the tests that hand-build it. Logged only
+        // when there IS a remedy, so the ordinary `none` arms — which fire on every idle sweep for
+        // every resting agent — do not turn this into a per-tick log flood.
+        if (decision.remedy !== undefined) {
+          // KEYED ON THE GOAL, NOT JUST THE REASON (roborev 79562). `decision.reason` is the
+          // constant token `goal-misspecified` for this entire class, so keying on it alone made
+          // every LATER mis-specified goal on the same agent permanently silent — and the expected
+          // follow-up to this very line is a human doing what it says, REWRITE THE GOAL. If the
+          // second draft still names a merge in a protected repo ("get PR #91 merged", the likeliest
+          // rewrite) the gate fires again, no continue is spent, nothing pages, and the log is
+          // suppressed: the row just goes quiet, which is the silence this was built to end.
+          //
+          // The fingerprint is hex and contains no colon, so the prune's `lastIndexOf(":")` still
+          // resolves the agent id. Keying on the raw remedy would break that — it contains `: "`.
+          const remedyKey = `${agent.id}:${decision.reason}:${goalFingerprint(agent.goal?.text)}`;
+          if (!loggedRemedy.has(remedyKey)) {
+            loggedRemedy.add(remedyKey);
+            log.info("goals", "goal is mis-specified", {
+              agentId: agent.id,
+              reason: decision.reason,
+              remedy: decision.remedy,
+            });
+          }
+        }
+        outcomes.push({ agentId: agent.id, action: "none", detail });
         continue;
       }
 
