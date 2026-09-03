@@ -91,3 +91,70 @@ describe("projectStore.setAgentActivity", () => {
     expect(agent().activityAt).toBeUndefined();
   });
 });
+
+// ── IDENTITY PRESERVATION (perf HIGH) ─────────────────────────────────────────────────────────
+// `set_agent_activity` fires from every one of ~60 live agents. `mapProject` used to `.map(...)`
+// into a FRESH `projects` array on every write, and `setAgentActivity` used to mint a fresh agent
+// object with no equality bail — so a no-op write rebuilt the whole `projects`/`agents` reference
+// graph and woke all 11 whole-`projects` subscribers fleet-wide. These tests assert REFERENCE
+// stability, not just value equality: they are the whole point, and each REDS if the guard in
+// `mapProject`, `mapAgent`, or the `setAgentActivity` writer is removed.
+describe("projectStore.setAgentActivity — reference identity", () => {
+  function seedTwo() {
+    const mk = (id: string, name: string): AgentTab => ({ ...mkAgent(), id, name });
+    const p1: Project = {
+      id: "p1", name: "P1", rootPath: "/tmp/p1", defaultBranch: null,
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [mk("a1", "A1"), mk("a2", "A2")],
+    };
+    const p2: Project = {
+      id: "p2", name: "P2", rootPath: "/tmp/p2", defaultBranch: null,
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [mk("b1", "B1")],
+    };
+    useProjectStore.setState({ projects: [p1, p2] } as never);
+  }
+  beforeEach(seedTwo);
+
+  const projects = () => useProjectStore.getState().projects;
+  const proj = (id: string) => projects().find((p) => p.id === id)!;
+  const agentIn = (pid: string, aid: string) => proj(pid).agents.find((a) => a.id === aid)!;
+
+  it("returns the SAME projects array reference when the write is a no-op", () => {
+    // Establish a concrete line first, then re-send the IDENTICAL text at the IDENTICAL clock.
+    useProjectStore.getState().setAgentActivity("p1", "a1", "reticulating splines", 1000);
+    const before = projects();
+    useProjectStore.getState().setAgentActivity("p1", "a1", "reticulating splines", 1000);
+    // No field changed, so nothing downstream should re-render: the whole array reference holds.
+    // Without the guard, `.map` mints a new array here and every `s.projects` subscriber wakes.
+    expect(projects()).toBe(before);
+  });
+
+  it("returns the SAME projects array reference when clearing an already-clear line", () => {
+    useProjectStore.getState().setAgentActivity("p1", "a1", "", 1000); // undefined -> "" (a real change)
+    const before = projects();
+    useProjectStore.getState().setAgentActivity("p1", "a1", "   ", 2000); // "" -> "" : a no-op
+    expect(projects()).toBe(before);
+  });
+
+  it("keeps unrelated project and sibling agent references on a real single-agent update", () => {
+    const before = projects();
+    const p1Before = proj("p1");
+    const p2Before = proj("p2");
+    const a1Before = agentIn("p1", "a1");
+    const a2Before = agentIn("p1", "a2");
+    const b1Before = agentIn("p2", "b1");
+
+    useProjectStore.getState().setAgentActivity("p1", "a1", "new work", 3000);
+
+    // The array itself DID change — agent a1's data really changed, so a `s.projects` subscriber
+    // must see it. But the change is surgical:
+    expect(projects()).not.toBe(before); // a real change ripples to the array
+    expect(proj("p2")).toBe(p2Before); // unrelated project: SAME reference
+    expect(agentIn("p2", "b1")).toBe(b1Before); // unrelated agent: SAME reference
+    expect(agentIn("p1", "a2")).toBe(a2Before); // sibling agent in same project: SAME reference
+    expect(proj("p1")).not.toBe(p1Before); // touched project: new object
+    expect(agentIn("p1", "a1")).not.toBe(a1Before); // touched agent: new object
+    expect(agentIn("p1", "a1").activity).toBe("new work"); // ...carrying the new value
+  });
+});

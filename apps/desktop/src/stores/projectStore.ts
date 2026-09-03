@@ -499,7 +499,20 @@ function mapProject(
   id: string,
   fn: (p: Project) => Project,
 ): Project[] {
-  return projects.map((p) => (p.id === id ? fn(p) : p));
+  // IDENTITY PRESERVATION (perf, mirrors beadsStore's `next === prev ? …` guard). `projects.map`
+  // ALWAYS mints a fresh array, so a no-op or single-project update used to wake every
+  // whole-`projects` subscriber (Workspace, ProjectTabsBar, ChiefPane, …) fleet-wide — with ~60
+  // agents narrating live via `setAgentActivity`, constantly. So when `fn` returns the matched
+  // project UNCHANGED (`===`), return the ORIGINAL array reference; every unrelated project keeps
+  // its reference either way. Values are identical to the plain `.map` — only references are spared.
+  let changed = false;
+  const next = projects.map((p) => {
+    if (p.id !== id) return p;
+    const updated = fn(p);
+    if (updated !== p) changed = true;
+    return updated;
+  });
+  return changed ? next : projects;
 }
 
 /** Wrap a single Claude Code session title as an {@link AgentName}. The session title has no
@@ -735,7 +748,20 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
 }
 
 function mapAgent(p: Project, agentId: string, fn: (a: AgentTab) => AgentTab): Project {
-  return { ...p, agents: p.agents.map((a) => (a.id === agentId ? fn(a) : a)) };
+  // IDENTITY PRESERVATION (see mapProject). `{ ...p, agents: … }` always mints a fresh project and
+  // agents array, so a no-op agent write (e.g. re-clearing an already-clear activity line, or a
+  // `setAgentRuntime`/`setAgentLandedElsewhere` that returns `a` unchanged) used to still hand
+  // mapProject a NEW project object and wake every `projects` subscriber. So when `fn` returns the
+  // matched agent UNCHANGED (`===`), return the ORIGINAL project reference — mapProject then returns
+  // the original array too, and nothing re-renders. Unrelated agents keep their references either way.
+  let changed = false;
+  const agents = p.agents.map((a) => {
+    if (a.id !== agentId) return a;
+    const updated = fn(a);
+    if (updated !== a) changed = true;
+    return updated;
+  });
+  return changed ? { ...p, agents } : p;
 }
 
 /**
@@ -1728,9 +1754,15 @@ export const useProjectStore = create<ProjectState>()(
             // "as of now" would read as a fresh self-report of nothing, the opposite of the intent.
             mapAgent(p, agentId, (a) => {
               const text = activity.trim();
-              return text
-                ? { ...a, activity: text, activityAt: now }
-                : { ...a, activity: "", activityAt: undefined };
+              const nextActivity = text ? text : "";
+              const nextActivityAt = text ? now : undefined;
+              // IDENTITY PRESERVATION: bail to the SAME agent object when the write changes nothing
+              // (e.g. re-clearing an already-clear line, or re-reporting the identical text at the
+              // same `now`). This propagates through mapAgent → mapProject so a genuine no-op leaves
+              // the whole `projects` reference intact. A real activity change still stamps `now` and
+              // mints a new object, exactly as before (bead sparkle-s8y5t6).
+              if (a.activity === nextActivity && a.activityAt === nextActivityAt) return a;
+              return { ...a, activity: nextActivity, activityAt: nextActivityAt };
             }),
           ),
         })),
