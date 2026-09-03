@@ -44,7 +44,7 @@ vi.mock("./ClaudeSignIn", () => ({
   },
 }));
 
-import { AccountLimitModal, PENDING_NICKNAME } from "./AccountLimitModal";
+import { AccountLimitModal, PENDING_NICKNAME, resetLabel } from "./AccountLimitModal";
 import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
 
@@ -148,5 +148,30 @@ describe("AccountLimitModal", () => {
 
     useAccountLimitStore.getState().raise({ accountId: "old", until: UNTIL });
     expect(useAccountLimitStore.getState().current).toBeNull();
+  });
+});
+
+// `until` is resolved by parsing a limit event's reset text, so a malformed/absent reset can hand
+// `resetLabel` a NaN. `Intl.DateTimeFormat.format(new Date(NaN))` throws `RangeError: Invalid time
+// value`, which would take down the whole limit modal — the one surface that tells a rate-limited
+// user what happened. The guard degrades to null (the render already has a no-reset-time copy).
+describe("resetLabel", () => {
+  const NOW = 4_000_000_000_000;
+
+  it("returns null for a non-finite reset instant instead of throwing", () => {
+    // Side effect under test: NO throw, and the null the render treats as "no reset time".
+    expect(() => resetLabel(Number.NaN, NOW)).not.toThrow();
+    expect(resetLabel(Number.NaN, NOW)).toBeNull();
+    expect(resetLabel(Number.POSITIVE_INFINITY, NOW)).toBeNull();
+  });
+
+  it("still formats a valid FUTURE reset instant (guard did not over-widen to always-null)", () => {
+    const label = resetLabel(NOW + 60 * 60 * 1000, NOW);
+    expect(label).not.toBeNull();
+    expect(label).toMatch(/\d/);
+  });
+
+  it("still returns null for a reset instant already in the past", () => {
+    expect(resetLabel(NOW - 1, NOW)).toBeNull();
   });
 });

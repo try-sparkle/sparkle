@@ -52,7 +52,13 @@ export { PENDING_NICKNAME };
 /** When the limit resets, in the user's own locale. Mirrors `AccountsScreen`'s `exhaustedLabel`
  *  rather than inventing a second format — the same instant should read the same everywhere. */
 export function resetLabel(until: number, now: number): string | null {
-  if (until <= now) return null;
+  // `until` is resolved by PARSING a limit event's reset text (see accountLimitStore /
+  // rateLimitWatch), so a malformed or absent reset can hand us NaN. `NaN <= now` is `false`, so a
+  // bare `<= now` guard lets it through to `new Date(NaN)`, and `Intl.DateTimeFormat.format` THROWS
+  // `RangeError: Invalid time value` on an invalid Date — which would take down the whole limit
+  // modal, the one surface that tells a rate-limited user what happened. Fall back to null (the
+  // render already has a no-reset-time copy) rather than crash.
+  if (!Number.isFinite(until) || until <= now) return null;
   return getDateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(until));
 }
 
