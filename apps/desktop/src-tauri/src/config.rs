@@ -3686,29 +3686,60 @@ fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     }
 }
 
-/// Overlay a partial `[approvals]` table. Each category present in the layer overrides; an absent
-/// category leaves the lower layer's value (so a project rule beats a global one per category, and
-/// removing a project key falls back to the global rule).
-fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
+/// Permissiveness rank of a permission-category value, for the TIGHTEN-ONLY project overlay below.
+/// The auto-approve axis runs `never` (0 — never auto-approve, always prompt) < `ask` (1 — surface
+/// the prompt) < `always` (2 — auto-approve, most permissive). Any UNRECOGNIZED value reads as the
+/// stricter `ask`, matching the frontend's fail-closed handling of an unreadable rule — so a repo
+/// cannot smuggle a loosening past this ranking by misspelling `always`.
+fn approval_permissiveness(v: &str) -> u8 {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "never" => 0,
+        "always" => 2,
+        _ => 1,
+    }
+}
+
+/// Overlay ONE permission category. `tighten` = true (the tracked project layer) accepts the
+/// incoming value ONLY when it is strictly STRICTER (lower permissiveness) than what the lower
+/// layers already resolved to — a project may make a category safer but never looser. `tighten` =
+/// false (the global layer and the gitignored `local.toml`, both the user's own machine writes)
+/// keeps the plain overwrite.
+fn apply_category(into: &mut Option<String>, incoming: Option<String>, tighten: bool) {
+    let Some(v) = incoming else { return };
+    if tighten {
+        // Keep the lower layer's value when the incoming one is the same or LOOSER. With no lower
+        // value there is nothing to loosen past, so the project value stands.
+        if into
+            .as_deref()
+            .is_some_and(|cur| approval_permissiveness(cur) <= approval_permissiveness(&v))
+        {
+            return;
+        }
+    }
+    *into = Some(v);
+}
+
+/// Overlay a partial `[approvals]` table. An absent category leaves the lower layer's value.
+///
+/// SECURITY — the tracked project layer is TIGHTEN-ONLY. A `.sparkle/config.toml` travels with a
+/// cloned repo, so honouring a project `bash = "always"` over a user's global `bash = "never"` would
+/// let a repo you merely OPENED re-enable auto-approve of shell commands the user turned off. So a
+/// `Layer::Project` overlay may only make a category STRICTER, never looser (`never` < `ask` <
+/// `always`). The global layer and the gitignored `local.toml` — which is where the app's own UI
+/// writes land, incl. the "always auto-approve here" nudge, and which a cloned repo cannot ship —
+/// keep the plain per-key overwrite: those ARE the user's intent. Mirrors the concierge policy's
+/// tighten-only resolution (see `own_orgs` / `apply_concierge`). `resume`/`plan`/`concierge_answers`
+/// have their own value domains (not a permissiveness scale) and are not the command-auto-approve
+/// axis this guard protects, so they keep the plain overwrite in every layer.
+fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>, layer: Layer) {
     let Some(p) = p else { return };
-    if let Some(v) = p.skill {
-        into.skill = Some(v);
-    }
-    if let Some(v) = p.bash {
-        into.bash = Some(v);
-    }
-    if let Some(v) = p.edit {
-        into.edit = Some(v);
-    }
-    if let Some(v) = p.mcp {
-        into.mcp = Some(v);
-    }
-    if let Some(v) = p.fetch {
-        into.fetch = Some(v);
-    }
-    if let Some(v) = p.other {
-        into.other = Some(v);
-    }
+    let tighten = layer == Layer::Project;
+    apply_category(&mut into.skill, p.skill, tighten);
+    apply_category(&mut into.bash, p.bash, tighten);
+    apply_category(&mut into.edit, p.edit, tighten);
+    apply_category(&mut into.mcp, p.mcp, tighten);
+    apply_category(&mut into.fetch, p.fetch, tighten);
+    apply_category(&mut into.other, p.other, tighten);
     if let Some(v) = p.resume {
         into.resume = Some(v);
     }
@@ -5897,7 +5928,9 @@ fn apply_project_layer(
             ));
             apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
             apply_preview(&mut cfg.preview, p.preview, layer, warnings);
-            apply_approvals(&mut cfg.approvals, p.approvals);
+            // TIGHTEN-ONLY for the tracked project layer; a plain overwrite for `local.toml` (the
+            // app's own UI writes). See `apply_approvals`.
+            apply_approvals(&mut cfg.approvals, p.approvals, layer);
             apply_done(&mut cfg.done, p.done);
             apply_delivered(&mut cfg.delivered, p.delivered);
             // Repo-scoped: a project describing its own architecture and standards is the whole
@@ -6015,7 +6048,7 @@ fn build_effective_layered(
                 apply_capture(&mut cfg.capture, p.capture);
                 apply_ui(&mut cfg.ui, p.ui);
                 apply_voice(&mut cfg.voice, p.voice);
-                apply_approvals(&mut cfg.approvals, p.approvals);
+                apply_approvals(&mut cfg.approvals, p.approvals, Layer::Global);
                 // Extended immediately rather than collected like `rejected_plugins`: `[concierge]`
                 // is global-only, so there is no second layer whose warnings could interleave.
                 warnings.extend(apply_concierge(&mut cfg.concierge, p.concierge));
@@ -11577,6 +11610,62 @@ quit_app = 42
         assert!(
             !warns.iter().any(|w| w.contains("[approvals]")),
             "per-project [approvals] must be honored, not ignored"
+        );
+    }
+
+    #[test]
+    fn project_approvals_may_not_loosen_a_stricter_global() {
+        // SECURITY: a tracked `.sparkle/config.toml` travels with a cloned repo, so a repo you merely
+        // OPENED must not be able to flip `bash = "always"` back on over the user's global opt-out.
+        // The project layer is tighten-only: `always` (looser) over `never` (stricter) is IGNORED.
+        let g = "[approvals]\nbash = \"never\"\n";
+        let p = "[approvals]\nbash = \"always\"\n";
+        let (cfg, _, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        assert_eq!(
+            cfg.approvals.bash.as_deref(),
+            Some("never"),
+            "a project [approvals] must NOT loosen a stricter global rule — the user's opt-out stands"
+        );
+        // `ask` is looser than `never` too, so it is equally powerless to reopen the prompt-mute.
+        let (cfg, _, _) = effective(Some(g), Some("[approvals]\nbash = \"ask\"\n"));
+        assert_eq!(
+            cfg.approvals.bash.as_deref(),
+            Some("never"),
+            "a project may not loosen never→ask either"
+        );
+    }
+
+    #[test]
+    fn project_approvals_may_tighten_a_looser_global() {
+        // The other direction is the whole point of honouring the project layer at all: a repo may
+        // make a category SAFER. `never` (stricter) over a global `always` (looser) DOES win.
+        let g = "[approvals]\nbash = \"always\"\n";
+        let p = "[approvals]\nbash = \"never\"\n";
+        let (cfg, _, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        assert_eq!(
+            cfg.approvals.bash.as_deref(),
+            Some("never"),
+            "a project [approvals] may tighten a looser global rule"
+        );
+    }
+
+    #[test]
+    fn local_approvals_still_loosen_the_user_path() {
+        // The tighten-only rule is scoped to the TRACKED project file. The gitignored `local.toml`
+        // is where the app's own UI writes land (the "always auto-approve here" nudge writes to
+        // PROJECT scope, which persists to local.toml) and a cloned repo cannot ship one — so it is
+        // the user's own intent and may still loosen. Global `never`, local `always` → `always`.
+        let g = "[approvals]\nbash = \"never\"\n";
+        let local = "[approvals]\nbash = \"always\"\n";
+        let (cfg, _, hard) =
+            build_effective_layered(SparkleConfig::default(), Some(g), None, Some(local));
+        assert!(!hard);
+        assert_eq!(
+            cfg.approvals.bash.as_deref(),
+            Some("always"),
+            "local.toml (the user's own per-project write) is NOT tighten-only — it may loosen"
         );
     }
 

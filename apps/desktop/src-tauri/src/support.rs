@@ -124,6 +124,18 @@ pub fn redact_secrets(input: &str) -> String {
     out = url_userinfo()
         .replace_all(&out, "$1«redacted»@")
         .into_owned();
+    // Explicit token PREFIXES, redacted length-independently and BEFORE the hex/entropy heuristics
+    // below. A blob carrying one of these prefixes is unambiguously a secret whatever its length, so
+    // it must redact even when the catch-all would skip it — e.g. a 40-hex-shaped GitHub token or a
+    // sub-40 key the length floor lets through. See `token_prefix` for the covered shapes.
+    out = token_prefix().replace_all(&out, REDACTED).into_owned();
+    // The CLI flag form (`--password v`, `--token v`, `--secret v`, `--api-key v`), space- OR
+    // `=`-separated, length-independent. `secret_assignment` above only catches the `k=v`/`k:"v"`
+    // shapes, so a space-delimited `--token <32hex>` (below the entropy floor) would otherwise leak.
+    // Keep the flag name so the log still reads sensibly; redact only its value.
+    out = cli_secret_flag()
+        .replace_all(&out, "$1«redacted»")
+        .into_owned();
     // The catch-all's closure decides per-match so we PRESERVE the identifiers a human needs while
     // still catching secret shapes — see `high_entropy_blob` for which shapes survive and why.
     out = high_entropy_blob()
@@ -207,6 +219,30 @@ pattern!(
     url_userinfo,
     URL_USERINFO_CELL,
     r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@"
+);
+
+// Explicit provider/token PREFIXES — redacted whatever the length, so a token that collides with a
+// git-hash SHAPE (a 40-hex-looking value) or that falls under the high-entropy length floor still
+// goes. Covers GitHub (`ghp_`/`gho_`/`ghs_`/`ghu_`/`github_pat_`), Slack (`xoxb-`/`xoxa-`/`xoxp-`/
+// `xoxr-`/`xoxs-`), Stripe (`sk_live_`/`sk_test_`), and Anthropic (`sk-ant-`) key shapes. The body
+// after the prefix is a run of token characters (alnum plus `_-`, which also covers Slack's
+// dash-segmented tokens). Case-insensitive so a lowercased log line can't dodge it. Runs BEFORE the
+// hex/entropy pass so a prefixed blob is always redacted regardless of what that pass would decide.
+pattern!(
+    token_prefix,
+    TOKEN_PREFIX_CELL,
+    r"(?i)(?:gh[posu]_|github_pat_|xox[baprs]-|sk_(?:live|test)_|sk-ant-)[A-Za-z0-9_-]+"
+);
+
+// Secrets passed as a CLI flag: `--password`, `--token`, `--secret`, `--api-key`/`--api_key`/
+// `--apikey`, either space- or `=`-separated. The value (`\S+`) is redacted length-independently;
+// the flag name and its separator are kept (capture group 1) so the log still reads sensibly. This
+// complements `secret_assignment`, which only handles the `k=v`/`k:"v"`/JSON shapes, not the
+// double-dash space-delimited argv form a spawned process logs.
+pattern!(
+    cli_secret_flag,
+    CLI_SECRET_FLAG_CELL,
+    r"(?i)(--(?:password|token|secret|api[-_]?key)[ =])\S+"
 );
 
 // Leftover high-entropy blobs (unlabeled tokens with no `key=`/`Bearer`/`sk-` context). We redact a
@@ -633,6 +669,8 @@ mod tests {
             ("provider_key", &PROVIDER_KEY_CELL),
             ("secret_assignment", &SECRET_ASSIGNMENT_CELL),
             ("url_userinfo", &URL_USERINFO_CELL),
+            ("token_prefix", &TOKEN_PREFIX_CELL),
+            ("cli_secret_flag", &CLI_SECRET_FLAG_CELL),
             ("high_entropy_blob", &HIGH_ENTROPY_BLOB_CELL),
         ]
     }
@@ -641,7 +679,7 @@ mod tests {
     ///
     /// This asserts the side effect of the fix rather than its timing (a timing assertion here would
     /// be flaky and would not say WHY it was slow). The cells above are private to this module and
-    /// NOTHING initialises them except the seven accessors, which only `redact_secrets` calls — so
+    /// NOTHING initialises them except the pattern accessors, which only `redact_secrets` calls — so
     /// "every cell is populated after one call" is a direct statement about the code path that call
     /// took. Revert the body to per-call `regex::Regex::new(...)` and every cell stays `None`,
     /// whatever else the suite ran first, because the accessors are then dead code.
@@ -652,8 +690,8 @@ mod tests {
     #[test]
     fn redact_secrets_compiles_each_pattern_once_not_per_call() {
         // Exercise every rule in one string so no cell can stay cold for want of a match — though
-        // `replace_all` runs the matcher either way, so even a non-matching input must populate all
-        // seven.
+        // `replace_all` runs the matcher either way, so even a non-matching input must populate
+        // every cell.
         //
         // The URL userinfo goes through `shaped()` for the reason given above: spelled inline, a
         // scheme followed by a colon-separated user/password pair and an `@` is a live match for the
@@ -792,6 +830,57 @@ mod tests {
         let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // 64
         let s = format!("HEAD {sha1} tree {sha256}");
         assert_eq!(redact_secrets(&s), s);
+    }
+
+    #[test]
+    fn redacts_prefixed_provider_tokens() {
+        // Explicit token prefixes redact length-INDEPENDENTLY — including short tokens the
+        // high-entropy floor (40+) would let through, and prefixes (`sk_…`, `gh…_`) that no other
+        // rule covers. Assembled from fragments so no full-shaped token literal appears in this
+        // source (the public-mirror leak gate greps the exported text).
+        let cases = [
+            shaped("ghp_", "aBc123def"),            // GitHub PAT, well under 40 chars
+            shaped("gho_", "Xy9Zt4qw"),             // GitHub OAuth token
+            shaped("github_pat_", "11ABCDE_fghij"), // fine-grained PAT
+            shaped("xoxb-", "12ab-34cd-efGH"),      // Slack bot token
+            shaped("sk_live_", "51H8xShortval"),    // Stripe live key (underscore — not `sk-`)
+            shaped("sk-ant-", "api03short"),        // Anthropic key too short for provider_key's 16+ floor
+        ];
+        for tok in cases {
+            let out = redact_secrets(&format!("using {tok} now"));
+            assert!(!out.contains(tok.as_str()), "prefixed token survived: {out}");
+            assert!(out.contains(REDACTED), "expected a redaction marker: {out}");
+        }
+    }
+
+    #[test]
+    fn redacts_cli_secret_flags() {
+        // Secrets passed as a process's CLI flag — space-delimited, which `secret_assignment`'s
+        // `k=v` shape does NOT cover. A 32-hex bridge token is below the entropy floor and has no
+        // `key=` context, so `--token <hex>` is caught by THIS rule alone. Non-vacuous: remove the
+        // cli_secret_flag pass and both values below leak.
+        let hex32 = "0123456789abcdef0123456789abcdef"; // 32-hex bridge-token shape (< 40)
+        let out = redact_secrets(&format!("spawn --token {hex32} --password hunter2plaintext extra"));
+        assert!(!out.contains(hex32), "--token value survived: {out}");
+        assert!(!out.contains("hunter2plaintext"), "--password value survived: {out}");
+        // The flag name and unrelated trailing args are preserved so the log still reads sensibly.
+        assert!(out.contains("--token"), "flag name eaten: {out}");
+        assert!(out.contains("extra"), "trailing arg eaten: {out}");
+
+        // The `--secret <value>` spelling (space-delimited) is likewise only reachable here.
+        let out2 = redact_secrets("run --secret sup3rsecretvalue done");
+        assert!(!out2.contains("sup3rsecretvalue"), "--secret value survived: {out2}");
+        assert!(out2.contains("--secret"), "flag name eaten: {out2}");
+        assert!(out2.contains("done"), "trailing arg eaten: {out2}");
+    }
+
+    #[test]
+    fn prefixed_redaction_still_passes_genuine_git_shas() {
+        // The token-prefix / CLI passes must not touch a real 40-hex git SHA in a commit context —
+        // it carries no token prefix and is not a `--flag` value, so it survives as before.
+        let sha = "0123456789abcdef0123456789abcdef01234567"; // 40-char hex git SHA
+        let s = format!("HEAD is now at {sha} on main");
+        assert_eq!(redact_secrets(&s), s, "a genuine git SHA must survive redaction");
     }
 
     #[test]
