@@ -51,7 +51,7 @@ function verdict(over: Partial<HumaneVerdict> = {}): HumaneVerdict {
     judgesAnswered: 3,
     judgesAttempted: 3,
     degraded: false,
-    lane: 'openrouter',
+    lane: 'fleet',
     ...over,
     // `principles` must win over the spread so an explicit list is not clobbered.
     ...(over.principles ? { principles: over.principles } : {}),

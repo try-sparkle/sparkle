@@ -11,7 +11,7 @@ import type { JudgeAttempt, JudgeOptions, RawJudgeResult } from './humaneJudge';
 import { MIN_JUDGE_QUORUM, PRINCIPLE_IDS, verdictBlocks } from './humaneTypes';
 import type { DetectorFinding } from './humaneTypes';
 
-const OPTS: JudgeOptions = { judgeSet: 'hb-v1', lane: 'openrouter' };
+const OPTS: JudgeOptions = { judgeSet: 'hb-v1', lane: 'fleet' };
 
 /** The evaluator's own vocabulary, so a fixture cannot drift from the real wire format. */
 const CODES = Object.keys(EVALUATOR_CODE_TO_PRINCIPLE);
@@ -288,7 +288,7 @@ describe('the verdict carries what the check run reads', () => {
       expect(verdict).toHaveProperty(key);
     }
     expect(verdict.judgeSet).toBe('hb-v1');
-    expect(verdict.lane).toBe('openrouter');
+    expect(verdict.lane).toBe('fleet');
   });
 });
 

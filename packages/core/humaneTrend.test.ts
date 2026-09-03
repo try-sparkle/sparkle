@@ -74,7 +74,7 @@ function verdict(principles: PrincipleAssessment[], over: Partial<HumaneVerdict>
     judgesAnswered: 3,
     judgesAttempted: 3,
     degraded: false,
-    lane: 'openrouter',
+    lane: 'fleet',
     ...over,
   };
 }

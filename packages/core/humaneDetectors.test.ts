@@ -562,7 +562,7 @@ describe('principle ids', () => {
       judgesAnswered: 3,
       judgesAttempted: 3,
       degraded: false,
-      lane: 'openrouter',
+      lane: 'fleet',
     };
 
     expect(applicabilityViolations(verdict)).toEqual(['design-for-equity-and-inclusion']);

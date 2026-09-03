@@ -934,7 +934,7 @@ describe('the two axes never mix — a law cannot be averaged onto an ordinal', 
       judgesAnswered: 3,
       judgesAttempted: 3,
       degraded: false,
-      lane: 'subscription',
+      lane: 'fleet',
     };
 
     expect(verdict.humaneScore).toBe(before);

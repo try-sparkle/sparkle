@@ -145,7 +145,56 @@ export interface ComplianceCitation {
   reviewRequired: true;
 }
 
-export type Lane = 'subscription' | 'openrouter';
+/**
+ * WHERE THE CREDENTIAL THAT ANSWERED CAME FROM. Stamped into every published verdict.
+ *
+ * This replaces `Lane = 'subscription' | 'openrouter'`, which was a FICTION (bead
+ * `sparkle-plmpnm`): the CLI defaulted to `'openrouter'`, there has never been an OpenRouter call
+ * path anywhere in this repository, and the value was rendered into the PR comment table on every
+ * verdict the gate ever published. A provenance field naming a provider the code cannot reach is
+ * worse than no field, because a reader trusts it.
+ *
+ * These are CREDENTIAL SOURCES rather than vendors, because that is the distinction a reader of a
+ * verdict actually needs: which pool of capacity answered, and who to talk to when it stops.
+ */
+export type CredentialSource =
+  /** The account rotation fleet picked a live account at call time. No stored credential. */
+  | 'fleet'
+  /**
+   * The machine's own default Claude login answered — NOT a fleet selection.
+   *
+   * Kept distinct because conflating the two is how a provenance field starts lying again. The
+   * fleet selector exits 0 with EMPTY stdout to mean "no specific account; use the machine
+   * default", and on a CI runner that is the normal path rather than an edge case: the gate is
+   * checked out from the default branch, so the fleet SCRIPT exists even where no fleet does.
+   * Reporting that as `fleet` would render `Judged via: fleet` on a box with no rotation accounts
+   * — the same defect as the `openrouter` fiction this type replaced.
+   */
+  | 'local-login'
+  /** A long-lived OAuth token (`claude setup-token`), drawing on a Claude subscription. */
+  | 'oauth-token'
+  /** A metered API key. Supported for portability; not what this repository's own lanes use. */
+  | 'api-key'
+  /** Canned answers from a file. Tests only — never a real judgement. */
+  | 'stub'
+  /** No judge was called at all. The verdict is a could-not-evaluate, never a pass. */
+  | 'none';
+
+export const CREDENTIAL_SOURCES: readonly CredentialSource[] = [
+  'fleet',
+  'local-login',
+  'oauth-token',
+  'api-key',
+  'stub',
+  'none',
+] as const;
+
+/**
+ * The verdict field is still named `lane`, so every existing publisher and stored verdict keeps
+ * reading. Only the VALUES changed — from a provider that did not exist to the credential source
+ * that actually answered.
+ */
+export type Lane = CredentialSource;
 
 /**
  * WHY there is no verdict — the distinction between a bill and an outage.
