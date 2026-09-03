@@ -573,6 +573,64 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     });
   });
 
+  // ── THE TASK-LEVEL ORCHESTRATOR (bead `sparkle-n2feho.5`) ───────────────────────────────────────
+  //    `sendToBuild` in `mode: "task"` hands an orchestrator ONE CHILD BEAD and stamps THAT bead's id
+  //    into a field named `epicId`. The counter used to match that field RAW, so this agent satisfied
+  //    every RESOLVING reader and no raw one: `epicLadder.agentsForEpicSlices` found it and the Epics
+  //    column rendered `e1` STAFFED, while this function counted the same epic, in the same tick,
+  //    toward the founder's three-alarm fire. These three cases pin the SIDE EFFECT — the count —
+  //    rather than the length of a helper's return, and the second and third are what stop the fix
+  //    degenerating into "a task orchestrator always staffs something".
+
+  it("does NOT count an epic whose only LIVE orchestrator is a mode:'task' one on a CHILD bead", () => {
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    // Exactly what `prepareHandoff` writes for a task handoff: the TASK id in BOTH id fields.
+    seedSparkleAgents([
+      { id: "orch-task", kind: "build", epicId: "e1.t1", beadId: "e1.t1", runtime: "local" },
+    ]);
+    useRuntimeStore.setState({ status: {} }); // unknown liveness ⇒ conservative alive
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  it("PAIRED — DOES count it when that same task-level orchestrator is observed DEAD", () => {
+    // Without this the case above is satisfied by a counter that never counts anything once any
+    // build agent exists anywhere: resolving membership must not also fold away the liveness join.
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([
+      { id: "orch-task", kind: "build", epicId: "e1.t1", beadId: "e1.t1", runtime: "local" },
+    ]);
+    useRuntimeStore.setState({ status: { "orch-task": "done" } }); // observed dead
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
+  it("PAIRED — a task-level orchestrator on ANOTHER epic's child does not staff this one", () => {
+    // The resolver walks UP to the OWNING epic, so the widening is bounded by the parent edge and
+    // not by "any build agent exists". A rule keyed on the wrong side would pass the first case too.
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+      bead({ id: "e2", type: "epic", status: "open" }),
+      bead({ id: "e2.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([
+      { id: "orch-task", kind: "build", epicId: "e2.t1", beadId: "e2.t1", runtime: "local" },
+    ]);
+    useRuntimeStore.setState({ status: {} });
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
   it("does NOT count a childless (un-decomposed) in_progress epic — not buildable work", () => {
     seedEpicBoard([bead({ id: "e2", type: "epic", status: "in_progress" })]); // no children
     seedSparkleAgents([]);

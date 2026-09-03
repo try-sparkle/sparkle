@@ -49,6 +49,7 @@ import {
   type Bead,
 } from "./beads";
 import { epicStatus } from "./planView";
+import { agentsLadderingTo } from "./epicLadder";
 import {
   loadEpicPrdIndex,
   resolveEpicPrdPath,
@@ -550,6 +551,54 @@ export function boundAgentsFor(
 }
 
 /**
+ * Build agents whose work LADDERS UP to this epic — the STAFFING question, which is not the same
+ * question as {@link boundAgentsFor} and must not be reduced to it (bead `sparkle-n2feho.5`).
+ *
+ * ── TWO RULES OVER ONE FIELD, AND THE SPLIT WAS OBSERVABLE ────────────────────────────────────
+ * `AgentTab.epicId` is the BINDING, and `boundAgentsFor` matches it RAW. But `sendToBuild` in
+ * `mode: "task"` stamps a TASK bead id into that field (`prepareHandoff`), so a task-level
+ * orchestrator satisfies every RESOLVING reader and NO raw one. In one tick, on one epic, that
+ * produced a board that contradicted itself: `epicLadder.agentsForEpicSlices` FOUND the agent so
+ * the Epics column rendered the epic STAFFED, while `boundAgentsFor` returned nothing so
+ * `candidateFor` read it unstaffed and `pusherMount.improveUnstaffedEpics` counted it toward the
+ * founder's three-alarm fire. Any loop that reads the board to decide what to do next read a lie.
+ *
+ * ── IT DELEGATES; IT DOES NOT RE-DERIVE ───────────────────────────────────────────────────────
+ * `epicLadder.epicIdForAgent` is the sanctioned resolver for "which epic does this agent's work
+ * ladder up to", and `scripts/lib/epic-membership-guard.sh` exists to stop a second definition of
+ * the membership edge appearing. Calling the resolver is the opposite of that violation; writing a
+ * local `parentEpicOf` walk here would be the violation. The only thing this adds is the
+ * `kind === "build"` narrowing, because the sweep and the pusher ask about ORCHESTRATORS — a
+ * worker on a child bead is not staffing for the epic's decomposition.
+ *
+ * ── WHY `agentsLadderingTo` AND NOT `agentsForEpicSlices` ─────────────────────────────────────
+ * `agentsForEpicSlices` also returns agents laddering to this epic's DIRECT CHILDREN, which for a
+ * child that is itself a SUB-EPIC means the sub-epic's own orchestrator. Folding that in would make
+ * a parent epic read staffed on the strength of an agent that is, by the ladder's own definition,
+ * on a different rung — so a parent that genuinely stopped moving would become invisible to the
+ * sweep for as long as any one child sub-epic had an orchestrator. `agentsLadderingTo` asks the
+ * narrower question this gate wants: whose work ladders up to THIS epic.
+ *
+ * ── THE WIDENING IT CARRIES, ON PURPOSE ──────────────────────────────────────────────────────
+ * `epicIdForAgent` reads `epicId ?? beadId`, so a build agent carrying no `epicId` but whose bead is
+ * parented to this epic now counts as staffing it. That is a real widening of the staffing read and
+ * not a no-op, and it is the right direction: this module's own rule is that "a wrong 'alive' costs
+ * one skipped tick, a wrong 'dead' spawns a rival orchestrator against an epic somebody is already
+ * building." An agent on this epic's work is staffing it however its id got recorded.
+ */
+export function staffingAgentsFor(
+  agents: readonly AgentTab[],
+  beads: readonly Bead[],
+  epicId: string,
+): readonly AgentTab[] {
+  return agentsLadderingTo(
+    agents.filter((a) => a.kind === "build"),
+    beads,
+    epicId,
+  );
+}
+
+/**
  * Build the engine's view of one epic from the live roster.
  *
  * ── TWO DIFFERENT FACTS, FROM TWO DIFFERENT PLACES, AND CONFLATING THEM WAS A REAL BUG ────────
@@ -632,7 +681,24 @@ export function candidateFor(
     silentMs?: number;
   },
 ): EpicSweepCandidate {
+  // TWO READS OF THE ROSTER, AND THEY ASK DIFFERENT QUESTIONS (bead `sparkle-n2feho.5`).
+  //
+  // `bound` is the RAW BINDING and it feeds `promoted` ONLY — the watch gate, i.e. "was this epic
+  // handed over". It must stay raw. `sendToBuild` deliberately does NOT stamp `PROMOTED_LABEL` for
+  // a `mode: "task"` handoff ("stamping it would aim the sweep at ordinary tasks"), so resolving
+  // here would put an epic nobody promoted into the sweep's watch set for as long as one
+  // task-level orchestrator's tab happened to exist — and the marker self-heal in `sweepEpics`
+  // would then make that permanent by stamping the very label `sendToBuild` refused to write. The
+  // two would directly contradict each other.
+  //
+  // `staffingAgents` is the RESOLVED read and it feeds the LIVENESS verdict — "is anybody on this".
+  // A task-level orchestrator IS somebody: the Epics column already renders that epic staffed off
+  // exactly this resolver. Reading it as unstaffed is what let the sweep hand back an epic that was
+  // being built, which is the failure direction this module's own comments rank as the expensive
+  // one ("a wrong 'alive' costs one skipped tick, a wrong 'dead' spawns a rival orchestrator
+  // against an epic somebody is already building").
   const bound = boundAgentsFor(agents, epic.id);
+  const staffingAgents = staffingAgentsFor(agents, beads, epic.id);
   // UNKNOWN LIVENESS COUNTS AS ALIVE. `processAliveFor` returns undefined for an agent this window
   // never observed, and the conservative reading of "I cannot tell whether anyone is on this" is
   // to leave it alone: a wrong "alive" costs one skipped tick, a wrong "dead" spawns a rival
@@ -656,9 +722,9 @@ export function candidateFor(
   const orchestratorAlive = !rosterRead
     ? null
     : staffing === undefined
-      ? bound.some((a) => alive(a.id) !== false)
+      ? staffingAgents.some((a) => alive(a.id) !== false)
       : epicOrchestratorLiveness(
-          bound.map((a) =>
+          staffingAgents.map((a) =>
             orchestratorLivenessOf(
               {
                 observedAlive: alive(a.id),
@@ -1059,6 +1125,16 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       // that is failing to answer, which is the last thing a wedged store needs. More to the point
       // it is a WRITE justified by a reading we have just declined to trust, and this module does
       // not get to trust it for its own bookkeeping and distrust it for the founder's veto.
+      //
+      // `boundAgentsFor` HERE, NOT `staffingAgentsFor`, AND THAT ASYMMETRY IS THE POINT (bead
+      // `sparkle-n2feho.5`). The liveness reads in `candidateFor` resolve a `mode: "task"` handoff
+      // up to its owning epic, because a task-level orchestrator really is somebody building that
+      // epic's work. This is a WRITE, and a different question: it stamps the durable marker that
+      // says "a human handed this EPIC over". `sendToBuild` refuses to stamp it for a task handoff
+      // on purpose — "stamping it would aim the sweep at ordinary tasks" — so resolving here would
+      // have this line write the exact label that path declines to, permanently, from one click on
+      // one child bead. The raw binding is the only evidence of an epic-level handoff, so the raw
+      // binding is what may heal its marker.
       if (beadsObserved && !isPromotedToBuild(epic) && boundAgentsFor(project.agents, epic.id).length > 0) {
         try {
           await setLabel(project.rootPath, "add", epic.id, PROMOTED_LABEL);
@@ -1282,8 +1358,12 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
         // epic that is merely waiting out an account limit — a false alarm in the one lane that
         // must only ever hold real ones. The epic stays fully eligible and the next tick re-asks,
         // exactly as the `cannot-notify` refusal below does.
+        // THE SAME SET THE LIVENESS VERDICT WAS COMPUTED OVER, or this asks "why is it dead" about
+        // agents nobody judged dead. `candidateFor` reads liveness off `staffingAgentsFor`; a raw
+        // read here would drop a task-level orchestrator's death cause and answer `restart` for an
+        // epic whose only agent hit an account wall.
         const remedy = epicRestartRemedy(
-          boundAgentsFor(project.agents, epic.id).map((a) => deathCauseFor(a.id)),
+          staffingAgentsFor(project.agents, beads, epic.id).map((a) => deathCauseFor(a.id)),
         );
         if (remedy !== "restart") {
           const note = remedy === "wall" ? "wall" : "human-blocked";

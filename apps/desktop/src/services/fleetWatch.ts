@@ -30,8 +30,9 @@ import type { AgentTabStatus } from "@sparkle/ui";
 import { invoke } from "@tauri-apps/api/core";
 
 import { log } from "../logger";
-import { submitPrompt } from "../pty";
-import { openAgentIdSet } from "./knownAgents";
+import { ptyLiveEpoch, submitPrompt } from "../pty";
+import { findKnownAgent, openAgentIdSet } from "./knownAgents";
+import { SPARKLE_PROJECT_ID } from "./sparkleAgent";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import {
@@ -429,6 +430,23 @@ export interface FleetWatchDeps {
   digest(agents: AgentRef[]): Promise<JudgedDigest>;
   /** This window's live status entry, or `undefined` when it has none. */
   observedStatus(agentId: string): AgentTabStatus | undefined;
+  /**
+   * The epoch of the PTY live under this id right now, or `0` when none is (`pty.ptyLiveEpoch`).
+   *
+   * ASKED ONLY FOR APP-OWNED IDS, and only because for those the status entry is NOT proof of a
+   * pane. `observedStatusRefusal`'s whole safety argument is that a live status row means a mounted
+   * pane wrote it — true for a roster agent, whose rows come only from a mounted `Terminal`, and
+   * FALSE for `__sparkle_self__`: `services/improvementPass` writes `setStatus(SPARKLE_AGENT_ID, …)`
+   * from the headless hourly pass, including the terminal `"idle"` at its end, from a path whose own
+   * comment reads "The headless pass has no PTY and no StatusEngine". `improvePassLiveness` writes
+   * the same key. So a status row for that id can be a HEADLESS artifact, and claiming on the
+   * strength of it would consume mail with nothing to write to — `claim` is destructive,
+   * exactly-once, and has no un-claim command, so the message would be gone for good.
+   *
+   * Not asked for roster agents: their premise holds, and this is an `invoke` per agent per tick
+   * against a population bounded only by the open-pane count.
+   */
+  ptyLiveEpoch(agentId: string): Promise<number>;
   inboxStatus(agentIds: string[]): Promise<InboxStatusRow[]>;
   /** Atomically claim an idle agent's pending messages. Returns only what this call WON. */
   claimForIdle(agentId: string): Promise<ClaimedMessage[]>;
@@ -497,6 +515,74 @@ export interface FleetWatchTick {
   failed: Array<{ agentId: string; messageIds: string[]; error: string }>;
 }
 
+/**
+ * The APP-OWNED agents an open-pane roster walk structurally cannot see — today, exactly the
+ * Improve-Sparkle agent (`services/sparkleAgent`, the `__sparkle_self__` namespace).
+ *
+ * WHY A ROSTER WALK IS NOT THE ADDRESSABLE SET (bead sparkle-n2feho.3). `projectStore.projects[].agents`
+ * is the USER'S build-agent roster, and the Sparkle agent is DELIBERATELY never a member of it — see
+ * `services/knownAgents`' header and `stores/inboxStore`, both of which already say so in as many
+ * words. So `liveAgents()`'s walk over that roster could never yield `__sparkle_self__` whatever its
+ * pane state and whatever was queued for it, which meant this module's idle sweep — the ONLY delivery
+ * path for an agent that has already emitted its last `Stop` — could not reach it at all. Every
+ * queued peer message and every never-idle nudge for that agent had exactly one remaining drain
+ * trigger, its own `Stop` hook at a turn boundary, so the message written to un-idle an idle agent
+ * was delivered by a mechanism that required it to already be non-idle. That circularity is the
+ * defect; this function is the whole fix.
+ *
+ * NOT A SECOND DEFINITION OF "ADDRESSABLE". The membership test is `findKnownAgent(...).source ===
+ * "sparkle"` — arm (2) of the one resolver every surface that asks "can I address this id?" already
+ * goes through. Re-deriving it here (an `isSparkleAgentId` test of our own, say) is how the sweep
+ * would come to disagree with the concierge and the send receipt about the same id.
+ *
+ * WHAT IT DOES NOT WIDEN, and this is the line that matters:
+ *
+ *   - NOT arm (3) `observed`. An id this window merely has a status entry for has no project and no
+ *     app-managed worktree, so there is no `(projectId, agentId)` for `fleet_digest` to build a path
+ *     from — `worktree::worktree_path` would name a directory that does not exist and every such row
+ *     would be refused `no-worktree` after paying for the walk. Only the app-owned namespace has a
+ *     worktree layout this side can name: `<app_data>/worktrees/sparkle-self/<agentId>`, which is
+ *     exactly `worktree_path(app_data, SPARKLE_PROJECT_ID, agentId)` (src-tauri/sparkle_agent.rs).
+ *   - NOT the DELIVERY gate. Every id returned here still goes through `decideIdleDelivery` and
+ *     therefore through `observedStatusRefusal`, so a Sparkle agent with no live status entry is
+ *     refused `no-live-pty` exactly like any other pane-less agent. This widens WHO IS CONSIDERED,
+ *     never WHAT IS SAFE TO CLAIM — `claim` is destructive and exactly-once with no un-claim command,
+ *     so claiming without a PTY would consume the message and report it delivered forever.
+ *   - NOT the open-pane bound. `open` is the same cost gate the roster walk uses, so a Sparkle agent
+ *     whose pane nobody has open is not digested either.
+ *
+ * `already` is the roster walk's own output rather than a set of its own, so an id that walk already
+ * yielded cannot be digested twice (it never can today — the Sparkle agent is in no roster — but a
+ * duplicate `AgentRef` would double this agent's git spawns and worktree walk on every tick, and the
+ * de-dupe costs one pass over a list that is at most the open-pane count).
+ */
+export function appOwnedLiveAgents(
+  open: ReadonlySet<string>,
+  already: readonly AgentRef[],
+): AgentRef[] {
+  const seen = new Set(already.map((a) => a.agentId));
+  return [...open]
+    .filter((id) => !seen.has(id) && appOwnedAgentId(id))
+    .map((agentId) => ({ agentId, projectId: SPARKLE_PROJECT_ID }));
+}
+
+/**
+ * Is this an APP-OWNED agent id — i.e. one admitted by {@link appOwnedLiveAgents} rather than by the
+ * project-roster walk?
+ *
+ * ONE DEFINITION, because it is consulted twice and the two must not drift: once to ADMIT the id to
+ * the sweep, and once before the claim to demand the stronger PTY proof that admission makes
+ * necessary. If these ever disagreed, the id admitted would be an id whose proof was never asked
+ * for, which is precisely the hole the second check exists to close.
+ *
+ * Arm (2) of the shared resolver, not a test of our own: re-deriving it here (an `isSparkleAgentId`
+ * of our own, say) is how this sweep would come to disagree with the concierge and the send receipt
+ * about the same id.
+ */
+export function appOwnedAgentId(id: string): boolean {
+  return findKnownAgent(id)?.source === "sparkle";
+}
+
 export function defaultFleetWatchDeps(): FleetWatchDeps {
   return {
     now: () => Date.now(),
@@ -519,7 +605,7 @@ export function defaultFleetWatchDeps(): FleetWatchDeps {
       // pane was open at the last relaunch, is still in it, which is exactly the population Level 0
       // exists to observe.
       const open = openAgentIdSet();
-      return useProjectStore.getState().projects.flatMap((p) =>
+      const roster = useProjectStore.getState().projects.flatMap((p) =>
         p.agents
           // A cloud agent has no local PTY and no app-managed worktree, so neither half of this loop
           // applies to it. An agent with no worktree cannot be digested at all — `fleet_digest`
@@ -528,7 +614,9 @@ export function defaultFleetWatchDeps(): FleetWatchDeps {
           .filter((a) => a.runtime !== "cloud" && a.worktreePath !== null && open.has(a.id))
           .map((a) => ({ agentId: a.id, projectId: p.id })),
       );
+      return [...roster, ...appOwnedLiveAgents(open, roster)];
     },
+    ptyLiveEpoch,
     digest: async (agents) => {
       // The existing Level 0 wrapper, not a fresh `invoke`: it is where `verdictsFor` is applied,
       // so reusing it is what keeps this module from becoming a second opinion about progress.
@@ -728,6 +816,40 @@ export async function pollFleetOnce(deps: FleetWatchDeps): Promise<FleetWatchTic
     if (stillOk !== undefined) {
       skipped[id] = stillOk;
       continue;
+    }
+
+    // AN APP-OWNED ID NEEDS A REAL PTY, NOT A STATUS ROW (bead `sparkle-n2feho.3`).
+    //
+    // Every other agent here reached this line having proved a mounted pane the cheap way: only a
+    // mounted `Terminal` writes its `status` row, so the row IS the proof. `__sparkle_self__` breaks
+    // that equivalence — `services/improvementPass` writes `setStatus(SPARKLE_AGENT_ID, "idle")` at
+    // the end of the HEADLESS hourly pass ("The headless pass has no PTY and no StatusEngine", its
+    // own comment), and `services/improvePassLiveness` writes the same key. The open-pane bound does
+    // not save it either: nothing ever removes this id from `openAgentIds`, so once the pane has been
+    // opened even once the set says "open" in every later session.
+    //
+    // The consequence is the one thing this loop must never do. `claimForIdle` is destructive and
+    // exactly-once with NO un-claim command, so a claim made on a headless status row consumes the
+    // message and then has nothing to write it to — the send is recorded `failed`, the ids are gone,
+    // and the peer message or never-idle nudge is destroyed rather than merely delayed. Refusing
+    // instead leaves it `pending`, which is the outcome `no-live-pty` exists to produce: the agent
+    // drains it through its own `Stop` hook the moment a pane is opened.
+    //
+    // So for these ids the proof is the PTY itself. `ptyLiveEpoch` returns 0 when none is live.
+    if (appOwnedAgentId(id)) {
+      let epoch = 0;
+      try {
+        epoch = await deps.ptyLiveEpoch(id);
+      } catch (e) {
+        // A probe that could not answer is not a yes. Fail CLOSED: the cost of refusing is one
+        // skipped tick, and the cost of admitting is a destroyed message.
+        log.warn("fleet", `pty liveness probe failed for app-owned agent ${id}`, e);
+        epoch = 0;
+      }
+      if (epoch <= 0) {
+        skipped[id] = "no-live-pty";
+        continue;
+      }
     }
 
     // TWO PHASES, TWO try BLOCKS, and the split is the point rather than tidiness.

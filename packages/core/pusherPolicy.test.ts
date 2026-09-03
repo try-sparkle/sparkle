@@ -76,7 +76,9 @@ describe("the message budget is a CEILING ONLY", () => {
 
 describe("the inbox yield is a CEILING ONLY", () => {
   // Raising it would let a Pusher spend the last slots of a partner's inbox — the ones reserved so
-  // the concierge can still reach that builder. The inbox refuses when full rather than evicting.
+  // the concierge can still reach that builder. The inbox refuses an `act` when full rather than
+  // evicting anything (only the lower-ceilinged `fyi` class is a ring buffer, and an `fyi` may never
+  // evict an `act`), and a Pusher message is `act`.
   it("refuses to be raised", () => {
     expect(resolvePusherPolicy({ inbox_yield_pct: 100 }).inboxYieldPct).toBe(INBOX_YIELD_PCT);
   });

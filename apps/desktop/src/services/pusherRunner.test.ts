@@ -158,7 +158,7 @@ describe("the inbox read", () => {
   });
 
   // A failed read is not an empty mailbox. Unknown occupancy must yield, because inbox.rs REFUSES
-  // when full rather than evicting — guessing "empty" can starve the concierge's route to the
+  // an `act` when full rather than evicting — guessing "empty" can starve the concierge's route to the
   // same builder.
   it("yields when the usage read fails", async () => {
     const { deps, sent, recorded } = fakeDeps({

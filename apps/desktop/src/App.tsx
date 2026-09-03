@@ -59,6 +59,7 @@ import { startPipelineHealthWatch } from "./stores/pipelineHealthStore";
 import { startCiBudgetGovernor } from "./services/ciBudgetGovernorInit";
 import { startPusher } from "./services/pusherMount";
 import { startDrainerBridge } from "./services/drainerBridge";
+import { startBacklogAutoscaler } from "./services/backlogAutoscaler";
 import { startAuthRecovery } from "./services/authRecovery";
 import { startSocialSync } from "./services/socialSync";
 
@@ -345,6 +346,22 @@ function Pusher() {
 // core that ships tested but unmounted runs for nobody.
 function DrainerBridge() {
   useEffect(() => startDrainerBridge(), []);
+  return null;
+}
+
+// THE BACKLOG AUTOSCALER — PHASE 1, DRY RUN, READ-ONLY (bead sparkle-n2feho.6).
+//
+// It computes `target = min(free capacity, ready backlog)` once a minute and LOGS it. It starts
+// nothing. There is no arming marker because there is no write to gate: the module calls no spawn,
+// no bd write and no PTY write, and `backlogAutoscaler.test.ts` ratchets that so Phase 2 cannot
+// slip a writer in behind this mount. Mounted anyway, and deliberately: a decision core that ships
+// tested but unmounted measures nothing, and the whole point of Phase 1 is to check the math
+// against the machine's real ceiling.
+//
+// NOT OBSERVABLE IN THE RUNNING APP — it is a packaged build with no hot reload. These lines appear
+// only in a DMG built from a main containing this merge.
+function BacklogAutoscaler() {
+  useEffect(() => startBacklogAutoscaler(), []);
   return null;
 }
 
@@ -709,6 +726,7 @@ export function App() {
       <FleetResurrection />
       <Pusher />
       <DrainerBridge />
+      <BacklogAutoscaler />
       <AuthRecovery />
       <ApiRecovery />
       <DisplayRespan />

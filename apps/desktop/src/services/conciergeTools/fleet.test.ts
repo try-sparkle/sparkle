@@ -17,6 +17,7 @@ import {
   inboxSend,
   inboxStatus,
   readAgentTranscript,
+  recipientQueueFromRow,
 } from "./fleet";
 import { absenceClaimIn } from "../../engine/probeOutcome";
 import { defaultDecisionFor } from "./policy";
@@ -101,7 +102,23 @@ function view(agentId: string, entries: InboxEntry[]): InboxView {
   return { agentId, entries };
 }
 
-/** A counts row with everything at zero, so a test states only the column it is about. */
+/** How many times `invoke` was called with this exact command name.
+ *
+ *  WHY NOT `expect(invoke).toHaveBeenCalledTimes(1)`, which is what these tests used to say: that
+ *  counts EVERY command, so it was only ever a proxy for the thing being asserted — *exactly one
+ *  `inbox_send` reached Rust*. The proxy broke the moment `inboxSend` gained a second, unrelated read
+ *  (the recipient's queue depth), and it broke by reporting a count, which says nothing about which
+ *  call was the extra one. Naming the command asserts the real claim and is strictly stronger: a
+ *  double-enqueue still reds, and an added read no longer does. */
+function invokeCount(cmd: string): number {
+  return invoke.mock.calls.filter(([c]) => c === cmd).length;
+}
+
+/** A counts row with everything at zero, so a test states only the column it is about.
+ *
+ *  The ceilings are the REAL ones `inbox::status_of` sends on every row (`FYI_CEILING` /
+ *  `MAX_PER_AGENT`), not zeroes: they are plain `u32`s in Rust, so the command always carries them,
+ *  and a fixture that omitted them would be a payload shape the backend cannot produce. */
 function countsRow(agentId: string, over: Partial<Record<string, unknown>> = {}) {
   return {
     agentId,
@@ -110,6 +127,8 @@ function countsRow(agentId: string, over: Partial<Record<string, unknown>> = {})
     acknowledged: 0,
     awaitingAck: 0,
     pendingIds: [],
+    fyiCeiling: 40,
+    actCeiling: 50,
     ...over,
   };
 }
@@ -244,6 +263,153 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
    * `delivered` reads `undefined`, and `toBe(false)` rejects it. `undefined` is not the answer either
    * — an absent field is exactly what let a caller assume the happy case.
    */
+  /**
+   * BEAD sparkle-n2feho.4 — the send receipt carries THE RECIPIENT'S QUEUE DEPTH, closing bead
+   * sparkle-x4mnec's first acceptance criterion: *"a sender can see the recipient's queue depth
+   * BEFORE being refused."* Depth used to live in exactly one place — the text of a capacity refusal
+   * — so a sender learned how full the queue was from the message telling it the send had not
+   * happened. That is too late by construction.
+   *
+   * ASSERTS THE VALUE, NOT THE FIELD. `expect(r.data.recipientQueue).toBeTruthy()` passes against an
+   * implementation that hardcodes zeroes, which is the vacuous shape AGENTS.md names: the backend is
+   * driven to a DISTINCT depth (37 of a 40 ceiling) and the receipt has to carry that number and the
+   * headroom derived from it — 3 fyi and 13 act, neither of which is a constant appearing anywhere
+   * in the fixture.
+   */
+  it("carries the recipient's live queue depth on the SUCCESS receipt", async () => {
+    markLive("a1");
+    backend({
+      inbox_send: "m1",
+      inbox_status: [countsRow("a1", { pending: 37, pendingIds: ["m1"] })],
+    });
+    const r = await inboxSend("a1", "main has moved");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    expect(r.data.recipientQueue?.pending).toBe(37);
+    expect(r.data.recipientQueue?.fyiCeiling).toBe(40);
+    expect(r.data.recipientQueue?.actCeiling).toBe(50);
+    expect(r.data.recipientQueue?.fyiHeadroom).toBe(3);
+    expect(r.data.recipientQueue?.actHeadroom).toBe(13);
+    // The sentence a model repeats to a human has to carry the number too — a field it never reads
+    // aloud is a field the human never sees.
+    expect(r.data.recipientQueue?.note).toContain("37");
+  });
+
+  /**
+   * `null` MEANS "COULD NOT READ IT", NEVER "EMPTY", and the send still succeeds. The depth read is a
+   * second call made AFTER the write has already landed, so a reporting concern must never be able
+   * to turn a queued message into a refusal — the same rule `handleSendPeerMessage` states for its
+   * display append. A fabricated `pending: 0` would be worse than silence: it reads as "plenty of
+   * room" on a queue that may be at its ceiling.
+   */
+  it("reports an unreadable depth as null WITHOUT failing the send", async () => {
+    markLive("a1");
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "inbox_send" ? Promise.resolve("m1") : Promise.reject(new Error("status unavailable")),
+    );
+    const r = await inboxSend("a1", "main has moved");
+    expect(r.ok, "a depth read that fails must not fail the send").toBe(true);
+    if (!r.ok) return;
+    expect(r.data.messageId).toBe("m1");
+    expect(r.data.recipientQueue).toBeNull();
+  });
+
+  /**
+   * AT THE CEILING THE NOTE MUST NOT SAY "REFUSED". The `fyi` class has been a RING BUFFER since
+   * 252e7a9d6: at the ceiling the next `fyi` EVICTS the recipient's stalest one and succeeds. Copy
+   * that called that a refusal would send a caller off to escalate over a message that in fact went
+   * through — and would leave it believing nothing was lost when something was.
+   *
+   * The negative and the positive are asserted SEPARATELY (AGENTS.md's copy-ratchet rule): deleting
+   * the word "refused" is not the same fact as stating what actually happens, and a negative-only
+   * ratchet is green over copy that says nothing at all.
+   */
+  it("describes a full fyi queue as EVICTING, never as refusing", async () => {
+    markLive("a1");
+    backend({
+      inbox_send: "m1",
+      inbox_status: [countsRow("a1", { pending: 41 })],
+    });
+    const r = await inboxSend("a1", "context");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    const note = r.data.recipientQueue!.note;
+    expect(r.data.recipientQueue!.fyiHeadroom, "over the ceiling clamps at zero").toBe(0);
+    expect(r.data.recipientQueue!.actHeadroom).toBe(9);
+    // POSITIVE: it states what actually happens to a `fyi` at the ceiling.
+    expect(note, "the ring buffer evicts").toMatch(
+      /the next `fyi` evicts this agent's stalest `fyi` to make room/,
+    );
+    // ...AND IT CARRIES THE EXCEPTION, which is the half that was wrong. `inbox.rs::enqueue` still
+    // refuses an `fyi` when every queued slot holds an `act` — an `fyi` may never evict an `act`.
+    // Copy that promised eviction UNCONDITIONALLY told a refused peer its next send would succeed,
+    // which is the `sparkle-8bvh` remedy-contradiction shape: a remedy unsafe under exactly the
+    // condition that triggered it. A peer cannot reclassify (`send_peer_message` is hardcoded
+    // `fyi`), so it has no way to discover the exception except from this sentence.
+    expect(note, "the all-`act` exception must be stated, not implied").toMatch(
+      /UNLESS every queued slot holds an `act`[^.]*refused outright/,
+    );
+    // ...and it still tells the caller that an `act` really can be refused — the wall that remains.
+    expect(note, "an `act` at the ceiling IS refused, and that must survive").toMatch(
+      /before an `act` is refused/,
+    );
+  });
+
+  /**
+   * A REFUSED SENDER GETS THE DEPTH TOO. Rust's capacity refusals name it themselves, but a queue
+   * write that failed for any other reason does not — and the caller standing in front of a refusal
+   * is exactly the one that needs to know whether the recipient is at 3 or at 40 before deciding
+   * whether to escalate, wait, or pick another channel.
+   */
+  it("appends the depth to a refusal that did not already carry one", async () => {
+    markLive("a1");
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "inbox_send"
+        ? Promise.reject(new Error("inbox: disk full"))
+        : Promise.resolve([countsRow("a1", { pending: 12 })]),
+    );
+    const r = await inboxSend("a1", "context");
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain("disk full");
+    expect(r.message, "the depth must survive into the refusal a caller reads").toContain("12");
+  });
+
+  /**
+   * A ROW WITH NO CEILINGS YIELDS `null`, NOT A DEPTH WITH NO SCALE. `pending: 38` is either
+   * comfortable or one send from eviction depending on a number the caller cannot see, so reporting
+   * the depth alone is worse than reporting nothing — and inventing a ceiling is worse still.
+   */
+  it("refuses to report a depth it has no ceiling to scale", () => {
+    expect(recipientQueueFromRow(null)).toBeNull();
+    expect(
+      recipientQueueFromRow({
+        agentId: "a1",
+        pending: 38,
+        delivered: 0,
+        acknowledged: 0,
+        awaitingAck: 0,
+        pendingIds: [],
+      }),
+    ).toBeNull();
+    // ...and the positive control, so this is not merely green because the helper always returns
+    // null: the same row WITH ceilings resolves, and to the depth it was given.
+    expect(
+      recipientQueueFromRow({
+        agentId: "a1",
+        pending: 38,
+        delivered: 0,
+        acknowledged: 0,
+        awaitingAck: 0,
+        pendingIds: [],
+        fyiCeiling: 40,
+        actCeiling: 50,
+      })?.pending,
+    ).toBe(38);
+  });
+
   it("does NOT report itself as delivered", async () => {
     markLive("a1");
     invoke.mockResolvedValue("m1");
@@ -499,7 +665,7 @@ describe("deliver-or-fail: the recipient directory (C1, bead sparkle-179b2s)", (
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.data.messageId).toBe("m9");
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invokeCount("inbox_send"), "the recipient was enqueued exactly once").toBe(1);
   });
 
   it("treats the concierge as addressable even with no live agent panes", async () => {
@@ -510,7 +676,7 @@ describe("deliver-or-fail: the recipient directory (C1, bead sparkle-179b2s)", (
     const r = await inboxSend(CONCIERGE_ID, "the founder asked for a status line");
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invokeCount("inbox_send"), "the concierge was enqueued exactly once").toBe(1);
   });
 
   it("treats the canonical Improve Sparkle id as addressable even headless", async () => {
@@ -520,7 +686,7 @@ describe("deliver-or-fail: the recipient directory (C1, bead sparkle-179b2s)", (
     const r = await inboxSend(SPARKLE_AGENT_ID, "unstick yourself");
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invokeCount("inbox_send"), "Improve Sparkle was enqueued exactly once").toBe(1);
   });
 
   it("in a broadcast, only addressable ids reach Rust; the rest become not-queued, never a fake id", async () => {

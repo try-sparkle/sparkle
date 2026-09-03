@@ -169,7 +169,7 @@ describe("the message budget", () => {
 
 describe("the inbox yield", () => {
   // The concierge's message carries human intent; the Pusher's can wait. The inbox REFUSES when
-  // full rather than evicting, so a talkative Pusher can starve the concierge's route to the same
+  // an `act` when full rather than evicting, so a talkative Pusher can starve the concierge's route to the same
   // builder — this is the rule that stops it.
   it(`refuses at ${INBOX_YIELD_PCT}% full`, () => {
     const v = refused(gateChallenge(input({ inbox: { used: 40, capacity: 50 } })));

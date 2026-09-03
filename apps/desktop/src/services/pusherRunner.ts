@@ -446,9 +446,10 @@ export async function sweepPushers(
     const inbox: InboxReading =
       used === undefined
         ? // Unknown occupancy reads as FULL, so the Pusher yields rather than talking over a
-          // mailbox it could not see. `inbox.rs` refuses when full rather than evicting, so the
-          // cost of guessing wrong in the other direction is the concierge losing its route to
-          // this same builder.
+          // mailbox it could not see. A Pusher message is `act`, and `inbox.rs` REFUSES an `act`
+          // when the queue is full rather than evicting anything (only the `fyi` class is a ring
+          // buffer, and an `fyi` may never evict an `act`) — so the cost of guessing wrong in the
+          // other direction is the concierge losing its route to this same builder.
           { used: INBOX_CAPACITY, capacity: INBOX_CAPACITY }
         : { used, capacity: INBOX_CAPACITY };
 

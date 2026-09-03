@@ -181,6 +181,78 @@ export interface InboxStatusRow {
   acknowledged: number;
   awaitingAck: number;
   pendingIds: string[];
+  /**
+   * The ceilings `pending` is judged against — `inbox::FYI_CEILING` and `inbox::MAX_PER_AGENT`.
+   *
+   * CARRIED FROM RUST RATHER THAN RE-DECLARED HERE. Two literals in two packages are two numbers
+   * that look like one and drift silently, which is the reason `peerMessaging.MESSAGE_MAX_CHARS`
+   * re-exports rather than restates its cap. The ceilings are Rust's to decide — the reserve split
+   * lives in `enqueue` — so the frontend reads them off the row it already fetches.
+   *
+   * `?:` HERE AND NON-`Option` IN RUST, deliberately, and the asymmetry is the safe direction. The
+   * command always sends both (they are plain `u32`s, so nothing crosses as `null` and the
+   * `field?: T` / `null` seam `AGENTS.md` documents cannot open). Optional on this side only so the
+   * hand-built rows in existing fixtures keep compiling; read them with a `?? null` and report
+   * "unknown" rather than inventing a ceiling.
+   */
+  fyiCeiling?: number;
+  actCeiling?: number;
+}
+
+/**
+ * WHAT A SENDER IS TOLD ABOUT THE RECIPIENT'S QUEUE — the answer to bead `sparkle-x4mnec`'s first
+ * acceptance criterion, *"a sender can see the recipient's queue depth BEFORE being refused."*
+ *
+ * Depth used to exist in exactly one place: the text of a refusal. That is too late by construction
+ * — the sender learns the queue was full from the message telling it the send did not happen, and a
+ * sender that wanted to slow down, batch, or pick a different channel had nothing to read until it
+ * was already refused. So this rides the SUCCESS receipt as well.
+ *
+ * `headroom` is the actionable half and the two classes differ, which is why both are named:
+ *  - `fyiHeadroom` — sends left before the `fyi` ring buffer starts EVICTING the recipient's stalest
+ *    `fyi` to admit the next one. Reaching zero is not a refusal (it has not been one since the ring
+ *    buffer landed) — it is the point at which sending costs the recipient something it already had.
+ *  - `actHeadroom` — sends left before an `act` is REFUSED outright. This one really is a wall.
+ */
+export interface RecipientQueue {
+  /** Messages queued and not yet claimed by any delivery path. */
+  pending: number;
+  fyiCeiling: number;
+  actCeiling: number;
+  fyiHeadroom: number;
+  actHeadroom: number;
+  /** One sentence a language model can repeat to a human verbatim. */
+  note: string;
+}
+
+/** Build a {@link RecipientQueue} from a status row, or `null` when the row cannot tell us. */
+export function recipientQueueFromRow(row: InboxStatusRow | undefined | null): RecipientQueue | null {
+  if (!row) return null;
+  const { pending, fyiCeiling, actCeiling } = row;
+  // A row that carries no ceilings is a row from an older shape or a hand-built fixture. Reporting a
+  // depth with no scale is worse than reporting nothing — 38 reads as fine or as one-from-eviction
+  // depending on a number the caller cannot see — so refuse to guess.
+  if (
+    typeof pending !== "number" ||
+    typeof fyiCeiling !== "number" ||
+    typeof actCeiling !== "number"
+  ) {
+    return null;
+  }
+  const fyiHeadroom = Math.max(0, fyiCeiling - pending);
+  const actHeadroom = Math.max(0, actCeiling - pending);
+  const note =
+    fyiHeadroom > 0
+      ? `${pending} of this agent's messages are queued and undelivered; ${fyiHeadroom} more ` +
+        `\`fyi\` send(s) fit before the oldest one starts being evicted to make room, and ` +
+        `${actHeadroom} before an \`act\` is refused outright.`
+      : `${pending} of this agent's messages are queued and undelivered, at or over the ` +
+        `${fyiCeiling}-message \`fyi\` ceiling: the next \`fyi\` evicts this agent's stalest ` +
+        "`fyi` to make room — UNLESS every queued slot holds an `act`, which an `fyi` may never " +
+        `evict and which is refused outright. ${actHeadroom} \`act\` send(s) remain before an ` +
+        "`act` is refused. Either way it is not reading what it already has — consider whether " +
+        "another message helps.";
+  return { pending, fyiCeiling, actCeiling, fyiHeadroom, actHeadroom, note };
 }
 
 /**
@@ -281,6 +353,20 @@ export interface EnqueueReceipt {
   /** One sentence a language model can repeat to a human verbatim. Scoped to THIS WINDOW's
    *  observation and never a claim about the agent — {@link DRAIN_NOTES}. */
   drainNote: string;
+  /**
+   * HOW DEEP THE RECIPIENT'S QUEUE IS, ON THE SUCCESS RECEIPT — see {@link RecipientQueue}.
+   *
+   * `drainableBy` answers *will anything ever pick this up*; this answers *how much is already in
+   * front of it*, and they are different failures. A queue with a live drainer and thirty-nine
+   * undrained messages in it is a channel that is technically working and practically useless, and
+   * before this the only way to find that out was to keep sending until something was refused.
+   *
+   * `null` MEANS "COULD NOT READ IT", NEVER "EMPTY". The depth is a second, best-effort call made
+   * after the write has already succeeded, and it is deliberately unable to fail the send: a
+   * reporting concern must never turn a queued message into a refusal. A caller that reads `null`
+   * knows only that it was not told.
+   */
+  recipientQueue: RecipientQueue | null;
 }
 
 /**
@@ -562,9 +648,40 @@ export async function inboxSend(
       verifyArgs: { agentIds: [agentId], messageIds: [messageId] },
       drainableBy,
       drainNote: DRAIN_NOTES[drainableBy],
+      // AND HOW DEEP THE QUEUE IS — read AFTER the write, so the number includes this message and is
+      // the depth the NEXT sender would be judged against. Best-effort by construction; see
+      // `readRecipientQueue`.
+      recipientQueue: await readRecipientQueue(agentId),
     });
   } catch (e) {
-    return refuse("inbox_send", "queue-failed", detail(e));
+    // A REFUSAL CARRIES THE DEPTH TOO. Rust's capacity refusals already name it, but a queue-write
+    // failure does not, and a caller that has just been refused is exactly the one that needs to know
+    // whether the recipient is at 3 or at 40 before deciding what to do next.
+    const queue = await readRecipientQueue(agentId);
+    const suffix = queue ? ` ${queue.note}` : "";
+    return refuse("inbox_send", "queue-failed", `${detail(e)}${suffix}`);
+  }
+}
+
+/**
+ * Read the recipient's queue depth. Returns `null` — never a fabricated zero — when it cannot.
+ *
+ * BEST-EFFORT, AND THAT IS THE WHOLE CONTRACT. Every caller invokes this AFTER the decision the send
+ * turned on has already been made, so it must not be able to change that decision: it swallows its
+ * own failure, exactly as `handleSendPeerMessage` places its display append after the one call that
+ * can fail. A depth read that could refuse a message already sitting in the recipient's queue would
+ * report a delivery as a failure, which is the inversion this whole area of the code exists to
+ * prevent.
+ */
+export async function readRecipientQueue(agentId: string): Promise<RecipientQueue | null> {
+  try {
+    const rows = await invoke<InboxStatusRow[]>("inbox_status", { agentIds: [agentId] });
+    // `Array.isArray` rather than optional chaining: this reads a wire payload, and a non-array
+    // answer must produce "unknown" rather than throwing inside a path that has already succeeded.
+    if (!Array.isArray(rows)) return null;
+    return recipientQueueFromRow(rows.find((r) => r?.agentId === agentId) ?? rows[0]);
+  } catch {
+    return null;
   }
 }
 

@@ -3,7 +3,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 // The default deps reach for the real PTY write and the real Tauri bridge. Neither exists under
 // node, and the loop tests inject their own deps anyway — these mocks only keep module load clean.
 const submitPrompt = vi.fn();
-vi.mock("../pty", () => ({ submitPrompt: (...a: unknown[]) => submitPrompt(...a) }));
+// `ptyLiveEpoch` is mocked to a LIVE pty (a non-zero epoch) because these suites drive
+// `defaultFleetWatchDeps()`, whose production wiring imports it. Tests that are ABOUT the pty proof
+// inject their own probe through `realRosterDeps({ ptyEpoch })` and never reach this.
+vi.mock("../pty", () => ({
+  submitPrompt: (...a: unknown[]) => submitPrompt(...a),
+  ptyLiveEpoch: async () => 1,
+}));
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 // A deliberately-rejecting agent logs an error; keep it out of the test output.
@@ -17,6 +23,10 @@ import type { FleetAgentFacts, FleetVerdict, GitFacts, HookFacts } from "../engi
 import type { JudgedDigest, InboxStatusRow } from "./conciergeTools/fleet";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+// The app-owned agent's id and the project namespace its worktree lives under — read from the module
+// that defines them rather than spelled as literals here, so a test asserting on either is comparing
+// against production's constant and not against a second copy of it.
+import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID } from "./sparkleAgent";
 // The hook's renderer, reached directly so the shared provenance banner can be pinned equal across
 // the two delivery paths. Same import shape `sparkleHookInbox.test.ts` uses.
 import { draftDelivery } from "../../src-tauri/resources/sparkle-hook.mjs";
@@ -139,6 +149,7 @@ interface Spies {
   deliver: ReturnType<typeof vi.fn>;
   liveAgents: ReturnType<typeof vi.fn>;
   observedStatus: ReturnType<typeof vi.fn>;
+  ptyLiveEpoch: ReturnType<typeof vi.fn>;
   publishMovement: ReturnType<typeof vi.fn>;
 }
 
@@ -150,6 +161,8 @@ function fakeDeps(opts: {
   pending?: Record<string, number>;
   claimed?: Record<string, ClaimedMessage[]>;
   statuses?: Record<string, AgentTabStatus>;
+  ptyEpochs?: Record<string, number>;
+  ptyProbeThrows?: boolean;
 } = {}): { deps: FleetWatchDeps; spies: Spies } {
   const ids = opts.agents ?? ["a1"];
   const spies: Spies = {
@@ -175,12 +188,21 @@ function fakeDeps(opts: {
       (agentId: string): AgentTabStatus | undefined =>
         opts.statuses === undefined ? "idle" : opts.statuses[agentId],
     ),
+    // Defaults to a LIVE pty (epoch 1) for the same reason `observedStatus` defaults to a mounted
+    // resting pane: that is the only state in which delivery is possible, so it is the baseline a
+    // test opts OUT of. Only app-owned ids are ever probed, so this default cannot mask anything for
+    // a roster agent — no roster path reads it at all.
+    ptyLiveEpoch: vi.fn(async (agentId: string): Promise<number> => {
+      if (opts.ptyProbeThrows) throw new Error("pty probe exploded");
+      return opts.ptyEpochs === undefined ? 1 : (opts.ptyEpochs[agentId] ?? 0);
+    }),
   };
   const deps: FleetWatchDeps = {
     now: () => NOW,
     liveAgents: spies.liveAgents as unknown as FleetWatchDeps["liveAgents"],
     digest: spies.digest as unknown as FleetWatchDeps["digest"],
     observedStatus: spies.observedStatus as unknown as FleetWatchDeps["observedStatus"],
+    ptyLiveEpoch: spies.ptyLiveEpoch as unknown as FleetWatchDeps["ptyLiveEpoch"],
     inboxStatus: spies.inboxStatus as unknown as FleetWatchDeps["inboxStatus"],
     claimForIdle: spies.claimForIdle as unknown as FleetWatchDeps["claimForIdle"],
     deliver: spies.deliver as unknown as FleetWatchDeps["deliver"],
@@ -912,6 +934,265 @@ describe("defaultFleetWatchDeps().liveAgents", () => {
     } as never);
 
     expect(defaultFleetWatchDeps().liveAgents()).toEqual([{ agentId: "keep", projectId: "p1" }]);
+  });
+
+  // ── THE APP-OWNED AGENT THE ROSTER WALK CANNOT SEE (bead sparkle-n2feho.3) ───────────────────
+  //
+  // `__sparkle_self__` is BY CONSTRUCTION never a member of any project's `agents` array
+  // (services/knownAgents' header says so, and services/sparkleAgent's namespace exists precisely
+  // so it cannot be), so the roster walk above could never yield it — the idle sweep, which is the
+  // ONLY delivery path for an agent that has already emitted its last `Stop`, structurally could
+  // not reach the one agent this epic is about.
+  //
+  // These three cases are a set, not three independent facts. The first proves the union yields it,
+  // the second that the open-pane cost gate still binds it, and the third that the union did NOT
+  // become "every open id" — an `observed`-only id has no project and no app-managed worktree, so
+  // there is no `(projectId, agentId)` for `fleet_digest` to build a path from.
+  it("includes the app-owned Improve-Sparkle agent, under its own project namespace", () => {
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({ openAgentIds: [SPARKLE_AGENT_ID], status: {} } as never);
+
+    // NOT a literal `"sparkle-self"` on both sides: the expectation is built from the constant the
+    // Rust worktree layout is keyed on (`sparkle_agent.rs`'s `SPARKLE_PROJECT_ID`), so a ref pointing
+    // at any other namespace — the window's project, a synthetic id — goes red here.
+    expect(defaultFleetWatchDeps().liveAgents()).toEqual([
+      { agentId: SPARKLE_AGENT_ID, projectId: SPARKLE_PROJECT_ID },
+    ]);
+  });
+
+  it("does NOT digest the Sparkle agent when no pane for it is open anywhere", () => {
+    // The same cost gate the roster walk pays: no open pane, no five git spawns and no worktree walk.
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({ openAgentIds: [], status: {} } as never);
+
+    expect(defaultFleetWatchDeps().liveAgents()).toEqual([]);
+  });
+
+  it("does NOT widen to every open id — an observed-only id has no worktree to digest", () => {
+    // The opposite failure direction from the one the fix was about. A union of `open` with no
+    // membership test at all would pass the first case above and put an id with no project here,
+    // whose `(projectId, agentId)` names a directory that does not exist — refused `no-worktree`
+    // after paying for the walk, on every tick, forever.
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({
+      openAgentIds: ["a-stranger"],
+      status: { "a-stranger": "idle" },
+    } as never);
+
+    expect(defaultFleetWatchDeps().liveAgents()).toEqual([]);
+  });
+
+  it("appends the Sparkle agent to the roster walk rather than replacing it", () => {
+    const project: Project = {
+      id: "p1",
+      name: "P",
+      rootPath: "/p",
+      defaultBranch: "main",
+      createdAt: "now",
+      agents: [agent("keep")],
+      selectedAgentId: null,
+    } as Project;
+    useProjectStore.setState({ projects: [project] });
+    useRuntimeStore.setState({
+      openAgentIds: ["keep", SPARKLE_AGENT_ID],
+      status: {},
+    } as never);
+
+    expect(defaultFleetWatchDeps().liveAgents()).toEqual([
+      { agentId: "keep", projectId: "p1" },
+      { agentId: SPARKLE_AGENT_ID, projectId: SPARKLE_PROJECT_ID },
+    ]);
+  });
+});
+
+// ── THE IDLE SWEEP REACHES THE IMPROVE-SPARKLE AGENT (bead sparkle-n2feho.3) ───────────────────
+//
+// A PAIR, and it has to be one: absence passes for BOTH a fixed and an unfixed roster, so a single
+// "it was delivered" case would go green on a sweep that still cannot see this agent if anything
+// else in the chain also broke, and a single "it was refused" case is satisfied by an agent that was
+// never considered at all. Both cases below assert on the WHOLE `skipped`/`delivered` shape, so
+// removing the roster union reds them both: the agent then appears in neither map.
+//
+// They differ in EXACTLY ONE fact — whether `runtimeStore.status` holds an entry for the agent — and
+// they read it through the REAL `defaultFleetWatchDeps()` roster walk and the REAL `observedStatus`,
+// so neither half can drift from what production does.
+describe("pollFleetOnce reaches the app-owned Improve-Sparkle agent", () => {
+  /** Deps that use PRODUCTION's `liveAgents` and `observedStatus` (both read the two stores this
+   *  test seeds) and spy on everything with a side effect. `digest` is derived from whatever
+   *  `liveAgents()` actually returned, so an agent the roster union fails to yield is not digested,
+   *  is never a candidate, and appears nowhere in the tick — which is what makes the pair below
+   *  sensitive to the union rather than to this fixture. */
+  function realRosterDeps(opts: {
+    pending?: Record<string, number>;
+    claimed?: Record<string, ClaimedMessage[]>;
+    /** The PTY epoch the probe reports. Defaults to 1 — a LIVE pty — so a test that is not about
+     *  the pty proof does not have to state it. `0` is "no pty is live under this id". */
+    ptyEpoch?: number;
+    ptyProbeThrows?: boolean;
+  }): {
+    deps: FleetWatchDeps;
+    spies: Pick<Spies, "claimForIdle" | "deliver" | "inboxStatus" | "ptyLiveEpoch">;
+  } {
+    const real = defaultFleetWatchDeps();
+    const spies = {
+      inboxStatus: vi.fn(
+        async (agentIds: string[]): Promise<InboxStatusRow[]> =>
+          agentIds.map((agentId) => row(agentId, opts.pending?.[agentId] ?? 0)),
+      ),
+      claimForIdle: vi.fn(async (agentId: string) => opts.claimed?.[agentId] ?? []),
+      deliver: vi.fn(async () => {}),
+      ptyLiveEpoch: vi.fn(async (): Promise<number> => {
+        if (opts.ptyProbeThrows) throw new Error("pty probe exploded");
+        return opts.ptyEpoch ?? 1;
+      }),
+    };
+    const deps: FleetWatchDeps = {
+      now: () => NOW,
+      liveAgents: real.liveAgents,
+      observedStatus: real.observedStatus,
+      ptyLiveEpoch: spies.ptyLiveEpoch as unknown as FleetWatchDeps["ptyLiveEpoch"],
+      digest: async (agents) =>
+        digestOf(
+          agents.map((a) => facts(a.agentId)),
+          agents.map((a) => verdict(a.agentId)),
+        ),
+      inboxStatus: spies.inboxStatus as unknown as FleetWatchDeps["inboxStatus"],
+      claimForIdle: spies.claimForIdle as unknown as FleetWatchDeps["claimForIdle"],
+      deliver: spies.deliver as unknown as FleetWatchDeps["deliver"],
+      publishMovement: vi.fn(() => {}),
+    };
+    return { deps, spies };
+  }
+
+  it("claims and delivers a pending message to it when its pane is mounted and it is idle", async () => {
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({
+      openAgentIds: [SPARKLE_AGENT_ID],
+      // The one fact that differs from the paired case below: a live status entry, which is this
+      // window's proof that a pane is mounted and therefore that a PTY exists to write to.
+      status: { [SPARKLE_AGENT_ID]: "idle" as AgentTabStatus },
+    } as never);
+    const { deps, spies } = realRosterDeps({
+      pending: { [SPARKLE_AGENT_ID]: 1 },
+      claimed: { [SPARKLE_AGENT_ID]: [msg("m1", "drain your peer inbox", "act")] },
+    });
+
+    const tick = await pollFleetOnce(deps);
+
+    // THE ACCEPTANCE CRITERION: claimed and written to, with the agent having taken no turn.
+    expect(spies.claimForIdle).toHaveBeenCalledWith(SPARKLE_AGENT_ID);
+    const [id, text] = spies.deliver.mock.calls[0] as [string, string];
+    expect(id).toBe(SPARKLE_AGENT_ID);
+    expect(text).toContain("drain your peer inbox");
+    expect(tick.delivered).toEqual([{ agentId: SPARKLE_AGENT_ID, messageIds: ["m1"] }]);
+    expect(tick.skipped).toEqual({});
+  });
+
+  // ── THE STATUS ROW IS NOT PROOF OF A PANE FOR *THIS* ID ─────────────────────────────────────────
+  // Admitting `__sparkle_self__` to the sweep (above) imported a premise that does not hold for it.
+  // `observedStatusRefusal`'s safety argument is "a live status entry is this window's proof that a
+  // pane is mounted" — true for a roster agent, whose rows are written only by a mounted `Terminal`,
+  // and FALSE here: `services/improvementPass` writes `setStatus(SPARKLE_AGENT_ID, "idle")` at the
+  // end of the HEADLESS hourly pass, from a path whose own comment reads "The headless pass has no
+  // PTY and no StatusEngine", and `improvePassLiveness` writes the same key.
+  //
+  // These two assert on the SIDE EFFECT THAT DESTROYS MAIL, not on a reason string: `claimForIdle`
+  // is exactly-once with no un-claim command, so a claim made on a headless status row consumes the
+  // message and then has nothing to write it to. The pair is what makes it non-vacuous — refusing
+  // everything would pass the first alone.
+  it("does NOT claim on a HEADLESS status row — no live pty means the mail stays queued", async () => {
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({
+      openAgentIds: [SPARKLE_AGENT_ID],
+      // Exactly what the headless hourly pass leaves behind: a terminal `idle`, written with no pane
+      // anywhere. Nothing ever removes this id from `openAgentIds`, so `open` says yes as well.
+      status: { [SPARKLE_AGENT_ID]: "idle" as AgentTabStatus },
+    } as never);
+    const { deps, spies } = realRosterDeps({
+      pending: { [SPARKLE_AGENT_ID]: 1 },
+      claimed: { [SPARKLE_AGENT_ID]: [msg("m1", "drain your peer inbox", "act")] },
+      ptyEpoch: 0, // no pty is live under this id
+    });
+
+    const tick = await pollFleetOnce(deps);
+
+    // THE MESSAGE SURVIVES. Not claimed, not written, and named as refused rather than dropped.
+    expect(spies.claimForIdle).not.toHaveBeenCalled();
+    expect(spies.deliver).not.toHaveBeenCalled();
+    expect(tick.delivered).toEqual([]);
+    expect(tick.failed).toEqual([]);
+    expect(tick.skipped).toEqual({ [SPARKLE_AGENT_ID]: "no-live-pty" });
+  });
+
+  it("FAILS CLOSED when the pty probe itself throws — an unanswered probe is not a yes", async () => {
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({
+      openAgentIds: [SPARKLE_AGENT_ID],
+      status: { [SPARKLE_AGENT_ID]: "idle" as AgentTabStatus },
+    } as never);
+    const { deps, spies } = realRosterDeps({
+      pending: { [SPARKLE_AGENT_ID]: 1 },
+      claimed: { [SPARKLE_AGENT_ID]: [msg("m1", "drain your peer inbox", "act")] },
+      ptyProbeThrows: true,
+    });
+
+    const tick = await pollFleetOnce(deps);
+
+    expect(spies.claimForIdle).not.toHaveBeenCalled();
+    expect(tick.skipped).toEqual({ [SPARKLE_AGENT_ID]: "no-live-pty" });
+  });
+
+  it("asks for that proof ONLY for the app-owned id — a roster agent is not probed", async () => {
+    useProjectStore.setState({
+      projects: [
+        {
+          id: "p1",
+          agents: [{ id: "a1", runtime: "local", worktreePath: "/tmp/wt", kind: "build" }],
+        },
+      ],
+    } as never);
+    useRuntimeStore.setState({
+      openAgentIds: ["a1"],
+      status: { a1: "idle" as AgentTabStatus },
+    } as never);
+    const { deps, spies } = realRosterDeps({
+      pending: { a1: 1 },
+      claimed: { a1: [msg("m1", "hello", "act")] },
+      ptyEpoch: 0, // would refuse, IF it were consulted
+    });
+
+    const tick = await pollFleetOnce(deps);
+
+    // The roster agent's premise holds, so the probe is never spent on it and the epoch above is
+    // irrelevant — it is delivered to on the strength of its status row alone, exactly as before.
+    expect(spies.ptyLiveEpoch).not.toHaveBeenCalled();
+    expect(tick.delivered).toEqual([{ agentId: "a1", messageIds: ["m1"] }]);
+  });
+
+  it("still refuses it `no-live-pty` when this window observes no status for it", async () => {
+    useProjectStore.setState({ projects: [] });
+    useRuntimeStore.setState({
+      // Open (so the sweep CONSIDERS it — that is the half this bead fixed) but with no status entry,
+      // which for a local agent is the same event that killed the process: `LocalTransport.detach()`
+      // IS `kill()`. Claiming here would consume the message and report it delivered forever, since
+      // there is no un-claim command.
+      openAgentIds: [SPARKLE_AGENT_ID],
+      status: {},
+    } as never);
+    const { deps, spies } = realRosterDeps({
+      pending: { [SPARKLE_AGENT_ID]: 1 },
+      claimed: { [SPARKLE_AGENT_ID]: [msg("m1", "drain your peer inbox", "act")] },
+    });
+
+    const tick = await pollFleetOnce(deps);
+
+    expect(tick.skipped).toEqual({ [SPARKLE_AGENT_ID]: "no-live-pty" });
+    expect(tick.delivered).toEqual([]);
+    // Not merely undelivered: never claimed and never even asked about, so the message stays
+    // `pending` and the agent's own `Stop` hook drains it when a pane is opened.
+    expect(spies.claimForIdle).not.toHaveBeenCalled();
+    expect(spies.inboxStatus).not.toHaveBeenCalled();
+    expect(spies.deliver).not.toHaveBeenCalled();
   });
 });
 

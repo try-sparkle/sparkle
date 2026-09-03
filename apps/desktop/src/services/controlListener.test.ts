@@ -61,6 +61,12 @@ interface InboxSendArgs {
 const inboxSends: InboxSendArgs[] = [];
 /** Set to make the next `inbox_send` reject, standing in for a full recipient inbox. */
 let inboxSendError: string | null = null;
+/** What `inbox_status` answers — the seam the peer receipt's `recipientQueue` is read from.
+ *
+ *  DEFAULTS TO `undefined`, which is what an unregistered command produces: that is the "could not
+ *  read the depth" case, and it must be the default so every pre-existing test in this file keeps
+ *  driving the arm where the depth is unknown and the send succeeds anyway. */
+let inboxStatusReply: unknown = undefined;
 /** What `agent_concurrency_peak` answers. `null` = a backend that has recorded nothing. */
 let peakRecordReply: unknown = null;
 // ── THE ON-DEMAND LANDING PROBE (`goal_landed_probe.rs::agent_landed_probe`) ─────────────────────
@@ -95,6 +101,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
       inboxSends.push(args as InboxSendArgs);
       if (inboxSendError) throw new Error(inboxSendError);
       return `msg-${inboxSends.length}`;
+    case "inbox_status":
+      return inboxStatusReply;
     // The persistent concurrency record (docs/peak-concurrency.md). `null` stands in for a backend
     // that has never been read — services/peakConcurrency refuses to cache a payload that isn't
     // shaped like a record, so the default leaves `get_state`'s block reporting `observed: false`.
@@ -380,6 +388,8 @@ describe("controlListener", () => {
     useUiStore.getState().setThemePref("auto");
     inboxSends.length = 0;
     inboxSendError = null;
+    // A leaked depth row would silently turn a "could not read it" case into a readable one.
+    inboxStatusReply = undefined;
     // Reset with the rest of the invoke-switch state: a leaked `{ landed: true }` would hand a
     // later refusal test the ancestry proof that unlocks a `landed` goal.
     landedProbeReply = undefined;
@@ -7806,6 +7816,8 @@ describe("send_peer_message", () => {
     controlResponds.length = 0;
     inboxSends.length = 0;
     inboxSendError = null;
+    // A leaked depth row would silently turn a "could not read it" case into a readable one.
+    inboxStatusReply = undefined;
     _resetPeerRateLimitsForTests();
     useConciergeThreadStore.setState({ chat: [] });
     vi.mocked(sparkleActivityLine).mockReturnValue(null);
@@ -8547,6 +8559,89 @@ describe("send_peer_message", () => {
     expect(reply.verifyArgs).toBeNull();
   });
 
+  it("hands the sender the recipient's QUEUE DEPTH on the success receipt, not only in a refusal", async () => {
+    // BEAD sparkle-n2feho.4, closing sparkle-x4mnec's first acceptance criterion verbatim: *"a
+    // sender can see the recipient's queue depth BEFORE being refused."* Depth used to exist in
+    // exactly one place — the text of a capacity refusal — which is too late by construction: the
+    // sender is told how full the queue is by the message telling it the send did not happen.
+    //
+    // IT MATTERS MOST FOR EXACTLY THIS CALLER. The test above pins `verifyWith: null` for an agent
+    // BECAUSE there is no inbox-status op on its surface. A number an agent is not GIVEN is a number
+    // it can never obtain, so the depth has to ride the receipt or it does not reach it at all.
+    //
+    // ASSERTS THE VALUE, not the presence of a field: a `pending` hardcoded to 0 satisfies any
+    // shape check. 37 against a 40-ceiling yields 3 fyi / 13 act of headroom, and neither number
+    // appears in the fixture.
+    inboxStatusReply = [
+      {
+        agentId: otherId,
+        pending: 37,
+        delivered: 0,
+        acknowledged: 0,
+        awaitingAck: 0,
+        pendingIds: [],
+        fyiCeiling: 40,
+        actCeiling: 50,
+      },
+    ];
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    const reply = lastReply() as Record<string, unknown>;
+    expect(reply).toMatchObject({ ok: true, state: "queued", delivered: false });
+    expect(reply.recipientQueue).toMatchObject({
+      pending: 37,
+      fyiCeiling: 40,
+      actCeiling: 50,
+      fyiHeadroom: 3,
+      actHeadroom: 13,
+    });
+    // The message really was queued — a reporting field must never be able to cost a delivery.
+    expect(inboxSends).toHaveLength(1);
+  });
+
+  it("reports an unreadable depth as null and still sends", async () => {
+    // THE PAIRED NEGATIVE, and the arm every other test in this file drives. The depth is a SECOND
+    // call made after the write has already landed, so it must swallow its own failure: a `null`
+    // here means "could not read it", never "the queue is empty", and the send stands regardless.
+    // Without this pairing an implementation that fabricated `pending: 0` — or one that let the
+    // status read reject the whole op — would pass the positive above.
+    inboxStatusReply = undefined;
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    const reply = lastReply() as Record<string, unknown>;
+    expect(reply).toMatchObject({ ok: true, state: "queued", delivered: false });
+    expect(reply.recipientQueue, "an unreadable depth is null, never a fabricated zero").toBeNull();
+    expect(inboxSends).toHaveLength(1);
+  });
+
+  it("puts the depth into a REFUSAL that did not already carry one", async () => {
+    // Rust's capacity refusals name the depth themselves; a queue write that failed for any other
+    // reason does not. The caller standing in front of a refusal is precisely the one that needs to
+    // know whether the peer is at 3 or at 40 before deciding to escalate, wait, or change channel.
+    inboxSendError = "inbox: could not write to a1's queue";
+    inboxStatusReply = [
+      {
+        agentId: otherId,
+        pending: 12,
+        delivered: 0,
+        acknowledged: 0,
+        awaitingAck: 0,
+        pendingIds: [],
+        fyiCeiling: 40,
+        actCeiling: 50,
+      },
+    ];
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    const reply = lastReply() as Record<string, unknown>;
+    expect(reply).toMatchObject({ ok: false, code: "send_failed" });
+    expect(String(reply.error)).toContain("could not write");
+    expect(String(reply.error), "the depth must reach the refused sender too").toContain("12");
+  });
+
   it("gives the CONCIERGE a verification pointer, spelled as the tool it actually invokes", async () => {
     // The paired positive. Without it, an implementation that returned `null` for EVERYONE would
     // pass the test above while removing a pointer the concierge can genuinely follow.
@@ -8610,6 +8705,8 @@ describe("get_state scope: project", () => {
     controlResponds.length = 0;
     inboxSends.length = 0;
     inboxSendError = null;
+    // A leaked depth row would silently turn a "could not read it" case into a readable one.
+    inboxStatusReply = undefined;
     _resetPeerRateLimitsForTests();
     vi.mocked(sparkleActivityLine).mockReturnValue(null);
     useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
@@ -8729,6 +8826,8 @@ describe("get_state scope: fleet — the cross-project address book (bead sparkl
     controlResponds.length = 0;
     inboxSends.length = 0;
     inboxSendError = null;
+    // A leaked depth row would silently turn a "could not read it" case into a readable one.
+    inboxStatusReply = undefined;
     _resetPeerRateLimitsForTests();
     vi.mocked(sparkleActivityLine).mockReturnValue(null);
     useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });

@@ -42,10 +42,12 @@ import type { Project } from "../types";
  * (the empty-state button, the babysit dispatcher), nothing downstream could tell the two apart.
  *
  * The cost is not cosmetic. `epicSweepRunner.boundAgentsFor` is `kind === "build" && epicId ===
- * <epic>` and reads the ROW ALONE — no bead, no parent edge — and it is what every staffing reading
- * asks: the sweep's watch gate, `pusherMount.improveUnstaffedEpics`, and
- * `planView.orchestratorNameForEpic`. An agent dropped onto an epic therefore staffed nothing, and
- * the epic sat unstaffed with a live agent working it.
+ * <epic>` and reads the ROW ALONE — no bead, no parent edge. It is the RAW BINDING, read by the
+ * sweep's watch gate, the sweep's marker self-heal, and `planView.orchestratorNameForEpic`; the
+ * LIVENESS readings (`candidateFor`'s `orchestratorAlive`, `pusherMount.improveUnstaffedEpics`)
+ * resolve through `epicSweepRunner.staffingAgentsFor` instead, since bead `sparkle-n2feho.5`. A
+ * dropped spawn that discards the epic is invisible to BOTH — the row carries neither an `epicId`
+ * nor a bead parented to the epic — so the epic sat unstaffed with a live agent working it.
  *
  * ── READ LIVE, AT THE DROP, AND FROM THE OWNING SIDE ─────────────────────────────────────────
  * Two things this deliberately does NOT do:

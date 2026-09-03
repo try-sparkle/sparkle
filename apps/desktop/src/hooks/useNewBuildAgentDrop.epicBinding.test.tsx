@@ -9,9 +9,11 @@
 // the gesture and the shared spawn — and nothing anywhere said so.
 //
 // ── WHY THESE ASSERT THROUGH `boundAgentsFor` AND NOT ON THE SPAWN'S ARGUMENTS ────────────────────
-// `epicSweepRunner.boundAgentsFor` is `kind === "build" && epicId === <epic>` and it is the ONE
-// query every staffing reading uses — the sweep's watch gate, `pusherMount.improveUnstaffedEpics`,
-// `planView.orchestratorNameForEpic`. Asserting that `useSpawnBuildAgent` was CALLED with the epic
+// `epicSweepRunner.boundAgentsFor` is `kind === "build" && epicId === <epic>` — the RAW BINDING,
+// read by the sweep's watch gate, its marker self-heal, and `planView.orchestratorNameForEpic`. (The
+// LIVENESS readings resolve through `staffingAgentsFor` since bead `sparkle-n2feho.5`; a row that
+// discards the epic is invisible to that one too, since it has neither field to resolve.) Asserting
+// that `useSpawnBuildAgent` was CALLED with the epic
 // proves the argument moved; it does not prove the epic can be seen as staffed, which is the whole
 // defect. So these tests mock nothing on the spawn path: the real hook drives the real
 // `spawnBuildAgentInProject`, the row is read back out of the real `projectStore`, and the real

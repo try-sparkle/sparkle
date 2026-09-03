@@ -387,6 +387,22 @@ pub struct InboxStatus {
     pub awaiting_ack: u32,
     /// Ids still pending, so a caller can name them rather than only count them.
     pub pending_ids: Vec<String>,
+    /// The ceiling an incoming [`Severity::Fyi`] is judged against — [`FYI_CEILING`].
+    ///
+    /// CARRIED SO A SENDER CAN SEE THE DEPTH *BEFORE* IT IS REFUSED (bead sparkle-n2feho.4). `pending`
+    /// alone is a number with no scale: 38 is either comfortable or one send from eviction depending
+    /// on a constant that lives only in this file. Both ceilings ride the status row so the frontend
+    /// never has to keep a second copy of 40 and 50 — two literals in two packages are two numbers
+    /// that look like one, and the drift is silent.
+    ///
+    /// A PLAIN `u32`, DELIBERATELY NOT AN `Option`. A Rust `Option<T>` crosses the wire as `null` and
+    /// a TypeScript `field?: T` excludes `null`, which is the silent seam `AGENTS.md` documents; a
+    /// required scalar has no such seam. It is `?:` on the TS side only so existing fixtures that
+    /// build a row by hand keep compiling — the real command always sends it.
+    pub fyi_ceiling: u32,
+    /// The ceiling an incoming [`Severity::Act`] is judged against — [`MAX_PER_AGENT`]. See
+    /// [`InboxStatus::fyi_ceiling`] for why both are carried and why neither is an `Option`.
+    pub act_ceiling: u32,
 }
 
 fn now_ms() -> i64 {
@@ -737,12 +753,29 @@ pub fn enqueue(
                     // No `fyi` to evict means every slot up to the ceiling is `act`. An incoming
                     // `fyi` may NEVER evict an `act`, nor consume an Act-reserved slot — so this lone
                     // case stays a refusal for the `fyi` class.
+                    //
+                    // THE REMEDY MUST BE ONE THE REFUSED SENDER CAN ACTUALLY FOLLOW (bead
+                    // sparkle-n2feho.4, the `sparkle-8bvh` shape). This used to say *"resend as `act`
+                    // only if it genuinely needs doing"* — and the sender most likely to be standing
+                    // here is a PEER, whose severity is hardcoded `fyi` in `services/peerMessaging.ts`
+                    // with no argument that can change it. So the one instruction offered was a dead
+                    // end: following it is impossible, and an agent that tries reads the second
+                    // refusal as the channel being broken. The escalation is named as the CONCIERGE's
+                    // to make, and the peer is told what to do instead — which is to stop sending.
+                    //
+                    // The DEPTH rides the message for the same reason it rides the success receipt:
+                    // a sender that is told a number can tell "one message ahead of me" from "forty",
+                    // and a bare "refused" cannot be acted on at all.
                     None => {
+                        let depth = queued.len();
                         return Err(format!(
-                            "inbox: {agent_id} is at the {FYI_CEILING} `fyi` ceiling with no `fyi` \
-                             message to evict — every queued slot holds an `act` message, which is \
-                             never evicted; resend as `act` only if it genuinely needs doing before \
-                             the agent continues"
+                            "inbox: {agent_id} has {depth} message(s) pending against the \
+                             {FYI_CEILING}-message `fyi` ceiling and EVERY ONE of them is an `act`, \
+                             which an `fyi` never evicts — so there is nothing to make room and \
+                             nothing was queued. This clears only when that agent drains its queue: \
+                             do not re-send. A peer send is always `fyi` and cannot be escalated; if \
+                             it cannot wait, ask the concierge, whose `act` sends are judged against \
+                             the {MAX_PER_AGENT}-message ceiling instead"
                         ));
                     }
                 }
@@ -750,9 +783,11 @@ pub fn enqueue(
             // `Act` is consequential: never evicted, and it never evicts. When its slots are
             // genuinely full of `act`, that send alone is refused, exactly as before.
             Severity::Act => {
+                let depth = queued.len();
                 return Err(format!(
-                    "inbox: {agent_id} already has {MAX_PER_AGENT} undelivered messages; \
-                     it is not draining them — check its Level 0 verdict before sending more"
+                    "inbox: {agent_id} already has {depth} undelivered messages, at the \
+                     {MAX_PER_AGENT}-message ceiling; it is not draining them — check its Level 0 \
+                     verdict before sending more"
                 ));
             }
         }
@@ -851,6 +886,8 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
             acknowledged: 0,
             awaiting_ack: 0,
             pending_ids: Vec::new(),
+            fyi_ceiling: FYI_CEILING as u32,
+            act_ceiling: MAX_PER_AGENT as u32,
         };
     }
     let claims = claims_dir(app_data, agent_id);
@@ -894,6 +931,8 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
         // Saturating: an ack for a message whose claim file was reaped must not underflow.
         awaiting_ack: delivered.saturating_sub(acknowledged),
         pending_ids,
+        fyi_ceiling: FYI_CEILING as u32,
+        act_ceiling: MAX_PER_AGENT as u32,
     }
 }
 
@@ -2157,7 +2196,7 @@ mod tests {
         }
         let err = send(&base2, "a1", "context", 1_000, "fyi-blocked")
             .expect_err("a fyi at the ceiling with no fyi to evict must be refused, not evict an act");
-        assert!(err.contains("no `fyi` message to evict"), "the refusal must say why: {err}");
+        assert!(err.contains("EVERY ONE of them is an `act`"), "the refusal must say why: {err}");
         // The side effect that matters: no act was displaced and the fyi was not queued.
         let q2 = pending(&base2, "a1", 1_000);
         assert_eq!(q2.len(), FYI_CEILING, "nothing was evicted or added");
@@ -2165,6 +2204,102 @@ mod tests {
         assert_eq!(q2.iter().filter(|m| m.severity == Severity::Act).count(), FYI_CEILING);
         std::fs::remove_dir_all(&base).ok();
         std::fs::remove_dir_all(&base2).ok();
+    }
+
+    /// A REFUSED SENDER IS TOLD THE RECIPIENT'S ACTUAL DEPTH, not merely that it was refused
+    /// (bead sparkle-n2feho.4). Asserts the NUMBER, and the fixture is built so that number cannot
+    /// be confused with either constant: 45 acts are pending, which is above `FYI_CEILING` (40) and
+    /// below `MAX_PER_AGENT` (50), so a mutation that printed a ceiling in place of the live depth
+    /// changes this string. A test filled to exactly the ceiling would pass against that mutation.
+    #[test]
+    fn the_all_act_fyi_refusal_names_the_live_depth_and_a_remedy_a_peer_can_follow() {
+        let base = tmp("depth-fyi-refusal");
+        let depth = FYI_CEILING + 5;
+        assert!(depth < MAX_PER_AGENT, "the fixture depth must differ from BOTH ceilings");
+        for i in 0..depth {
+            send_act(&base, "a1", "act", 1_000, &format!("a{i}")).unwrap();
+        }
+        let err = send(&base, "a1", "context", 1_000, "fyi-blocked")
+            .expect_err("an all-act queue at the fyi ceiling still refuses a fyi");
+
+        assert!(
+            err.contains(&format!("has {depth} message(s) pending")),
+            "the refusal must name the LIVE depth ({depth}), not a constant: {err}"
+        );
+        assert!(
+            err.contains(&format!("{FYI_CEILING}-message `fyi` ceiling")),
+            "a depth with no scale cannot be acted on: {err}"
+        );
+
+        // THE REMEDY HALF. `send_peer_message` is hardcoded `fyi` (services/peerMessaging.ts), so
+        // "resend as `act`" — what this refusal used to say — is an instruction a peer CANNOT follow.
+        // Pin both directions: the dead instruction is gone, and something a peer can actually do is
+        // in its place.
+        assert!(
+            !err.contains("resend as `act`"),
+            "the refusal still tells a peer to do the one thing its surface cannot do: {err}"
+        );
+        assert!(
+            err.contains("do not re-send"),
+            "a refused peer must be told to stop, not left to guess: {err}"
+        );
+        assert!(
+            err.contains("ask the concierge"),
+            "the escalation must name who CAN send an `act`: {err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The `act` refusal carries the depth too. It coincides with `MAX_PER_AGENT` by construction —
+    /// `enqueue` cannot admit a 51st — so this pins the reported number and the scale rather than
+    /// discriminating between them; the fyi test above is what pins depth against the constants.
+    #[test]
+    fn the_full_queue_act_refusal_names_the_depth_and_the_ceiling() {
+        let base = tmp("depth-act-refusal");
+        for i in 0..MAX_PER_AGENT {
+            send_act(&base, "a1", "act", 1_000, &format!("a{i}")).unwrap();
+        }
+        let err = send_act(&base, "a1", "one too many", 1_000, "overflow").unwrap_err();
+        assert!(
+            err.contains(&format!("already has {MAX_PER_AGENT} undelivered messages")),
+            "the refusal must name the depth: {err}"
+        );
+        assert!(
+            err.contains(&format!("{MAX_PER_AGENT}-message ceiling")),
+            "the refusal must name the ceiling that depth is judged against: {err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE POINT OF THE WHOLE UNIT: depth is readable BEFORE a refusal, and it comes with the scale
+    /// to read it against. A sender that can only learn the number by being refused has learned it
+    /// too late (bead sparkle-x4mnec's first acceptance criterion).
+    ///
+    /// Asserts the VALUE — a `pending` that is always 0 passes a mere field-exists test — and asserts
+    /// the two ceilings are DIFFERENT numbers carried in the right fields, which is what a swap
+    /// mutation breaks.
+    #[test]
+    fn a_status_row_carries_the_live_depth_and_both_ceilings_before_any_refusal() {
+        let base = tmp("depth-status");
+        for i in 0..7 {
+            send(&base, "a1", "ctx", 1_000, &format!("f{i}")).unwrap();
+        }
+        let st = status_of(&base, "a1", 1_000);
+        assert_eq!(st.pending, 7, "the row must report the live depth, not a placeholder");
+        assert_eq!(st.fyi_ceiling, FYI_CEILING as u32);
+        assert_eq!(st.act_ceiling, MAX_PER_AGENT as u32);
+        assert_ne!(
+            st.fyi_ceiling, st.act_ceiling,
+            "the two ceilings are different numbers; a row reporting one for both is unreadable"
+        );
+
+        // AND THE WIRE SHAPE. `InboxStatus` is `rename_all = "camelCase"`, so a TS reader declaring
+        // these snake_case would read `undefined` for both with NOTHING logged — the silent seam
+        // `AGENTS.md` documents. Pin the keys the frontend actually receives.
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains("\"fyiCeiling\":40"), "wire key/value drift: {json}");
+        assert!(json.contains("\"actCeiling\":50"), "wire key/value drift: {json}");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

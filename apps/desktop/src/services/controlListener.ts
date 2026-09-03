@@ -168,6 +168,10 @@ import {
   sendPeerInboxMessage,
 } from "./peerMessaging";
 import { logPeerMessage, peerMessageEntry } from "./peerMessageLog";
+// The recipient's queue depth, read the same way `fleet.inboxSend` reads it — ONE definition of
+// "how deep is this inbox and what does that number mean", because the concierge and an agent must
+// not be told two different stories about the same queue.
+import { readRecipientQueue } from "./conciergeTools/fleet";
 // The preview supervisor's wrappers — the ONE module that invokes the Rust preview commands, so
 // this handler never touches `invoke` directly (services/preview's own header explains why).
 import {
@@ -4301,10 +4305,30 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // Give the reservation back: nothing was delivered, so nothing should have been spent. Without
     // this, an agent whose peer is at its inbox cap burns its whole budget on sends that never landed.
     releasePeerSend(req.callerAgentId, targetId, now);
-    // The inbox refuses rather than evicting when an agent is at its cap, and that refusal names the
-    // reason — pass it through rather than flattening it, because "they are not draining their
-    // inbox" is actionable and "send failed" is not.
-    return peerRefusal("send_failed", errMsg(e));
+    // WHAT A CAPACITY REFUSAL ACTUALLY MEANS NOW — the comment here used to say *"the inbox refuses
+    // rather than evicting when an agent is at its cap"*, and that has been FALSE for this path since
+    // the `fyi` class became a ring buffer (`inbox.rs` `enqueue`). A peer send is hardcoded `fyi`
+    // (`peerMessaging.sendPeerInboxMessage`), so at the ceiling it EVICTS the recipient's stalest
+    // `fyi` and succeeds. The one surviving capacity refusal for this path is the case where every
+    // queued slot holds an `act`, which an `fyi` may never evict — and Rust names that reason and the
+    // live depth in its message, which is why it is passed through rather than flattened: "they are
+    // not draining their inbox, and here is how deep it is" is actionable and "send failed" is not.
+    //
+    // The depth is appended for the refusals Rust does NOT name one in (a queue write that failed for
+    // some other reason), so a refused sender is never left without the number. Best-effort: see
+    // `readRecipientQueue`.
+    //
+    // CONDITIONAL, and that word is the whole of it. Rust's capacity refusals already name the
+    // ceiling and the live depth, and the surviving one for this path is the all-`act` queue — the
+    // single case in which an `fyi` is REFUSED rather than evicting. Appending the generic note
+    // there would answer Rust's "nothing was queued, do not re-send" with "your next `fyi` evicts
+    // and succeeds", i.e. tell the sender to do the exact thing that just failed. That is the
+    // `sparkle-8bvh` shape — a remedy that is unsafe under the very condition that triggered it —
+    // and this commit exists partly to remove it, so it must not reintroduce it one layer out.
+    const rawErr = errMsg(e);
+    const alreadyNamesDepth = /ceiling|undelivered|queued/i.test(rawErr);
+    const refusedQueue = alreadyNamesDepth ? null : await readRecipientQueue(targetId);
+    return peerRefusal("send_failed", refusedQueue ? `${rawErr} ${refusedQueue.note}` : rawErr);
   }
   // SHOW IT TO THE HUMAN. Until this call, a peer message went into the recipient's inbox and
   // NOWHERE ELSE: the founder could see two agents converge on one file but never the sentence where
@@ -4359,12 +4383,24 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   //
   // Additive: `docs/agent-peer-messaging.md` §1 froze `{ ok, messageId, to }` and every one of those
   // fields still means exactly what it did.
+  //
+  // AND THE DEPTH RIDES THE SUCCESS RECEIPT (bead `sparkle-n2feho.4`, closing `sparkle-x4mnec`'s
+  // first acceptance criterion: *"a sender can see the recipient's queue depth BEFORE being
+  // refused."*). Depth used to exist only inside the text of a refusal, which is too late by
+  // construction — the sender is told how full the queue is by the message saying its send did not
+  // happen. It matters most for exactly the caller `verifyWith: null` describes below: an agent has
+  // no inbox-status op it may call, so a number it is not GIVEN is a number it can never obtain.
+  // Read after the enqueue, so it counts this message and is the depth the next sender faces.
+  const recipientQueue = await readRecipientQueue(targetId);
+
   return {
     ok: true,
     messageId,
     to: { id: targetId, name: targetName },
     state: "queued",
     delivered: false,
+    /** How deep the recipient's queue is — `null` means it could not be read, never "empty". */
+    recipientQueue,
     // THE POINTER MUST BE FOLLOWABLE BY WHOEVER IS HOLDING IT (roborev 66025, finding 2).
     //
     // `fleet.inbox_status` lives behind `sparkle_fleet` -> `concierge_tool`, and `handleConciergeTool`

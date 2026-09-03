@@ -80,7 +80,10 @@ export const BUDGET_WINDOW_MS = 60 * 60 * 1000;
  * Percentage fill above which a Pusher declines to send at all.
  *
  * COST, from the design: every message consumes one slot against the inbox's `MAX_PER_AGENT`, and
- * the inbox REFUSES WHEN FULL RATHER THAN EVICTING. So a talkative Pusher does not merely annoy its
+ * the inbox REFUSES AN `act` WHEN FULL RATHER THAN EVICTING ANYTHING. (The qualifier is load-bearing
+ * since `inbox.rs` made the `fyi` class a ring buffer: an `fyi` at its own lower ceiling evicts the
+ * stalest `fyi` instead of being refused. A Pusher message is `act`, and an `act` is never evicted
+ * and never evicts, so the cost below is unchanged.) So a talkative Pusher does not merely annoy its
  * partner — it can exhaust the partner's inbox and starve the CONCIERGE's ability to reach the same
  * builder. The concierge's message is the one that carries human intent; the Pusher's is the one
  * that can wait. This threshold encodes that priority: the Pusher yields the last fifth of the

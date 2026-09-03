@@ -71,7 +71,7 @@ import { localAgentCapacity } from "./agentCapacity";
 import { goalStateOf, type AgentGoal } from "../engine/agentGoal";
 import type { AgentTabStatus } from "../types";
 import { epicIndexOf } from "./beads";
-import { boundAgentsFor } from "./epicSweepRunner";
+import { staffingAgentsFor } from "./epicSweepRunner";
 import {
   epicOrchestratorLiveness,
   orchestratorLivenessOf,
@@ -492,8 +492,12 @@ function improveLocalCapacity(): {
  * 60s tick — and REUSING that engine's own primitives so the two can never drift about what "bound"
  * or "alive" means:
  *   • `epicIndexOf(beads).childrenByParent.has(id)` is the has-children (buildable) test.
- *   • `boundAgentsFor(agents, id)` is the ONE definition of "which build agents are bound to this epic"
- *     (`epicSweepRunner`), so an epic reads staffed iff a bound agent is LIVE.
+ *   • `staffingAgentsFor(agents, beads, id)` is the ONE definition of "which build agents are working
+ *     this epic" (`epicSweepRunner`, which delegates the membership edge to `epicLadder`), so an epic
+ *     reads staffed iff one of them is LIVE. It resolves rather than matching `AgentTab.epicId` raw:
+ *     a `mode: "task"` handoff stamps a TASK bead id into that field, so the raw predicate returned
+ *     NOTHING for an epic the Epics column was simultaneously rendering as staffed, and this counter
+ *     shouted three-alarm about an epic somebody was actively building (bead `sparkle-n2feho.5`).
  *   • `orchestratorLivenessOf` + `epicOrchestratorLiveness` (`engine/orchestratorLiveness`) is the ONE
  *     staffing reading, joining the window-local `processAliveFor` status with the durable
  *     `fleet_digest` hook-log witness — the SAME join `epicSweepRunner.candidateFor` uses. An
@@ -550,7 +554,7 @@ function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number | null }
     // unknown-`null`) and otherwise takes the tri-state liveness verdict. Dropping either half silently
     // re-opens the other's bug — proven by the paired mutation tests in `pusherMount.improveNudge.test.ts`.
     const liveness = epicOrchestratorLiveness(
-      boundAgentsFor(agents, b.id).map((a) =>
+      staffingAgentsFor(agents, beads, b.id).map((a) =>
         agentIsFinished(a, rt.status, openIds, now)
           ? false
           : orchestratorLivenessOf(
