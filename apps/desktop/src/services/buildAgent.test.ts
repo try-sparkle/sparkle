@@ -1024,12 +1024,42 @@ describe("orchestrationPersona", () => {
   it("makes it drain roborev findings on each worker branch BEFORE spinning the worker down", () => {
     // spin_down deletes the worktree (not a checkout), so the pre-checkout gate never fires and
     // FAIL findings on worker commits would orphan. The persona must instruct an explicit drain.
-    expect(p).toMatch(/roborev list --open/);
+    expect(p).toMatch(/roborev-authored-findings\.sh/);
     expect(p).toMatch(/triage/i);
     // The drain must be ordered BEFORE the spin-down, not after.
-    expect(p.indexOf("roborev list --open")).toBeLessThan(p.lastIndexOf("spin_down_worker"));
+    expect(p.indexOf("roborev-authored-findings.sh")).toBeLessThan(
+      p.lastIndexOf("spin_down_worker"),
+    );
     // References the cross-branch sweep backstop.
     expect(p).toContain("roborev-list-all.py");
+  });
+
+  /* The persona must NOT prescribe `roborev list --open --branch` (bead `sparkle-awpy7`, SEV4, the
+   *  root of ~40 siblings). That command exits 0 while printing "failed to connect to daemon" plus a
+   *  usage dump, so reviewed-and-clean, every-job-crashed and daemon-never-reachable are BYTE-
+   *  IDENTICAL answers — and it does not fail on a branch that no longer exists, so after a merge it
+   *  reports on OTHER branches' commits and still reads as an all-clear. AGENTS.md bans it; the
+   *  persona is the MACHINE path that actually runs at spin-down, so a ban the persona contradicts
+   *  is not a ban. This is the negative half of the pair above: the positive assertion alone is
+   *  satisfied by a persona that names the right script and ALSO still prescribes the wrong one. */
+  it("does NOT prescribe the banned roborev list --open drain command", () => {
+    /* MENTION vs PRESCRIPTION. The honest replacement has to NAME the banned command in order to
+     *  warn agents off it, so a bare /roborev list --open/ ban reds the correct copy — the same
+     *  shape AGENTS.md records for copy ratchets, where the negative matches its own required
+     *  denial. The negation lookbehind is what separates the two, and it belongs HERE and never in
+     *  the shipped module: a lookbehind is a parse error in the safari14 WebView the app pins. */
+    /* TWO lookbehinds, not one with an optional backtick: with `?` the engine simply retries one
+     *  character later, at the `r`, where the preceding text ends in a backtick and the single
+     *  lookbehind is satisfied — so the ratchet reds its own denial anyway. Each accepted prefix
+     *  needs its own lookbehind, exactly as the paired-ratchet example in AGENTS.md does. */
+    expect(p, "persona must not PRESCRIBE the banned `roborev list --open` drain").not.toMatch(
+      /(?<!NEVER drain with )(?<!NEVER drain with `)roborev list --open/,
+    );
+    // ...and the warning that earns that exemption must actually be present, or the lookbehind
+    // silently turns this ratchet into one that permits the very thing it exists to ban.
+    expect(p, "the NEVER-drain warning must be present to justify the lookbehind").toContain(
+      "NEVER drain with `roborev list --open --branch`",
+    );
   });
 
   it("reflects a different cap value", () => {

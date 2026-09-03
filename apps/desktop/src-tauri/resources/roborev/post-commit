@@ -270,17 +270,56 @@ if [ "${ROBOREV_REVIEW_TEMP_REPOS:-}" != "1" ] && is_ephemeral_repo "$_ephemeral
     exit 0
 fi
 
-# Skip enqueue for PRD-only commits. PRD/ holds progress narrative (CLAUDE.md: "narrative + concerns
-# + context only"), never code — reviewing it spends a worker and the shared Claude quota for zero
-# gate value, and the agent fleet commits these constantly (a progress-doc update rides most commits).
-# Skip ONLY when EVERY changed path is under PRD/: a commit that also touches code is still reviewed.
-# Same never-skip-on-ambiguity posture as the guards above — an empty file list (root commit, a merge
-# that diff-tree shows nothing for, or an unreadable tree) falls through and IS enqueued. `grep -qv`
-# exits 0 iff some line is NOT under PRD/; negating it means "every changed path is PRD/". POSIX sh.
+# Skip enqueue for NARRATIVE-only commits. PRD/ holds progress narrative (CLAUDE.md: "narrative +
+# concerns + context only") and docs/*.md is prose in the same sense; neither is code — reviewing
+# them spends a worker and the shared Claude quota for zero gate value, and the agent fleet commits
+# these constantly (a progress-doc update rides most commits).
+# Skip ONLY when EVERY changed path is narrative: a commit that also touches code is still reviewed.
+#
+# MATCH THE EXTENSION UNDER docs/, NOT THE DIRECTORY. `docs/` is not all prose: it holds
+# `docs/schemas/worker-retro.schema.json` (a wire contract consumed by code) and
+# `docs/token-maxer-gap-analysis.html` today, and anything added there later would inherit the skip.
+# A bare `^docs/` would silently drop those from review entirely — the same silent-no-review failure
+# the guards above are each written to avoid — and it is unbounded going forward.
+#
+# Deliberately NOT widened to all `*.md`: AGENTS.md and README are markdown but are load-bearing
+# contract rather than narrative.
+# Same never-skip-on-ambiguity posture as the guards above — an EMPTY file list (a root commit, a
+# merge, an unreadable tree) falls through and IS enqueued; see the block below for why no
+# empty-diff skip belongs here. `grep -qv` exits 0 iff some line is NOT narrative; negating it means
+# "every changed path is". POSIX sh.
 _changed=$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)
-if [ -n "$_changed" ] && ! printf '%s\n' "$_changed" | grep -qvE '^PRD/'; then
+if [ -n "$_changed" ] && ! printf '%s\n' "$_changed" | grep -qvE '^(PRD/|docs/.*\.md$)'; then
     exit 0
 fi
+
+# DELIBERATELY NO EMPTY-DIFF / MERGE SKIP HERE. This was written, tested, reviewed and REMOVED;
+# the reasoning is recorded so the next reader does not re-add it.
+#
+# A merge commit's diff-tree output is empty (git suppresses merge diffs by default), so roborev
+# reviews nothing and answers with the sentinel "The diff is empty — this is a merge commit with no
+# changes to review": 788 such reviews all-time, 54 since 2026-08-01, each spending a worker and
+# shared quota for no gate value. Skipping the enqueue looks like free savings. It is not.
+#
+# WHICH MERGES REACH THIS HOOK AT ALL: a clean `git merge` fires post-MERGE, not post-commit, so the
+# only merges arriving here are CONFLICT-RESOLVED ones committed explicitly. That is precisely the
+# set `scripts/roborev-authored-findings.sh` refuses to exempt: its `merge_introduces_nothing()`
+# exempts a merge only when the tree equals `git merge-tree --write-tree <p1> <p2>` — no human
+# decision entered it. A conflict resolution DID record a decision, and take-ours / take-theirs /
+# delete-what-the-other-side-added are exactly the silent-drop shapes `merge-drop-check.sh` exists
+# to catch.
+#
+# So skipping here does not remove a useless review; it removes the JOB ROW. The SHA then lands in
+# that script's `missing_shas`, which returns 4 NOT REVIEWED, which `pre-merge-gate.sh` surfaces as
+# 12 and `roborev-fanout-review-gate.sh` folds in at its 4 tier. Every branch following AGENTS.md's
+# prescribed "merge origin/main in" workflow that hits a conflict would be blocked by its own
+# pre-merge gate, with NO finding to fix and no way to clear it but a manual `roborev review <sha>`.
+# That trades an INTERMITTENT false FAIL for a DETERMINISTIC block on the same shape — strictly
+# worse, and self-inflicted on the gate this same branch was strengthening.
+#
+# The narrowed alternative is a no-op: skipping only merges whose tree equals the auto-merge result
+# would skip nothing, because those never reach post-commit. If this is ever revisited, the hook's
+# skip and the gate's exemption must move together as ONE predicate, in one commit.
 
 # Round-cap: stop auto-enqueuing once a branch has piled up many un-landed commits — the signature of
 # a non-convergent fix->review->fix loop, where each fix commit spawns another review and the loop
