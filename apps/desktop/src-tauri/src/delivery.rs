@@ -81,10 +81,8 @@ pub struct DeliveryEvidence {
 fn git_ok(cwd: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
-    // Never let git block on an interactive credential/host-key prompt (mirrors worktree.rs).
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // Never let git block on an interactive credential/host-key prompt — the ONE shared definition.
+    crate::claude_oneshot::apply_noninteractive(&mut cmd);
     let out = cmd.output().ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())

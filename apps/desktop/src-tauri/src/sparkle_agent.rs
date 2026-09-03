@@ -51,9 +51,9 @@ pub struct SparkleWorkspace {
 /// Mirror worktree.rs's non-interactive git env so a clone/fetch can never hang the UI on a
 /// credential/host-key prompt. A public clone needs no auth; this just fails fast if it ever does.
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
     // Mirrored too: this module's fixtures commit into throwaway repos under the temp dir, so they
     // must not fire the developer's hooks either. See worktree.rs for why.
     #[cfg(test)]

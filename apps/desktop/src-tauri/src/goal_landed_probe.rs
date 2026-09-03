@@ -106,10 +106,8 @@ impl LandedProbe {
 fn git_output(cwd: &Path, args: &[&str], timeout: Duration) -> Result<std::process::Output, String> {
     let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-    crate::claude_oneshot::apply_noninteractive_pager(&mut cmd);
+    // The ONE shared definition (git/gh non-interactive env + pager).
+    crate::claude_oneshot::apply_noninteractive(&mut cmd);
     output_with_timeout(cmd, timeout)
 }
 

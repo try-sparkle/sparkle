@@ -2133,9 +2133,9 @@ mod rest_fallback_tests {
 /// Force `gh`/`git` to fail fast rather than block on an interactive credential or host-key prompt.
 /// A hung child on a repeating timer is how a background thread stops being a background thread.
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
 }
 
 /// Commits on the base that this PR's head does not contain, computed LOCALLY.

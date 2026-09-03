@@ -1037,11 +1037,9 @@ fn gate_from_stdout(stdout: &str, number: u64) -> ProbeGate {
 /// Keep `gh` from ever blocking on a prompt. Mirrors the same helper in `worktree.rs` /
 /// `roborev_probe.rs` — each module carries its own copy by house precedent.
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
 }
 
 /// Read one PR's probe state. Never `Err`s for a GitHub-side failure — see the module header; a

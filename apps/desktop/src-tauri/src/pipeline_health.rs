@@ -2350,11 +2350,9 @@ fn read_knightwatch_liveness(gh_program: Option<&str>, root: &str) -> Option<Kni
 /// Keep any child from blocking on a prompt. Mirrors the per-module copy in `worktree.rs` /
 /// `roborev_probe.rs` (house precedent is one copy per module rather than a shared import).
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
 }
 
 /// Run `roborev status` in `root`, mapping the outcome to a [`StatusProbe`]. A timeout becomes

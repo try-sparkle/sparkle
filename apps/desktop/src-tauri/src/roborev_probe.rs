@@ -431,9 +431,9 @@ fn extract_review_output(stdout: &str) -> Option<String> {
 /// `github.rs` (each module carries its own copy by house precedent): the CLI shells out to git for
 /// diffs, so the git prompt vars are the ones that matter.
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
 }
 
 /// Whether roborev is the gate on this machine, and where its binary is. `None` means the gate does

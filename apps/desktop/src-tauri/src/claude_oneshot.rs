@@ -843,6 +843,28 @@ pub(crate) fn apply_noninteractive_pager(cmd: &mut Command) {
     }
 }
 
+/// The FULL non-interactive environment for a spawned `git`/`gh` subprocess whose output we
+/// CAPTURE: no credential or terminal prompt, no SSH interactivity, no `gh` prompt or update
+/// notifier, and no pager (via [`apply_noninteractive_pager`]).
+///
+/// This is the ONE definition. It replaces what had become eight per-module copies that drifted
+/// apart silently: some set only the three `GIT_*` vars, some added the two `GH_*` vars, some the
+/// pager, in every combination. The gaps were latent hangs for an external user — a module that
+/// shells `gh` but set only the `GIT_*` vars could still stall on `gh`'s update-notifier or auth
+/// prompt. Applying the whole superset everywhere is safe: `git` ignores the `GH_*` names, `gh`
+/// ignores the `GIT_*` names, and every caller here captures with `.output()`, which already makes
+/// each tool self-disable its pager — so the pager vars are a harmless backstop, not a change of
+/// behavior. Callers keep a thin module-local `apply_noninteractive` that delegates here (plus, in
+/// the git-fixture modules, `#[cfg(test)]` hook isolation), so there is no env logic left to drift.
+pub(crate) fn apply_noninteractive(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_ASKPASS", "true");
+    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive_pager(cmd);
+}
+
 /// Run one call and return the model's reply text. `Err` on every failure so callers degrade.
 pub(crate) fn run(req: OneShot<'_>) -> Result<OneShotReply, String> {
     let claude_path = crate::preflight::cached_claude_path().ok_or_else(|| {
@@ -3093,6 +3115,44 @@ mod tests {
                 "{name} is scrubbed in Rust but NOT unset before `claude auth login` in \
                  claudeSpawn.ts. Add it to ANTHROPIC_ENV_UNSET (and its test's UNSET_PREFIX), or \
                  the login writes a credential the auth probe does not read."
+            );
+        }
+    }
+
+    #[test]
+    fn apply_noninteractive_sets_the_full_git_gh_and_pager_superset() {
+        // The SIDE EFFECT — the child's environment — for the ONE consolidated helper. Before
+        // consolidation, eight per-module copies each set some subset of this, and a module that
+        // shelled `gh` while setting only the GIT_* vars could stall on gh's prompt/update-notifier.
+        // Pinning the whole superset here is what stops any one of them silently dropping a var
+        // again: mutate away any line in `apply_noninteractive` and this reds.
+        let mut cmd = Command::new("/bin/echo");
+        apply_noninteractive(&mut cmd);
+        let set: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| (k.to_string_lossy().to_string(), v.to_string_lossy().to_string()))
+            })
+            .collect();
+        for (name, value) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", "true"),
+            ("GIT_SSH_COMMAND", "ssh -oBatchMode=yes"),
+            ("GH_PROMPT_DISABLED", "1"),
+            ("GH_NO_UPDATE_NOTIFIER", "1"),
+        ] {
+            assert_eq!(
+                set.get(name).map(String::as_str),
+                Some(value),
+                "{name}={value} not applied by apply_noninteractive; got {set:?}"
+            );
+        }
+        // The pager backstop must ride along too — that is the whole point of one definition.
+        for (name, value) in NONINTERACTIVE_PAGER_ENV {
+            assert_eq!(
+                set.get(*name).map(String::as_str),
+                Some(*value),
+                "pager var {name}={value} not applied by apply_noninteractive; got {set:?}"
             );
         }
     }

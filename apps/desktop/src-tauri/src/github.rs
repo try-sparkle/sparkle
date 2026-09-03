@@ -37,9 +37,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// one-shot `http.<host>.extraheader`, so a *further* interactive prompt only ever means "failed" —
 /// fail fast rather than block forever waiting on a human who isn't there.
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
 }
 
 /// The stored desktop bearer, or a stable "not signed in" error. Every command needs it to reach

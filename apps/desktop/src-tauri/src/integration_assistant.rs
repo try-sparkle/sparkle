@@ -1056,12 +1056,9 @@ pub fn confirm_landed_by_ancestry(root: &str, sha: &str, base_ref: &str) -> Resu
 /// Fail fast rather than blocking on an interactive prompt — a hung child freezes the command the
 /// UI awaits. Mirrors `worktree::apply_noninteractive`, which is private to that module.
 fn apply_noninteractive(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "true");
-    cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
-    crate::claude_oneshot::apply_noninteractive_pager(cmd);
+    // One shared definition — see `claude_oneshot::apply_noninteractive` for why eight per-module
+    // copies of this env setup were consolidated into it.
+    crate::claude_oneshot::apply_noninteractive(cmd);
 }
 
 /// Run one of the repo's own guard scripts and hand back its EXIT CODE.
