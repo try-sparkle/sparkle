@@ -408,7 +408,54 @@ pub fn shim_script(real_claude: &str, candidates_file: &str) -> String {
 ///
 /// All-zero tallies (a fresh install) map to 0.0 for everyone, so ranking falls back to the
 /// deterministic id tie-break rather than dividing by zero. Pure — unit-tested.
+///
+/// This ranks on the 5h SESSION window ALONE. That is blind to the WEEKLY (7d) cap: an account with
+/// light recent usage but a nearly-exhausted week scores as high-headroom and is picked first, then
+/// every review dies on the 429 weekly wall the 5h number cannot see. Prefer
+/// [`headroom_from_windowed_tokens`] where the 7d tally is available.
 pub fn headroom_from_tokens(tallies: &[(String, u64)]) -> HashMap<String, f64> {
+    normalize_tallies(tallies)
+}
+
+/// Turn per-account token tallies over the trailing 5h AND 7d windows into the 0..1
+/// "fraction consumed" [`rank_candidates`] expects — an account's score is the MAX of its
+/// fraction-consumed in either window, so it is deprioritized as it nears EITHER its short-session
+/// (5h) cap OR its WEEKLY (7d) cap.
+///
+/// This is the weekly-quota awareness [`headroom_from_tokens`] otherwise lacks (bead sparkle-sz8f2i).
+/// The reactive `exhausted_until` bench only routes around a 429 wall AFTER a failing job records it;
+/// ranking on the tighter of the two windows deprioritizes an account that is CLOSE to its weekly cap
+/// BEFORE it hits the wall, so roborev prefers a genuinely funded account first. It cannot detect
+/// "over quota" as a hard fact (that is the reactive bench's job) — it makes the near-cap account the
+/// LAST resort rather than the first pick, which is exactly the "prefer any funded account first"
+/// policy for the case where several accounts are healthy.
+///
+/// Each window is normalized INDEPENDENTLY against its own busiest account (same rationale as
+/// [`headroom_from_tokens`]: the learned per-identity ceiling is not available here and ranking needs
+/// only the ORDER), then the two fractions are combined with `max`. An id present in only one window
+/// takes that window's fraction. All-zero tallies map to 0.0 for everyone.
+///
+/// WIRING (out of this change's file scope — for the integrator): the only production caller,
+/// `accounts::republish_roborev_candidates`, currently builds `headroom` from `tokens_5h` via
+/// [`headroom_from_tokens`]. Passing `tokens_7d` (already on `AccountUsage`) into this function
+/// instead is the one-line change that makes production ranking weekly-aware. Pure — unit-tested.
+pub fn headroom_from_windowed_tokens(
+    tallies_5h: &[(String, u64)],
+    tallies_7d: &[(String, u64)],
+) -> HashMap<String, f64> {
+    let mut out = normalize_tallies(tallies_5h);
+    for (id, frac_7d) in normalize_tallies(tallies_7d) {
+        out.entry(id)
+            .and_modify(|e| *e = e.max(frac_7d))
+            .or_insert(frac_7d);
+    }
+    out
+}
+
+/// Normalize one window's raw token tallies to the 0..1 "fraction consumed" of its busiest account.
+/// All-zero (a fresh install) maps to 0.0 for everyone, so ranking falls back to the deterministic
+/// id tie-break rather than dividing by zero. Pure.
+fn normalize_tallies(tallies: &[(String, u64)]) -> HashMap<String, f64> {
     let max = tallies.iter().map(|(_, t)| *t).max().unwrap_or(0);
     if max == 0 {
         return tallies.iter().map(|(id, _)| (id.clone(), 0.0)).collect();
@@ -750,6 +797,84 @@ mod tests {
         let h = headroom_from_tokens(&[("a".into(), 0), ("b".into(), 0)]);
         assert_eq!(h["a"], 0.0);
         assert_eq!(h["b"], 0.0);
+    }
+
+    // ── WEEKLY-QUOTA AWARENESS (bead sparkle-sz8f2i) ─────────────────────────────────────────────
+
+    /// THE WEEKLY-QUOTA ASSERTION: an account that is light in the last 5h but heavy over the WEEK
+    /// — the one about to hit its 429 weekly wall — must be DEPRIORITIZED below a genuinely funded
+    /// account, instead of being the first pick. Ranking on the 5h window alone (the pre-fix
+    /// behavior) picks the weekly-heavy account first (it has the least RECENT usage) and every review
+    /// then dies on the weekly cap the 5h number cannot see.
+    ///
+    /// Mutation-provable, and the pair makes the mutant explicit. Degrade
+    /// `headroom_from_windowed_tokens` back to the 5h window alone (i.e. to `headroom_from_tokens`)
+    /// and the FUNDED account B is no longer first — the `first() == B` assertion goes RED. The paired
+    /// `dirs5` case asserts that pre-fix ordering directly, so the test names exactly what regressing
+    /// removes: it puts the weekly-heavy account A first.
+    #[test]
+    fn weekly_usage_deprioritizes_an_account_the_5h_window_alone_would_pick() {
+        // a: lightest in the last 5h (looks like the MOST headroom) but the busiest over the WEEK —
+        //    the account about to hit its weekly 429 wall.
+        // b: light in BOTH windows — genuinely funded, the account roborev should prefer.
+        // c: heavy in the last 5h (near its SESSION cap), light over the week.
+        let five_h = vec![("a".into(), 10u64), ("b".into(), 20), ("c".into(), 100)];
+        let seven_d = vec![("a".into(), 100u64), ("b".into(), 10), ("c".into(), 20)];
+        let accounts = vec![
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+            acct("c", "/dir/c", None),
+        ];
+
+        // Windowed (weekly-aware): B — funded in both windows — is preferred first, and the
+        // weekly-heavy A is ranked BELOW it rather than being the first pick.
+        let h = headroom_from_windowed_tokens(&five_h, &seven_d);
+        let dirs: Vec<String> = rank_candidates(&accounts, &h, NOW).into_iter().map(|c| c.dir).collect();
+        assert_eq!(
+            dirs.first(),
+            Some(&"/dir/b".to_string()),
+            "the account funded in BOTH windows must be preferred first: {dirs:?}"
+        );
+        let pos = |d: &str| dirs.iter().position(|x| x == d).unwrap();
+        assert!(
+            pos("/dir/a") > pos("/dir/b"),
+            "the weekly-heavy account must rank below the funded one: {dirs:?}"
+        );
+
+        // PAIRED PRE-FIX ORDERING — ranking on the 5h window ALONE picks A first (least recent usage).
+        // This is the bug, and it is what degrading the windowed ranker back to 5h-only reintroduces.
+        let h5 = headroom_from_tokens(&five_h);
+        let dirs5: Vec<String> = rank_candidates(&accounts, &h5, NOW).into_iter().map(|c| c.dir).collect();
+        assert_eq!(
+            dirs5.first(),
+            Some(&"/dir/a".to_string()),
+            "5h-only ranking picks the weekly-heavy account first — the behavior this fix replaces: {dirs5:?}"
+        );
+    }
+
+    /// The score is the MAX across windows: an account at the cap in EITHER window scores 1.0, so a
+    /// near-session-cap account and a near-weekly-cap account are both deprioritized.
+    #[test]
+    fn windowed_headroom_takes_the_max_fraction_across_windows() {
+        // a: busiest in 5h (1.0), idle over the week. b: idle in 5h, busiest over the week (1.0).
+        let h = headroom_from_windowed_tokens(
+            &[("a".into(), 100), ("b".into(), 0)],
+            &[("a".into(), 0), ("b".into(), 100)],
+        );
+        assert_eq!(h["a"], 1.0, "near the 5h cap must score 1.0");
+        assert_eq!(h["b"], 1.0, "near the 7d weekly cap must score 1.0");
+    }
+
+    /// Back-compat: with NO weekly data the windowed form reduces EXACTLY to the 5h-only ranking, so
+    /// the un-wired call site keeps today's behavior and adopting the new function is a safe swap.
+    #[test]
+    fn windowed_headroom_with_no_weekly_data_matches_the_5h_only_form() {
+        let five_h = vec![("a".into(), 100u64), ("b".into(), 50), ("c".into(), 0)];
+        assert_eq!(
+            headroom_from_windowed_tokens(&five_h, &[]),
+            headroom_from_tokens(&five_h),
+            "empty 7d tallies must reduce to the 5h-only ranking"
+        );
     }
 
     #[test]

@@ -4239,8 +4239,11 @@ pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
 
     let now = now_secs();
     let usages = usage_for_accounts(&accounts, now);
-    let tallies: Vec<(String, u64)> = usages.iter().map(|u| (u.id.clone(), u.tokens_5h)).collect();
-    let headroom = crate::roborev_account::headroom_from_tokens(&tallies);
+    // Rank on BOTH windows: an account light on recent (5h) use but heavy over the WEEK (7d) would
+    // otherwise score high-headroom, get picked first, and every review would die on its weekly 429.
+    let tallies_5h: Vec<(String, u64)> = usages.iter().map(|u| (u.id.clone(), u.tokens_5h)).collect();
+    let tallies_7d: Vec<(String, u64)> = usages.iter().map(|u| (u.id.clone(), u.tokens_7d)).collect();
+    let headroom = crate::roborev_account::headroom_from_windowed_tokens(&tallies_5h, &tallies_7d);
     // TWO corrections compose here, both feeding the same publish:
     //
     // (1) IDENTITY-AWARE QUOTA EXHAUSTION (sparkle-xsr6o): `usage_for_accounts` computes exhaustion
