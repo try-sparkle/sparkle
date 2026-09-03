@@ -979,9 +979,21 @@ pub fn merge_refusal(
              run for a conflicting PR, so waiting will not help."
                 .to_string()
         } else if reason.contains("roborev") {
-            "Drain the findings first: `roborev list --open --branch <branch>`, then `roborev show \
-             <id>` and either fix it or `roborev close <id>` with a stated reason. Then run the \
-             gate again."
+            // TWO TRAPS AVOIDED HERE, both documented and both previously present in this string.
+            // (1) `roborev list --open --branch` exits 0 while printing a connection banner, so an
+            //     empty answer is indistinguishable from "reviewed, nothing found" — a reader who
+            //     acts on it drains nothing and merges over live findings. The `--json` form plus
+            //     the stated caution is what makes the emptiness readable.
+            // (2) `roborev show <id>` resolves its argument as a GIT REF first, so a bare numeric
+            //     id fails "commit not found" whenever it also reads as an abbreviated sha. It
+            //     needs `--job`.
+            // Deliberately no repo-specific helper script is named: this assistant runs against
+            // whatever project the user has open, so a path from one repo would be wrong in every
+            // other one.
+            "Drain the findings first: `roborev list --open --json --branch <branch>` — an empty \
+             or non-array answer means COULD NOT ASK, not \"no findings\" — then `roborev show \
+             --job <id>` (the `--job` is required; a bare id is read as a git ref) and either fix \
+             it or `roborev close <id>` with a stated reason. Then run the gate again."
                 .to_string()
         } else {
             "Read the failing check and fix it on the branch, then run the gate again. Do not \

@@ -102,10 +102,16 @@ def _format_block(branch: str, jobs: list[dict]) -> str:
         lines.append(f"  - review {ref} (FAIL)")
     lines += [
         "",
-        "Drain this branch BEFORE switching — `roborev list --open` on it, then "
-        "resolve every open fail-verdict review with judgment per finding (do "
-        "NOT clear them with `roborev refine`/`roborev fix`, which auto-apply "
-        "findings without the valid-vs-YAGNI judgment):",
+        # The ids are ENUMERATED ABOVE, so the remedy does not need a re-listing command — and must
+        # not print one. `roborev list --open` exits 0 while printing a connection banner, so an
+        # empty answer from it is indistinguishable from "reviewed, nothing found"; a reader who
+        # re-lists and sees nothing concludes the branch is clear and switches away, which is the
+        # exact strand this gate exists to prevent. Nothing repo-specific is named here either:
+        # this hook is installed machine-wide and runs in every repo, so a remedy pointing at one
+        # repo's helper script would be wrong everywhere else.
+        "Drain this branch BEFORE switching — resolve every fail-verdict review listed above "
+        "with judgment per finding (do NOT clear them with `roborev refine`/`roborev fix`, "
+        "which auto-apply findings without the valid-vs-YAGNI judgment):",
         "  1. `roborev show --job <id>` — read the findings.",
         "  2. VALID finding: fix it in a new commit on THIS branch, then "
         "`roborev close <id>`.",
@@ -166,13 +172,34 @@ def main() -> int:
     flight = _in_flight(jobs)
     if flight:
         n = len(flight)
+        # NAME THE IDS, the same way _format_block does for the terminal arm. Two reasons, and the
+        # second is the one that matters:
+        #   - no `roborev list --open` here: it exits 0 while printing a connection banner, so
+        #     "nothing came back" reads the same whether the branch is clean or the daemon is
+        #     unreachable, and acting on that is how an in-flight finding gets stranded.
+        #   - and the re-run is NOT a substitute for it. This gate FAILS OPEN when it cannot read
+        #     roborev (`jobs is None -> _allow()` above, deliberately — a blocked switch strands no
+        #     code), so "re-run and I will stop you again" is a guarantee it cannot honour: with the
+        #     daemon down the switch simply succeeds. Promising it would relocate the original
+        #     hazard and dress it as a certification. Naming the ids gives the reader something
+        #     checkable that needs no second successful daemon read.
+        refs = ", ".join(
+            f"#{j.get('id')}"
+            if isinstance(j.get("id"), int)
+            else f"@{str(j.get('git_ref', '') or '?')[:8]}"
+            for j in flight
+        )
         return _deny(
             f"Branch switch blocked: {n} roborev review(s) on the branch you're "
             f"LEAVING ({branch!r}) are still in flight — one could land "
             "verdict=F after you've switched away and strand the finding. "
-            "`roborev wait` for them to finish, resolve any fail-verdict ones "
-            "(`roborev list --open` → fix-then-close or comment-then-close), then "
-            "re-run the switch."
+            f"In flight: {refs}. "
+            "`roborev wait` for them to finish, then read each with "
+            "`roborev show --job <id>` and resolve any that landed verdict=F "
+            "(fix-then-close, or comment-then-close with the reason). "
+            "NOTE this gate FAILS OPEN when it cannot read roborev, so a switch that "
+            "is allowed later is NOT by itself proof the branch drained — confirm the "
+            "ids above concluded before treating them as resolved."
         )
     return _allow()
 

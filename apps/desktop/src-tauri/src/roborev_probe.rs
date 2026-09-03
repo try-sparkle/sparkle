@@ -360,9 +360,17 @@ fn probe_from_stdout(
         // count made the common case read "0 row(s) returned … the window is full". And the remedy
         // names only what the caller can actually DO — no tool on this surface exposes a limit.
         Ok(_) if window_saturated(stdout, limit) => RoborevProbe::unknown(format!(
+            // The remedy must RAISE THE WINDOW, which is the actual problem here — and it must not
+            // prescribe the bare `roborev list --open --branch` form, which exits 0 while printing
+            // a connection banner, so its emptiness cannot be told from "reviewed, nothing found".
+            // A reader sent to re-look with that form can come back with nothing and conclude the
+            // branch is clear, which is the same lie this saturated-window verdict refuses to tell.
+            // `--json` plus an explicit --limit gives both a bigger window and a readable answer.
             "roborev filled its {limit}-row window for {branch} ({} row(s) returned), so an older \
              unresolved finding may have fallen off the end and this reading cannot be treated as \
-             complete. Read the branch directly: `roborev list --open --branch {branch}`.",
+             complete. Read the branch with a bigger window: `roborev list --open --json --branch \
+             {branch} --limit 500` — an empty or non-array answer there means COULD NOT ASK, not \
+             \"no findings\".",
             raw_row_count(stdout)
         )),
         Ok(jobs) => RoborevProbe { enabled: true, jobs: Some(jobs), error: None },
@@ -830,7 +838,20 @@ mod tests {
         let err = p.error.expect("and it must say why");
         assert!(err.contains("50-row window"), "naming the window: {err}");
         assert!(err.contains("50 row(s) returned"), "with the RAW count, not the filtered one: {err}");
-        assert!(err.contains("roborev list --open --branch mine"), "and a runnable remedy: {err}");
+        // A RUNNABLE remedy, and specifically one that RAISES the window — the saturated window is
+        // the whole complaint, so a remedy that re-reads at the same size answers nothing.
+        assert!(err.contains("--branch mine"), "and a runnable remedy naming the branch: {err}");
+        assert!(err.contains("--limit"), "that raises the window rather than re-reading it: {err}");
+        // NEGATIVE HALF, and it is the load-bearing one. The previous assertion pinned the exact
+        // string `roborev list --open --branch mine`, which is the form banned for exiting 0 while
+        // printing a connection banner — so the test REQUIRED the defect and would have failed on
+        // the fix. Pinning a bad string in place is how the same class survived in the orchestrator
+        // persona until it was found by review. This bans the bare form while leaving the `--json`
+        // one (a superstring of it under a naive check) reachable, so the two cannot be conflated.
+        assert!(
+            !err.contains("roborev list --open --branch"),
+            "must not prescribe the bare list form, which cannot distinguish an outage from a clean branch: {err}"
+        );
 
         // One row short of the cap is a real answer.
         let short = format!("[{}]", full[..49].join(","));
