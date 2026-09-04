@@ -128,7 +128,17 @@ export interface SpawnBuildAgentOpts {
    *   2. `AgentTab.epicId` is set NOW, synchronously — mirroring the sendToBuild path — so the epic
    *      pill shows immediately, before the async `bd create` resolves and binds `beadId`.
    *
-   * Absent (the generic "+ New Build Agent"/drop/babysit spawn) the bead stays top-level, unchanged.
+   * A THIRD consumer reads the same field and is the one the Epics column's STAFFING reading uses:
+   * `epicSweepRunner.boundAgentsFor` is `kind === "build" && epicId === <epic>` and consults the row
+   * ALONE — no bead, no parent edge. So the row write above is not merely the display half; delete it
+   * and `agentsForEpicSlices` still finds the agent by its bead parent while every staffing reading
+   * (the sweep's watch gate, `pusherMount.improveUnstaffedEpics`, `planView.orchestratorNameForEpic`)
+   * reports the epic unstaffed. `buildAgentSpawn.boundAgents.test.ts` is what holds that half down.
+   *
+   * OMITTED is the honest no-epic spawn (the generic "+ New Build Agent"/drop/babysit start): the
+   * bead stays top-level, no binding is written, and nothing is logged. PRESENT BUT BLANK is a
+   * DIFFERENT fact — a caller that meant to name an epic and resolved it to nothing — and is never
+   * written as a binding; it is logged instead. See the normalizer in the body.
    */
   epicId?: string;
   /**
@@ -280,6 +290,33 @@ export function spawnBuildAgentInProject(
   // so a mutation aimed at it can be judged (a bare `if (!quiet) {` cannot be mutated without
   // breaking the parse, which leaves the site unverified).
   const mayTakeCaret = !quiet;
+  // ══ AN ABSENT EPIC AND A LOST ONE ARE DIFFERENT FACTS ═══════════════════════════════
+  // Most spawns through here genuinely have no epic — the "+ New Build Agent" button, a file drop,
+  // the babysit dispatcher watching a PR. An OMITTED `epicId` is that state, it is legitimate, and it
+  // must stay silent: the row carries no `epicId`, the auto-bead is top-level, and
+  // `epicSweepRunner.boundAgentsFor` correctly returns the agent for no epic at all.
+  //
+  // A PRESENT BUT BLANK `epicId` is the opposite fact. It means a caller DID have an epic in hand and
+  // resolved it to nothing — a lookup that missed, a focus id read after the focus cleared — and the
+  // epic it meant to staff is about to sit unstaffed with nothing anywhere saying why. Collapsing the
+  // two is the failure this repo keeps paying for (AGENTS.md: an absent binding and an unknown
+  // binding are different facts), and it collapsed in BOTH directions here:
+  //   • the empty string fell through the truthiness guard and was indistinguishable from the honest
+  //     no-epic spawn — the epic stayed dark and no line anywhere said a binding had been asked for;
+  //   • a whitespace-only id is TRUTHY, so it stamped the row's `epicId` with that whitespace and
+  //     parented the auto-bead to it — a binding to an epic that does not exist. `boundAgentsFor` can
+  //     never match it, so the epic reads unstaffed while the ROW claims to be staffing it, which is
+  //     strictly worse than no binding at all.
+  // So: normalize to ONE value, never write a garbage binding, and SAY SO when one was thrown away.
+  // The spawn still happens — refusing it would trade a real agent the caller asked for for a
+  // bookkeeping complaint — it simply happens as the free-standing agent it actually is.
+  const epicBinding = opts.epicId?.trim() || undefined;
+  if (opts.epicId !== undefined && epicBinding === undefined) {
+    log.warn("build-agent", "epic binding LOST: the caller named an epic that resolved to blank", {
+      projectId: project.id,
+      epicId: JSON.stringify(opts.epicId),
+    });
+  }
   const store = useProjectStore.getState();
   const id = store.addAgent(project.id, {
     kind: "build",
@@ -300,7 +337,12 @@ export function spawnBuildAgentInProject(
   // Spawned AGAINST an epic: set `epicId` NOW, synchronously — exactly as sendToBuild does — so the
   // sidebar epic pill shows before the async `bd create` below resolves and binds `beadId`. The
   // durable epic→agent link is the bead PARENT edge minted below; this is the immediate-display half.
-  if (opts.epicId) store.setAgentEpicId(project.id, id, opts.epicId);
+  //
+  // `epicBinding` is resolved ONCE, above, and is the value every consumer below reads — the row,
+  // the bead's parent, and the ledger's `beads`. Those three used to read the raw option through
+  // three different guards (truthiness, a nullish default, a ternary), which is how a whitespace id
+  // could stamp the ROW while the other two disagreed about whether an epic had been named at all.
+  if (epicBinding) store.setAgentEpicId(project.id, id, epicBinding);
   // "A NULL OR A THROW MEANS NOTHING WAS CREATED" — HELD BY CONSTRUCTION, NOT BY ASSERTION
   // (roborev 59548 then 59562).
   //
@@ -518,7 +560,7 @@ export function spawnBuildAgentInProject(
       projectName: project.name,
       brief: opts.prompt ?? "",
       ...(opts.ask ? { ask: opts.ask } : {}),
-      beads: opts.epicId ? [opts.epicId] : [],
+      beads: epicBinding ? [epicBinding] : [],
       mode: opts.mode ?? null,
       // Derived from `background` unless the caller knows better — see `dispatchedBy`. The concierge
       // is the caller that knows better, and it is the one whose recall failure started all this.
@@ -526,7 +568,7 @@ export function spawnBuildAgentInProject(
     });
     // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
     // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
-    void createBeadFull(project.rootPath, title, "", "task", opts.epicId ?? "", "", AUTO_LABEL)
+    void createBeadFull(project.rootPath, title, "", "task", epicBinding ?? "", "", AUTO_LABEL)
       .then((beadId) => {
         // ── FIRST WRITER WINS. THIS `.then` IS LATE BY CONSTRUCTION ─────────────────────────────
         // `createBeadFull` is a `bd` shell-out against a single-writer Dolt store under lock
