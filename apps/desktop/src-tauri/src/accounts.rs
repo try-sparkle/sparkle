@@ -4212,15 +4212,28 @@ pub async fn accounts_mark_exhausted(
     .await?
 }
 
-/// Recompute the roborev shim's account candidates from the accounts on disk.
+/// The next wall-clock instant at which a walled account is known to recover — the moment the
+/// candidate set could GROW. `0` means "recompute on the next refresh" (the un-armed default and the
+/// value stored when accounts.json could not be read); `i64::MAX` means "nothing is walled, no
+/// recovery pending". Armed by every event-driven [`republish_roborev_candidates`] (a wall, a login,
+/// install) and re-armed by the recovery refresh, so a wall recorded on any path still gets its
+/// recovery noticed by the constantly-running usage refresh (see [`refresh_candidates_on_recovery`]).
+static NEXT_ROBOREV_RECOVERY_CHECK: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Compute — but do NOT write — the roborev shim's candidate file content from the accounts on disk,
+/// plus the earliest FUTURE identity-corrected `exhausted_until` across those accounts (the next
+/// instant a walled account recovers and the set could grow). Returns `None` only when accounts.json
+/// cannot be read.
+///
+/// Split out of [`republish_roborev_candidates`] so the recovery refresh can render the same bytes
+/// and compare them against the on-disk copy before deciding to write — the constantly-running usage
+/// path must not churn the file every tick.
 ///
 /// Lives here rather than in `roborev_account` because it needs `read_accounts_at` +
-/// `usage_for_accounts`, both private to this module. Errors are swallowed deliberately: every
-/// caller is a best-effort refresh on a path whose real job is something else.
-pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
-    let Ok(all) = read_accounts_at(&accounts_json_path(app_data)) else {
-        return;
-    };
+/// `usage_for_accounts`, both private to this module.
+fn roborev_candidate_plan(app_data: &Path, home: &Path, now: i64) -> Option<(String, Option<i64>)> {
+    let all = read_accounts_at(&accounts_json_path(app_data)).ok()?;
 
     // Drop registrations that are not actually signed in. WITHOUT this the rotation is worse than
     // no rotation: an unauthenticated account has consumed zero tokens, so it scores as the account
@@ -4237,7 +4250,6 @@ pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
         .collect();
     let accounts = if signed_in.is_empty() { all } else { signed_in };
 
-    let now = now_secs();
     let usages = usage_for_accounts(&accounts, now);
     // Rank on BOTH windows: an account light on recent (5h) use but heavy over the WEEK (7d) would
     // otherwise score high-headroom, get picked first, and every review would die on its weekly 429.
@@ -4275,12 +4287,82 @@ pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
     let log = identity_log::read_log_at(&identity_log::identity_log_path(app_data));
     let auth_dead = roborev_auth_dead_dirs(&accounts, Some(home), &log, now);
 
-    // Publish once: identity-CORRECTED accounts (so ranking/`is_healthy` is identity-aware) AND the
+    // Render once: identity-CORRECTED accounts (so ranking/`is_healthy` is identity-aware) AND the
     // auth-dead exclusion. Both features hold — an auth-dead identity is excluded, and a walled
     // login's siblings are benched by the corrected exhaustion.
-    let _ = crate::roborev_account::publish_candidates_excluding_auth_dead(
-        home, &corrected, &headroom, &auth_dead, now,
+    let ranked = crate::roborev_account::rank_candidates_excluding_auth_dead(
+        &corrected, &headroom, &auth_dead, now,
     );
+    let content = crate::roborev_account::render_candidates(&ranked);
+
+    // The next instant a walled account recovers. Read off the identity-CORRECTED field so a walled
+    // login's benched siblings count too, and only future instants (a past `exhausted_until` is
+    // already healthy). `None` ⇒ nothing is walled.
+    let next_recovery = corrected
+        .iter()
+        .filter_map(|a| a.exhausted_until)
+        .filter(|&e| e > now)
+        .min();
+
+    Some((content, next_recovery))
+}
+
+/// Recompute the roborev shim's account candidates from the accounts on disk and publish them.
+///
+/// Errors are swallowed deliberately: every caller is a best-effort refresh on a path whose real job
+/// is something else. Always writes (the event-driven path — a wall, a login, install — where the
+/// account picture is known to have just changed), and ARMS [`NEXT_ROBOREV_RECOVERY_CHECK`] so the
+/// usage refresh notices when the earliest walled account later recovers.
+pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
+    let now = now_secs();
+    let Some((content, next_recovery)) = roborev_candidate_plan(app_data, home, now) else {
+        return;
+    };
+    let _ = crate::roborev_account::write_candidates(home, &content);
+    NEXT_ROBOREV_RECOVERY_CHECK.store(
+        next_recovery.unwrap_or(i64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The RECOVERY half of the rotation loop, and the fix for the stale-candidate bug: an observed wall
+/// republishes (via [`republish_roborev_candidates`]) and correctly drops the walled account, but
+/// nothing re-published when that account's `exhausted_until` later ELAPSED — so a recovered, funded
+/// account stayed out of rotation until an app restart or an unrelated wall. Meanwhile the two
+/// accounts already in the file could both hit a wall and review would go dark with funded accounts
+/// idle.
+///
+/// Called from the constantly-running usage refresh ([`accounts_usage`]). Cheap in the common case —
+/// a single wall-clock comparison against `due` (the previously-armed horizon) — and does the heavier
+/// recompute only once wall-clock has crossed a known recovery instant. Writes ONLY when the rendered
+/// content actually differs from the on-disk copy, so a recompute that finds nothing new never churns
+/// the file (no write thrash).
+///
+/// Pure w.r.t. process state — the horizon is threaded in as `due` and the new horizon returned — so
+/// it is unit-testable against temp dirs and an injected `now` with no global to reset. Returns
+/// `(wrote, next_due)`.
+fn refresh_candidates_on_recovery(
+    app_data: &Path,
+    home: &Path,
+    now: i64,
+    due: i64,
+) -> (bool, i64) {
+    if now < due {
+        // Nothing has recovered since the horizon was armed; skip the recompute entirely.
+        return (false, due);
+    }
+    let Some((content, next_recovery)) = roborev_candidate_plan(app_data, home, now) else {
+        // Could not read accounts.json — leave the horizon un-armed so the next refresh retries
+        // rather than pinning it forward on the strength of a failed read.
+        return (false, 0);
+    };
+    let path = crate::roborev_account::candidates_path(home);
+    let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+    let wrote = on_disk != content;
+    if wrote {
+        let _ = crate::roborev_account::write_candidates(home, &content);
+    }
+    (wrote, next_recovery.unwrap_or(i64::MAX))
 }
 
 /// Per-account token tallies (5h / 7d) plus any in-effect exhausted-until epoch.
@@ -4293,6 +4375,18 @@ pub async fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String>
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountUsage>, String> {
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let now = now_secs();
+        // RECOVERY HALF of the rotation loop (best-effort). This command "runs constantly" (the
+        // banner's 10s re-read), so it is where a walled account that has since recovered is noticed
+        // and re-published into the shim's candidate list — the wall itself republishes, but nothing
+        // else did when `exhausted_until` elapsed, so a funded account otherwise stayed out of
+        // rotation until an app restart. Gated on a wall-clock horizon so the common tick is a single
+        // atomic load, and writes only when the content actually changes (no file churn). Failure to
+        // resolve HOME just skips it — never fail the usage read the banner depends on.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let due = NEXT_ROBOREV_RECOVERY_CHECK.load(std::sync::atomic::Ordering::Relaxed);
+            let (_wrote, next_due) = refresh_candidates_on_recovery(&app_data, &home, now, due);
+            NEXT_ROBOREV_RECOVERY_CHECK.store(next_due, std::sync::atomic::Ordering::Relaxed);
+        }
         // Cached: this command is the banner's 10s re-read and the spawn/AccountsScreen path, the
         // "runs constantly" caller. The memo coalesces both overlapping (single-flight under the
         // lock) and back-to-back walks, and re-runs the instant the account set, a bench, or a login
@@ -9272,6 +9366,80 @@ mod tests {
         assert!(!published.contains(crate::roborev_account::STANDDOWN), "unexpected stand-down: {published}");
         assert!(published.contains(dir_d.to_str().unwrap()), "healthy D missing: {published}");
         assert!(published.contains(dir_e.to_str().unwrap()), "healthy E missing: {published}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// THE RECOVERY ASSERTION — the stale-candidate bug (a funded account walled by a 5h/7d limit
+    /// that has since recovered but never re-entered rotation, so review goes dark while it sits
+    /// idle). An observed wall republishes and correctly DROPS the account, but nothing re-published
+    /// when its `exhausted_until` later ELAPSED. [`refresh_candidates_on_recovery`], hung off the
+    /// constantly-running usage refresh, closes that half: once wall-clock crosses the recovery
+    /// instant it re-publishes and the recovered account re-enters the candidate file.
+    ///
+    /// Asserted on the SIDE EFFECT (the written candidate file), with `now` and the horizon injected
+    /// so the recovery is observed WITHOUT waiting and WITHOUT touching the process-global horizon.
+    /// The transition is what makes it non-vacuous: A is proven excludable while walled, then proven
+    /// to re-enter once it recovers. Mutation-provable in two independent ways — delete the
+    /// `write_candidates` call and the post-recovery `contains(A)` goes red; invert the `now < due`
+    /// skip guard and the refresh early-returns after recovery, so A never re-enters and it goes red.
+    #[test]
+    fn a_recovered_account_re_enters_the_candidate_list_on_the_usage_refresh() {
+        let base = unique_dir("recovery-refresh");
+        let app_data = base.join("app_data");
+        std::fs::create_dir_all(&app_data).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Three distinct signed-in logins. A is walled until `wall_until`; D and E stay healthy so
+        // the list is never a STANDDOWN (two == MIN_HEALTHY_TO_RUN) and A's presence is the only
+        // thing that moves across the recovery boundary.
+        let dir_a = base.join("a");
+        let dir_d = base.join("d");
+        let dir_e = base.join("e");
+        write_claude_json(&dir_a, r#"{"oauthAccount":{"emailAddress":"a@x.com","accountUuid":"uuid-a"}}"#);
+        write_claude_json(&dir_d, r#"{"oauthAccount":{"emailAddress":"d@x.com","accountUuid":"uuid-d"}}"#);
+        write_claude_json(&dir_e, r#"{"oauthAccount":{"emailAddress":"e@x.com","accountUuid":"uuid-e"}}"#);
+
+        let base_now = now_secs();
+        let wall_until = base_now + 3_600;
+        let mut a = sample("a", false, dir_a.to_str().unwrap());
+        a.exhausted_until = Some(wall_until);
+        a.exhausted_identity = Some("uuid-a".to_string()); // unique identity: no sibling contagion
+        let accounts = vec![
+            a,
+            sample("d", false, dir_d.to_str().unwrap()),
+            sample("e", false, dir_e.to_str().unwrap()),
+        ];
+        write_accounts_at(&accounts_json_path(&app_data), &accounts).unwrap();
+
+        // Event-driven publish (the wall). A is walled, so it is absent; D and E are present. This is
+        // also the pre-change baseline: the same list the stale-candidate machine would keep serving
+        // for hours after A recovered.
+        republish_roborev_candidates(&app_data, &home);
+        let before = std::fs::read_to_string(crate::roborev_account::candidates_path(&home))
+            .expect("candidate file written");
+        assert!(!before.contains(dir_a.to_str().unwrap()), "walled A published: {before}");
+        assert!(before.contains(dir_d.to_str().unwrap()), "healthy D missing before recovery: {before}");
+        assert!(before.contains(dir_e.to_str().unwrap()), "healthy E missing before recovery: {before}");
+
+        // The horizon the publish armed = A's recovery instant. A usage refresh BEFORE recovery is a
+        // cheap no-op: nothing has recovered, so it must neither recompute nor churn the file.
+        let (wrote_before, next_due) =
+            refresh_candidates_on_recovery(&app_data, &home, wall_until - 100, wall_until);
+        assert!(!wrote_before, "the refresh churned the file before any account recovered");
+        assert_eq!(next_due, wall_until, "the horizon must stay armed at A's recovery instant");
+
+        // Usage refresh AFTER recovery: wall-clock has crossed the horizon, so it recomputes and A —
+        // now healthy — re-enters the list. This is the exact transition the bug never made.
+        let (wrote_after, _) =
+            refresh_candidates_on_recovery(&app_data, &home, wall_until + 100, next_due);
+        assert!(wrote_after, "the recovery refresh did not re-publish once A recovered");
+        let after = std::fs::read_to_string(crate::roborev_account::candidates_path(&home)).unwrap();
+        assert!(after.contains(dir_a.to_str().unwrap()), "recovered A did NOT re-enter the list: {after}");
+        assert!(after.contains(dir_d.to_str().unwrap()), "healthy D dropped on recovery refresh: {after}");
+        assert!(after.contains(dir_e.to_str().unwrap()), "healthy E dropped on recovery refresh: {after}");
+        assert!(!after.contains(crate::roborev_account::STANDDOWN), "unexpected stand-down: {after}");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

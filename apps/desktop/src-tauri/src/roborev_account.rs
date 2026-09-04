@@ -530,7 +530,16 @@ pub fn publish_candidates_excluding_auth_dead(
     now: i64,
 ) -> Result<(), String> {
     let ranked = rank_candidates_excluding_auth_dead(accounts, headroom, auth_dead, now);
-    write_atomic(&candidates_path(home), &render_candidates(&ranked), 0o600)
+    write_candidates(home, &render_candidates(&ranked))
+}
+
+/// Write pre-rendered candidate content to the shim's candidate file (0600, atomic).
+///
+/// Split out of [`publish_candidates_excluding_auth_dead`] so a caller that already rendered content
+/// — to compare it against the on-disk copy before deciding whether to write — reaches the exact same
+/// path and mode. A candidate list names the user's account paths, hence 0600.
+pub fn write_candidates(home: &Path, content: &str) -> Result<(), String> {
+    write_atomic(&candidates_path(home), content, 0o600)
 }
 
 #[cfg(test)]
