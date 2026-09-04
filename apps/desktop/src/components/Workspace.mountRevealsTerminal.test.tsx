@@ -192,7 +192,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useBeadsStore } from "../stores/beadsStore";
 import { bucketBeads } from "../services/beads";
 import { useConnectionStore } from "../stores/connectionStore";
-import { resetVisitedProjects } from "../services/sessionProjects";
+import { markProjectVisited, resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable } from "../stores/cableStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { doubleClickRow, openRowMenu, singleClickRow } from "../testing/rowGestures";
@@ -768,5 +768,169 @@ describe("selecting an epic hides the terminal of a row it filters out", () => {
 
     // "You can keep the terminal output the same as it was" — the same pane, still mounted.
     expect(terminalOnScreen("a1")).toBe(true);
+  });
+});
+
+// ══ THE LEFT PAIR — THE HALF EVERY CASE ABOVE LEAVES UNCOVERED ══════════════════════════════════
+//
+// Every `seed()` above runs single-pair: `pairAssignment: {}`, `leftProjectId: null`, so the whole
+// suite only ever exercises the RIGHT stage. The founder's report (bead sparkle-x91ps5) is about the
+// OTHER half: *"clicking/mounting a build agent does not surface its terminal in the LEFT terminal
+// column — the mount appears to land in the concierge instead."* A right-only suite goes green while
+// the left-side reveal regresses, which is exactly the shape that lets such a report ship.
+//
+// So this block seeds a REAL two-pair cockpit — project `L` assigned to the left, project `R` on the
+// right — and asserts the SIDE EFFECT the user sees: a mounted left build agent's terminal is
+// PAINTED and lives INSIDE the terminal-left stage, never the right one. Asserting only "visible"
+// would pass against a version that painted it in the wrong stage; asserting containment is what
+// pins the ROUTING (`sideOf` → `stages[side]` → the `terminal-stage-left` portal), which is where
+// the misroute would be. `terminal-stage-left` / `terminal-stage-right` are the two stage markers
+// `Workspace` sets (Workspace.tsx `data-testid="terminal-stage-left"` / `-right`).
+//
+// EVERY CANDIDATE IS MOUNTABLE, and both are checked, because "the terminal is in the left stage" is
+// the vacuous-test trap otherwise (AGENTS.md, "the rule picks one of N targets and the test asserts
+// absence on a target never MOUNTED"): a routing that pinned the left stage to ONE agent would pass a
+// single-agent assertion. Mounting `la2` after `la1` proves the left stage FOLLOWS the gesture, and
+// the right project's own agent (`ra1`) proves the two stages stay partitioned.
+// The two stage markers `Workspace` sets: the left pair's is `terminal-stage-left`; the right/primary
+// pair keeps the original single-pair name `terminal-stage` (Workspace.tsx:2310 and :2605). The
+// exact-match selector for the right one deliberately does NOT match `terminal-stage-left`.
+const stageLeftEl = () => document.querySelector<HTMLElement>('[data-testid="terminal-stage-left"]');
+const stageRightEl = () => document.querySelector<HTMLElement>('[data-testid="terminal-stage"]');
+const inLeftStage = (id: string) => stageLeftEl()?.contains(paneFor(id)) === true;
+const inRightStage = (id: string) => stageRightEl()?.contains(paneFor(id)) === true;
+
+/** Two pairs: `L` (left) holds build agents la1/la2 with la1 selected; `R` (right) holds ra1. */
+function seedTwoPair(opts: { leftMode?: string; special?: string | null } = {}) {
+  const { leftMode = "build", special = null } = opts;
+  useProjectStore.setState({
+    projects: [
+      mkProject("L", "Left", [mkAgent("la1", "Left Build One"), mkAgent("la2", "Left Build Two")], "la1"),
+      mkProject("R", "Right", [mkAgent("ra1", "Right Build One")], "ra1"),
+    ],
+    selectedProjectId: "R",
+  } as never);
+  useRuntimeStore.setState({
+    openAgentIds: special === "sparkle" ? [SPARKLE_ID, "la1", "la2", "ra1"] : ["la1", "la2", "ra1"],
+    status: {},
+  } as never);
+  useUiStore.setState({
+    activeSpecial: special,
+    workModeBySide: { left: leftMode, right: "build" },
+    pinnedProjectId: null,
+    openProjectIds: null,
+    pairAssignment: { L: "left" },
+    leftProjectId: "L",
+    collapsedOrchestrators: {},
+  } as never);
+  useSettingsStore.setState({ beadsEnabled: true } as never);
+  useConnectionStore.setState({ isOnline: true } as never);
+  enableAiEnhancementsForTests();
+  resetVisitedProjects();
+  markProjectVisited("L");
+  markProjectVisited("R");
+  resetCable();
+}
+
+// The left build column renders its rows to the LEFT of the concierge; its rows carry the same
+// `[data-hint="agent"]` marker every row does, so `rowFor` finds them by name unchanged.
+describe("mounting a LEFT-pair build agent surfaces its terminal in the terminal-left column", () => {
+  beforeEach(() => seedTwoPair());
+
+  // THE PREMISE — both stages exist and the left build agent is already portalled into the LEFT one.
+  // Without this a containment assertion below could pass because the right stage is simply absent.
+  it("renders both stages with the left agent's pane inside the left one", async () => {
+    await mount();
+    expect(stageLeftEl()).toBeTruthy();
+    expect(stageRightEl()).toBeTruthy();
+    expect(paneFor("la1")).toBeTruthy();
+    expect(inLeftStage("la1")).toBe(true);
+    expect(inRightStage("la1")).toBe(false);
+  });
+
+  it("double-clicking a LEFT build row paints its terminal in terminal-left, not the right stage", async () => {
+    await mount();
+    doubleClickRow(rowFor("Left Build One"));
+    expect(terminalOnScreen("la1")).toBe(true);
+    expect(inLeftStage("la1")).toBe(true);
+    expect(inRightStage("la1")).toBe(false);
+  });
+
+  // FOLLOWS THE GESTURE — mounting a DIFFERENT left row moves the left terminal to it. This is the
+  // paired case that stops "pin the left stage to the first agent" from wearing the test's green.
+  it("moves the left terminal to a second left row when it is mounted", async () => {
+    await mount();
+    doubleClickRow(rowFor("Left Build Two"));
+    expect(terminalOnScreen("la2")).toBe(true);
+    expect(inLeftStage("la2")).toBe(true);
+    expect(terminalOnScreen("la1")).toBe(false);
+  });
+
+  // THE PARTITION — the right project's own agent is in the RIGHT stage, never the left. A misroute
+  // that dumped everything into one stage would fail here.
+  it("keeps the right project's agent in the right stage", async () => {
+    await mount();
+    expect(inRightStage("ra1")).toBe(true);
+    expect(inLeftStage("ra1")).toBe(false);
+  });
+});
+
+// The founder's EXACT layout: Improve Sparkle holds the right stage while build agents are watched on
+// the left. `showBuildStage("left")` must not depend on clearing the (right-only) special.
+describe("Improve Sparkle on the right does not block a left-pair mount from reaching terminal-left", () => {
+  beforeEach(() => seedTwoPair({ special: "sparkle" }));
+
+  it("mounts the left build agent into terminal-left while the sparkle pane keeps the right", async () => {
+    await mount();
+    doubleClickRow(rowFor("Left Build One"));
+    expect(terminalOnScreen("la1")).toBe(true);
+    expect(inLeftStage("la1")).toBe(true);
+    // The right stage is still the sparkle pane's — the left mount never displaced it.
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+  });
+});
+
+// ══ THE ACTUAL FOUNDER PATH — OPEN THE LEFT PAIR, THEN MOUNT ════════════════════════════════════
+// Above the pair is pre-assigned. But the founder starts single-pair with his build agents on the
+// RIGHT and reaches the left column through the "Open the left pair" control (BuildColumnHeader
+// controls → `assignProjectToPair(projectId, otherSide(pairSide))`). This drives that exact store
+// gesture, then mounts a build row, and asserts the terminal lands in terminal-left — the end-to-end
+// path the report is about.
+describe("opening the left pair and THEN mounting a build agent reaches terminal-left", () => {
+  beforeEach(() => {
+    useProjectStore.setState({
+      projects: [mkProject("p1", "Alpha", [mkAgent("a1", MOUNTED), mkAgent("a2", OTHER)], "a1")],
+      selectedProjectId: "p1",
+    } as never);
+    useRuntimeStore.setState({ openAgentIds: [SPARKLE_ID, "a1", "a2"], status: {} } as never);
+    useUiStore.setState({
+      activeSpecial: "sparkle",
+      workModeBySide: { left: "build", right: "build" },
+      pinnedProjectId: null,
+      openProjectIds: null,
+      pairAssignment: {},
+      leftProjectId: null,
+      collapsedOrchestrators: {},
+    } as never);
+    useSettingsStore.setState({ beadsEnabled: true } as never);
+    useConnectionStore.setState({ isOnline: true } as never);
+    enableAiEnhancementsForTests();
+    resetVisitedProjects();
+    markProjectVisited("p1");
+    resetCable();
+  });
+
+  it("moves the project left and paints the mounted agent's terminal in terminal-left", async () => {
+    await mount();
+    // The "Open the left pair" gesture: reassign the current project to the left side.
+    act(() => {
+      useUiStore.getState().assignProjectToPair("p1", "left");
+    });
+    // The left column now renders; mount a build row in it.
+    doubleClickRow(rowFor(MOUNTED));
+    expect(stageLeftEl()).toBeTruthy();
+    expect(terminalOnScreen("a1")).toBe(true);
+    expect(inLeftStage("a1")).toBe(true);
+    expect(inRightStage("a1")).toBe(false);
   });
 });
