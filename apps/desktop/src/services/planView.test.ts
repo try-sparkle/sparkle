@@ -285,4 +285,39 @@ describe("orchestratorNameForEpic — reverse §8 linkage for the live view", ()
     expect(orchestratorNameForEpic(beads, [buildAgent({})], "e1")).toBeNull();
     expect(orchestratorNameForEpic(beads, [], "e1")).toBeNull();
   });
+
+  // ── THE LADDER ARM (bead `sparkle-n2feho.9`, part D) ───────────────────────────────────────
+  // `sendToBuild` in `mode: "task"` stamps a TASK bead's id into `epicId`, so the direct arm's
+  // `a.epicId === epicId` cannot see that agent on the EPIC, and the worker-derived arm cannot see
+  // it until it has SPAWNED A WORKER. Between the handoff and the first worker the epic therefore
+  // read `orchestrator: None` while an orchestrator was plainly on it.
+  it("finds a TASK-LEVEL orchestrator that has spawned NO worker yet", () => {
+    // Exactly what `prepareHandoff` writes in task mode: the same TASK id in BOTH fields.
+    const taskOrch = buildAgent({ epicId: "e1.1" });
+    expect(orchestratorNameForEpic(beads, [{ ...taskOrch, beadId: "e1.1" }], "e1")).toBe(
+      "Orchestrator One",
+    );
+  });
+
+  // THE PAIRED NEGATIVE: the arm must not drag in an agent from a DIFFERENT epic. Without this,
+  // a ladder arm that returned the first build agent unconditionally would pass the case above.
+  it("does not claim a task orchestrator bound under a different epic", () => {
+    const otherEpic = [
+      bead("e1", "open", null),
+      bead("e1.1", "open", "e1"),
+      bead("e2", "open", null),
+      bead("e2.1", "open", "e2"),
+    ];
+    const onE2 = buildAgent({ id: "b2", name: "Other", epicId: "e2.1" });
+    expect(orchestratorNameForEpic(otherEpic, [{ ...onE2, beadId: "e2.1" }], "e1")).toBeNull();
+    expect(orchestratorNameForEpic(otherEpic, [{ ...onE2, beadId: "e2.1" }], "e2")).toBe("Other");
+  });
+
+  // PRECEDENCE: an orchestrator handed THIS epic outranks one handed a child of it. The ladder
+  // resolves both to "e1", so only the arm ORDER separates them.
+  it("prefers the orchestrator bound to the EPIC over one bound to a child task", () => {
+    const onEpic = buildAgent({ id: "b-epic", name: "Epic Owner", epicId: "e1" });
+    const onTask = buildAgent({ id: "b-task", name: "Task Owner", epicId: "e1.1" });
+    expect(orchestratorNameForEpic(beads, [onTask, onEpic], "e1")).toBe("Epic Owner");
+  });
 });

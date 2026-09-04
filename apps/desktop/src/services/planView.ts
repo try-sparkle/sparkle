@@ -2,6 +2,7 @@
 // No React, no stores: the Plan view and the Build-tab hovers call these to compute what to show.
 // Kept pure so the linkage logic is unit-testable without a GUI.
 import { childrenOf, type Bead, type Board } from "./beads";
+import { epicIdForAgent } from "./epicLadder";
 import type { AgentTab } from "../types";
 import { rollupStages, type WorkflowStageId } from "../engine/workflowStage";
 
@@ -310,28 +311,73 @@ export function epicChildViews(
   return childrenOf(beads, epicId).map((b) => ({ bead: b, workers: workersForBead(agents, b.id) }));
 }
 
-/** The name of the Build orchestrator bound to an epic, for the epic's live status view (spec §7,
- *  the §8 linkage in reverse). Prefers a build agent whose `epicId` matches (set at sendToBuild
- *  handoff, so it resolves before any worker binds to a bead), else the build agent whose workers
- *  are on this epic's children (`epicForBuild` reverse path). Null when no orchestrator is bound. */
-export function orchestratorNameForEpic(
-  beads: Pick<Bead, "id" | "parent">[],
-  agents: Pick<AgentTab, "id" | "name" | "kind" | "epicId" | "parentId" | "beadId">[],
+/** The agent fields both orchestrator reads below need. Structural so a test builds six keys,
+ *  not a whole `AgentTab`. */
+export type OrchestratorCandidate = Pick<
+  AgentTab,
+  "id" | "name" | "kind" | "epicId" | "parentId" | "beadId"
+>;
+
+/**
+ * THE Build orchestrator on an epic — the agent, not just its name.
+ *
+ * The §8 linkage in reverse (spec §7). `orchestratorNameForEpic` is a thin wrapper over this, and
+ * every other caller that needs the agent's ID as well as its label goes through here, so the
+ * predicate that decides "which agent is bound to this epic" lives in exactly ONE function.
+ * `docs/orchestrators-per-task.md` requires that: this read and `sendToBuild.prepareHandoff`'s
+ * reuse predicate "must agree, and neither is duplicated anywhere else."
+ *
+ * ── THREE ARMS, IN THIS ORDER, AND THE ORDER IS LOAD-BEARING ─────────────────────────────────
+ *
+ *  1. THE BINDING ITSELF — a build agent whose `epicId` IS this epic. Stamped at handoff, so it
+ *     resolves before any worker binds to a bead. Unchanged, and first: it is the direct statement
+ *     of intent, and an orchestrator handed THIS epic must outrank one handed a child of it.
+ *
+ *  2. THE LADDER (bead `sparkle-n2feho.9`, flagged in `PRD/never-idle-fleet-epic-integration.md`).
+ *     `sendToBuild` in `mode: "task"` stamps a TASK bead's id into `epicId` — the shape
+ *     `docs/orchestrators-per-task.md` calls a TASK-LEVEL ORCHESTRATOR. Arm 1 cannot see it (the
+ *     ids differ) and arm 3 cannot see it until it has SPAWNED A WORKER, so between the handoff
+ *     and the first worker the epic read `orchestrator: None` while an orchestrator was plainly on
+ *     it. `epicLadder.epicIdForAgent` is the sanctioned resolver for exactly this — the bead is the
+ *     answer when it IS an epic, its parent epic otherwise — and using it here is a LADDER VIEW
+ *     over the binding, not a second definition of it. Re-deriving the edge locally is what
+ *     `scripts/lib/epic-membership-guard.sh` exists to reject.
+ *
+ *  3. THE WORKER-DERIVED REVERSE PATH — a build agent with no binding of its own whose workers are
+ *     on this epic's children. Not subsumed by arm 2: it routes through `parentId`, which
+ *     `epicIdForAgent` never reads, so it still answers for an orchestrator that carries neither
+ *     `epicId` nor `beadId`.
+ */
+export function orchestratorForEpic(
+  beads: readonly Bead[],
+  agents: readonly OrchestratorCandidate[],
   epicId: string,
-): string | null {
+): OrchestratorCandidate | null {
   const direct = agents.find((a) => a.kind === "build" && a.epicId === epicId);
-  if (direct) return direct.name;
+  if (direct) return direct;
+  const laddered = agents.find(
+    (a) => a.kind === "build" && epicIdForAgent(a, beads) === epicId,
+  );
+  if (laddered) return laddered;
   // Indexed ONCE outside the `find`, not once per candidate: the reverse path asks the same
   // question of every build agent, and rebuilding the bead map inside the predicate is how the
   // sidebar's O(agents × beads) got there in the first place.
-  const index = buildPlanViewIndex(
-    beads as Pick<Bead, "id" | "title" | "parent">[],
-    agents,
+  const index = buildPlanViewIndex(beads, agents);
+  return (
+    agents.find(
+      (a) => a.kind === "build" && workerDerivedEpicIdIndexed(index, a.id) === epicId,
+    ) ?? null
   );
-  const derived = agents.find(
-    (a) => a.kind === "build" && workerDerivedEpicIdIndexed(index, a.id) === epicId,
-  );
-  return derived ? derived.name : null;
+}
+
+/** The NAME of the Build orchestrator bound to an epic, for the epic's live status view.
+ *  Null when no orchestrator is bound. See {@link orchestratorForEpic} for the resolution order. */
+export function orchestratorNameForEpic(
+  beads: readonly Bead[],
+  agents: readonly OrchestratorCandidate[],
+  epicId: string,
+): string | null {
+  return orchestratorForEpic(beads, agents, epicId)?.name ?? null;
 }
 
 /** A short "id · title" label for the bead a worker is on (for the Build-tab worker hover).

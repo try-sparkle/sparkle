@@ -19,6 +19,7 @@ import {
   type AwaitedMountResult,
 } from "./agentMount";
 import { labelBead, commentBead, PROMOTED_LABEL, HANDED_TO_BUILD_LABEL } from "./beads";
+import { handoffRecordComment } from "./durableBinding";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { log } from "../logger";
@@ -512,12 +513,25 @@ function prepareHandoff(args: SendToBuildArgs): PreparedHandoff {
     // survives concurrency — one shared single-writer store with many agents writing at once makes
     // a mutable body last-write-wins, which destroys somebody else's edit without saying so. A
     // handoff is exactly the kind of accumulated fact that belongs in that thread.
+    // ...AND IT IS MACHINE-READABLE (bead `sparkle-n2feho.9`, founder decision 2026-09-04). The
+    // sentence alone is a record a HUMAN can read and a parser can only guess at, so the same
+    // comment now also carries a one-line `sparkle:binding {…}` trailer. The prose is unchanged and
+    // stays first — the bd thread is read by people, and a comment that is only a JSON blob is a
+    // worse artifact than one that says what it means.
+    //
+    // BOTH ENCODINGS COME OUT OF ONE FUNCTION (`durableBinding.handoffRecordComment`) so they
+    // cannot name different agents. Two formatters is exactly how a payload and the sentence beside
+    // it drift; `durableBinding.test.ts` pins that the pair this call writes round-trips through
+    // the parser to the SAME agent and project.
     void commentBead(
       project.rootPath,
       args.epicId,
-      `Handed to Build: orchestrator \`${agentId}\` in project \`${args.projectId}\`. ` +
-        `Recorded here because the binding itself (AgentTab.epicId) lives only in this window's ` +
-        `local store — this comment is what survives a fleet refresh (bead sparkle-n2feho.8).`,
+      handoffRecordComment({
+        agentId,
+        projectId: args.projectId,
+        beadId: args.epicId,
+        at: Date.now(),
+      }),
     ).catch((e: unknown) => {
       log.warn("epics", "could not record the task handoff identity", {
         bead: args.epicId,

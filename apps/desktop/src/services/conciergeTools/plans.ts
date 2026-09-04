@@ -24,6 +24,7 @@ import {
   childrenOf,
   isEpic,
   isBeadsUnavailable,
+  HANDED_TO_BUILD_LABEL,
   type Bead,
 } from "../beads";
 import {
@@ -40,7 +41,18 @@ import {
   toBeadsError,
   type BeadsError,
 } from "../beadsCommands";
-import { epicStatus, epicChildViews, orchestratorNameForEpic } from "../planView";
+import {
+  epicStatus,
+  epicChildViews,
+  orchestratorForEpic,
+  orchestratorNameForEpic,
+} from "../planView";
+import {
+  resolveOrchestratorBinding,
+  durableBindingDeps,
+  type DurableBindingDeps,
+  type OrchestratorBinding,
+} from "../durableBinding";
 import { columnFor } from "../beads";
 import { sendToBuild, AtCapacityError } from "../sendToBuild";
 import { epicGoalGenDeps, requestEpicGoal } from "../epicGoalGen";
@@ -184,12 +196,188 @@ export interface PlanChildView {
   blocked: boolean;
   /** Names of the worker agents attached to this bead. */
   workers: string[];
+  /**
+   * WHO IS — OR WAS — THE ORCHESTRATOR ON THIS TASK. See {@link OrchestratorBinding}.
+   *
+   * `source: "live"` is a roster row that exists right now. `source: "durable"` means the row is
+   * GONE and this is what the bead itself recorded at handoff — a RECOVERY, not a running agent,
+   * and the discriminant is there so nothing resumes or counts the two alike. `null` means the
+   * task was never handed to Build, or its record could not be read.
+   */
+  binding: OrchestratorBinding | null;
 }
 
 /** The agents of one project, as planView's pure helpers want them. Resolved from the STORE here —
  *  planView takes data, not ids, precisely so it stays pure and testable. */
 function agentsOf(projectId: string): AgentTab[] {
   return useProjectStore.getState().projects.find((p) => p.id === projectId)?.agents ?? [];
+}
+
+/**
+ * HOW MANY DURABLE RECORD READS ONE `get_plan` MAY SPEND.
+ *
+ * `beads_detail` carries `--include-comments`, so it pulls a bead's WHOLE thread from the
+ * single-writer Dolt store every worktree on this machine shares. Three call sites document it as
+ * PER-OPEN and refuse to put it on the board's 5s poll (`BoardView`, `EpicInlineCard`,
+ * `Concierge/BeadPill`), and bead `sparkle-n2feho.9` restates the constraint: `get_plan` is the
+ * single-plan read and can afford a detail read; `list_plans` iterates every epic and must gain
+ * none. So `list_plans` gets NOTHING added, and this tier is bounded twice over:
+ *
+ *   • BY THE GATES, which cost nothing. A read fires only for a bead that is BOTH unbound in the
+ *     live roster AND carries {@link HANDED_TO_BUILD_LABEL} — a fact already on the polled
+ *     snapshot, written by the same branch of `prepareHandoff` that writes the comment, so no bead
+ *     can hold a record without holding the label. In the ordinary case (nothing handed, or the
+ *     orchestrator is alive) that is ZERO reads for the whole plan.
+ *   • BY THIS CEILING, so the bound is provable rather than argued. Epic size guidance is 3-8
+ *     children (`sparkle-o05vcs.4`, flex up), so it clips only a plan where a dozen tasks were all
+ *     handed to Build and every one of their orchestrators has since been destroyed.
+ *
+ * A clipped bead reports `null` — the same "we did not find out" a failed read gives, for the same
+ * reason: there is no honest third answer, and this tier is a recovery hint riding alongside real
+ * data that must still be returned. It logs, so a plan that keeps hitting the ceiling is visible
+ * rather than merely quiet.
+ */
+export const DURABLE_BINDING_READ_CAP = 12;
+
+/**
+ * HOW LONG THE WHOLE RECOVERY PASS MAY TAKE before `get_plan` gives up on it.
+ *
+ * `get_plan` already spends three `bd` invocations, and the concierge bridge kills the whole tool
+ * call at 50s — the same ceiling `CREATE_PLAN_TOTAL_BUDGET_MS` exists to stay under. This tier adds
+ * up to {@link DURABLE_BINDING_READ_CAP} more, so without a bound a contended store could push a
+ * plan read past that kill for the sake of a recovery HINT, turning a working call into an opaque
+ * transport error. The reads run concurrently, so this is wall clock over all of them, not each.
+ *
+ * ABANDONING IT IS SAFE FOR THE REASON THE DEDUPE READ'S BUDGET IS: these are READS, they leave
+ * nothing behind, and the tier already fails to `null` on any error — so an expiry costs the
+ * recovery hint and nothing else, while the plan, its children and the live orchestrator are
+ * returned exactly as they were before this tier existed.
+ */
+export const DURABLE_BINDING_BUDGET_MS = 8_000;
+
+/**
+ * HOW MANY OF THOSE READS MAY BE IN FLIGHT AT ONCE — 2, matching the `bd` permit pool exactly.
+ *
+ * ══ WHY A COUNT CEILING AND A DEADLINE ARE NOT ENOUGH (roborev 80885, HIGH) ═══════════════════
+ * Every `beads_detail` becomes a `bd` child through the process-wide `BD_LIMITER`, whose production
+ * size is `BD_MAX_CONCURRENT = 2` (`apps/desktop/src-tauri/src/beads_cmd.rs:116`) and whose 30s
+ * deadline covers QUEUE TIME as well as run time. Firing all {@link DURABLE_BINDING_READ_CAP} at
+ * once does not make them run at once — it makes ten of them QUEUE, and that queue is SHARED: the
+ * board's 5s `bd list` poll and every other UI `bd` operation line up behind them. That convoy is
+ * the exact thing the 2-permit cap was introduced as a P0 to prevent, so a recovery HINT would be
+ * degrading the whole app's responsiveness.
+ *
+ * AND THE GATES DO NOT MAKE IT RARE — THEY MAKE IT THE NORMAL PATH. After a fleet refresh EVERY
+ * orchestrator row is gone, so every `handed-to-build` child of a plan is simultaneously unbound
+ * and affordable. The first `get_plan` after exactly the event this feature exists for is the
+ * widest fan-out it can produce.
+ *
+ * Matching the permit pool means the queue this tier adds is never longer than the work it is
+ * actually allowed to do, so nothing else waits behind reads that were not going to run yet anyway.
+ */
+export const DURABLE_BINDING_READ_WIDTH = 2;
+
+/** Does the polled snapshot already say this bead was handed to Build? The cheap half of the
+ *  binding: ONE BIT, no identity — the identity is what costs a detail read. */
+function handedToBuild(bead: Pick<Bead, "labels">): boolean {
+  return (bead.labels ?? []).includes(HANDED_TO_BUILD_LABEL);
+}
+
+/**
+ * Resolve `{live | durable | null}` for each of `targets`, in one bounded pass.
+ *
+ * THE LIVE TIER IS NOT DECIDED HERE. `planView.orchestratorForEpic` is the one reverse read over
+ * `AgentTab.epicId`, and `docs/orchestrators-per-task.md` says that predicate is "not duplicated
+ * anywhere else" — so this asks it and forwards the answer, rather than re-testing the field.
+ */
+async function bindingsFor(
+  projectPath: string,
+  beads: Bead[],
+  agents: AgentTab[],
+  targets: readonly Bead[],
+  deps: DurableBindingDeps,
+): Promise<Map<string, OrchestratorBinding | null>> {
+  let budget = DURABLE_BINDING_READ_CAP;
+  let clipped = 0;
+  // CLASSIFIED SYNCHRONOUSLY, in array order, so the ceiling is spent deterministically
+  // front-to-back rather than by whichever read happens to resolve first.
+  const plan = targets.map((bead) => {
+    const live = orchestratorForEpic(beads, agents, bead.id);
+    const wants = live === null && handedToBuild(bead);
+    const affordable = wants && budget-- > 0;
+    if (wants && !affordable) clipped++;
+    return { bead, live, affordable };
+  });
+  const resolve = (p: (typeof plan)[number]) =>
+    resolveOrchestratorBinding(
+      {
+        projectPath,
+        beadId: p.bead.id,
+        live: p.live ? { id: p.live.id, name: p.live.name } : null,
+        handedToBuild: p.affordable,
+      },
+      deps,
+    ).then((binding) => [p.bead.id, binding] as const);
+
+  // THE FREE TIER FIRST, AND OUTSIDE THE BUDGET. A live binding and a never-handed bead are both
+  // answered from data already in hand — `resolveOrchestratorBinding` returns before it awaits
+  // anything on both those paths — so putting them under a wall-clock expiry would let a slow
+  // store discard answers that cost nothing to produce. Only the READS are bounded.
+  const out = new Map<string, OrchestratorBinding | null>(
+    await Promise.all(plan.filter((p) => !p.affordable).map(resolve)),
+  );
+  const reads = plan.filter((p) => p.affordable);
+  // Seeded to null BEFORE the bounded pass, so an expiry leaves "we did not find out" rather than a
+  // missing key some later reader could mistake for a bead nobody asked about.
+  for (const p of reads) out.set(p.bead.id, null);
+
+  if (reads.length > 0) {
+    // A WIDTH-LIMITED POOL, NOT `Promise.all` — see DURABLE_BINDING_READ_WIDTH for why starting
+    // them all at once would queue behind, and in front of, the board's own poll.
+    const deadlineAt = Date.now() + DURABLE_BINDING_BUDGET_MS;
+    let next = 0;
+    let abandoned = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const p = reads[next++];
+        if (p === undefined) return;
+        // CHECKED BEFORE PULLING THE NEXT JOB, so an expiry stops us ISSUING work rather than
+        // merely stopping us waiting for it. `withDeadline` alone abandons the wait while the pool
+        // carries on spawning `bd` children nobody will ever read — the convoy, minus the caller.
+        if (Date.now() >= deadlineAt) {
+          abandoned++;
+          continue;
+        }
+        const [id, binding] = await resolve(p);
+        // WRITTEN AS EACH ONE LANDS, so a partial pass keeps what it already learned. Collecting
+        // into an array and assigning after `withDeadline` would throw away every completed read
+        // the moment the last one ran long.
+        out.set(id, binding);
+      }
+    };
+    // The outer bound is still needed: the clock check above stops us STARTING work, and only this
+    // stops us waiting on a single read that never returns at all.
+    await withDeadline(
+      Promise.all(
+        Array.from({ length: Math.min(DURABLE_BINDING_READ_WIDTH, reads.length) }, worker),
+      ),
+      DURABLE_BINDING_BUDGET_MS,
+    );
+    if (abandoned > 0) {
+      log.warn("plans", "durable binding lookups abandoned on their wall-clock budget", {
+        budgetMs: DURABLE_BINDING_BUDGET_MS,
+        abandoned,
+        reads: reads.length,
+      });
+    }
+  }
+  if (clipped > 0) {
+    log.warn("plans", "durable binding lookups clipped by the per-plan ceiling", {
+      clipped,
+      cap: DURABLE_BINDING_READ_CAP,
+    });
+  }
+  return out;
 }
 
 function summarize(epic: Bead, all: Bead[], agents: AgentTab[]): PlanSummary {
@@ -229,7 +417,19 @@ export async function getPlan(
   projectPath: string,
   projectId: string,
   id: string,
-): Promise<PlansResult<{ plan: PlanSummary; children: PlanChildView[] } | null>> {
+  /** The durable-record transport, injected ONLY so a test can drive the recovery tier without a
+   *  tauri bridge. Production callers never pass it. */
+  deps: DurableBindingDeps = durableBindingDeps,
+): Promise<
+  PlansResult<{
+    plan: PlanSummary;
+    children: PlanChildView[];
+    /** The orchestrator on the PLAN itself — live, durably recovered, or nothing. See
+     *  {@link PlanChildView.binding}; `plan.orchestrator` remains the live-only name, so a caller
+     *  that has not been taught about recovery keeps its old meaning exactly. */
+    binding: OrchestratorBinding | null;
+  } | null>
+> {
   const found = await attempt("get_plan", async () => {
     const [epic, beads, blocked] = await Promise.all([
       beadShow(projectPath, id),
@@ -249,18 +449,35 @@ export async function getPlan(
     );
   }
   const agents = agentsOf(projectId);
+  // epicChildViews pairs each child with the workers on it — the Plan board's own composition,
+  // reused rather than rebuilt.
+  const rows = epicChildViews(beads, agents, epic.id);
+  // THE PLAN AND ITS CHILDREN IN ONE PASS, because the record lives on whichever bead was handed.
+  // `sendToBuild` writes it only in `mode: "task"`, and a task-mode handoff names the bead it was
+  // given — usually a CHILD of the plan being read here, and occasionally the plan bead itself (a
+  // bead handed as a task that has since gained children is an epic by `isEpic`; see
+  // `useBeadBuildActions`'s own note on that shape). Asking only about the plan would leave the
+  // ordinary case — an epic's task whose orchestrator row was destroyed — permanently unreadable,
+  // which is the write-only defect this bead exists to close.
+  const bindings = await bindingsFor(
+    projectPath,
+    beads,
+    agents,
+    [epic, ...rows.map((r) => r.bead)],
+    deps,
+  );
   return ok("get_plan", {
     plan: summarize(epic, beads, agents),
-    // epicChildViews pairs each child with the workers on it — the Plan board's own composition,
-    // reused rather than rebuilt.
-    children: epicChildViews(beads, agents, epic.id).map(({ bead, workers }) => ({
+    children: rows.map(({ bead, workers }) => ({
       id: bead.id,
       title: bead.title,
       status: bead.status,
       column: columnFor(bead, blocked),
       blocked: blocked.has(bead.id),
       workers,
+      binding: bindings.get(bead.id) ?? null,
     })),
+    binding: bindings.get(epic.id) ?? null,
   });
 }
 

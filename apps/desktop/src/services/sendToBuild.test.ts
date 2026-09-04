@@ -153,6 +153,7 @@ import {
   MountRefusedError,
   sendToBuildBlockedReason,
 } from "./sendToBuild";
+import { parseHandoffRecord, BINDING_TRAILER_TAG } from "./durableBinding";
 // LEFT REAL, deliberately. `briefForLaunch` is the exact function `AgentPane.prepare` calls to build
 // the spawn's `initialPrompt`, so reading it here asserts the launch-side FACT rather than a mock of
 // it. Mocking `./agentBrief` would reproduce the original bug's blind spot: the old suite asserted
@@ -265,6 +266,36 @@ describe("sendToBuild", () => {
     // project unrecoverable, and one naming neither would be the defect this replaces.
     expect(text).toContain("build-new");
     expect(text).toContain("proj1");
+  });
+
+  // ── AND THE RECORD IS MACHINE-READABLE (bead `sparkle-n2feho.9`) ──────────────────────────────
+  it("writes the machine trailer AND the human sentence, naming the SAME pair", () => {
+    // The whole reason ONE function emits both encodings is that two would drift — a sentence
+    // naming one agent beside a payload naming another is worse than either alone, because a reader
+    // and a parser would then disagree with no way to tell which is right. This asserts the write
+    // side of that: the trailer this call produced parses back to exactly the pair the prose names.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "task-9", prdPath: null, mode: "task" });
+
+    const text = (commentBeadMock.mock.calls[0] as unknown as string[])[2]!;
+    const parsed = parseHandoffRecord([
+      { id: "c1", author: null, text, createdAt: null },
+    ]);
+    expect(parsed).toMatchObject({
+      agentId: "build-new",
+      projectId: "proj1",
+      beadId: "task-9",
+      encoding: "trailer",
+    });
+    // ...and the prose half still says it in words, on the SAME pair, so a human reading the bd
+    // thread is not left with a JSON blob. Asserted separately from the trailer: a single
+    // `toContain` over the whole comment would be satisfied by either half alone.
+    const prose = text.split("\n").filter((l) => !l.startsWith(BINDING_TRAILER_TAG)).join("\n");
+    expect(prose).toContain("Handed to Build: orchestrator `build-new` in project `proj1`");
+    // ONE LINE, always — a trailer split across lines would desynchronise the parser's line scan.
+    expect(text.split("\n").filter((l) => l.startsWith(BINDING_TRAILER_TAG))).toHaveLength(1);
   });
 
   it("records no such identity for an EPIC handoff — that path already has durable traces", () => {
