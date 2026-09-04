@@ -724,6 +724,37 @@ describe("HelperApp", () => {
     expect(originY).toBeTypeOf("number");
   });
 
+  it("ends an in-flight drag when the island is hidden mid-gesture", async () => {
+    // The pointer listeners live on `window`, so they outlive the island's pill. If Sparkle comes
+    // forward mid-drag the island hides and its DOM unmounts — but without the teardown effect the
+    // move/up handlers would keep firing, moving the now-invisible window and persisting a position
+    // the user could no longer see.
+    render(<HelperApp />);
+    const mark = await screen.findByAltText("Sparkle");
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+    await waitFor(() => expect(fireFrontmost).toBeTypeOf("function"));
+
+    // A real drag, past DRAG_SLOP.
+    fireEvent.pointerDown(mark, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerMove(window, { screenX: 300, screenY: 650 });
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+
+    // Sparkle comes forward → the visibility rule hides the island and the pill unmounts.
+    fireFrontmost!(true);
+    await waitFor(() => expect(screen.queryByTestId("helper-root")).toBeNull());
+    setHelperBounds.mockClear();
+
+    // Further pointer motion must reach nothing: the drag was torn down with the pill.
+    fireEvent.pointerMove(window, { screenX: 100, screenY: 900 });
+    fireEvent.pointerUp(window, { screenX: 100, screenY: 900 });
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(setHelperBounds).not.toHaveBeenCalled();
+    // …and no position was persisted from a drag the user could no longer see.
+    expect(useHelperPrefs.getState().x).toBeNull();
+    expect(useHelperPrefs.getState().y).toBeNull();
+  });
+
   // ---- the drag latch is ONE-SHOT: it suppresses the drag's own click, and nothing after it ----
 
   it("repositioning the tab does not un-collapse it", async () => {

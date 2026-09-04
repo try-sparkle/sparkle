@@ -136,6 +136,11 @@ export function HelperApp() {
   // without this repositioning the tab would always un-collapse it), and the release handler, which
   // must not clamp-and-persist a position the user never moved.
   const draggedRef = useRef(false);
+  // Teardown for an IN-FLIGHT drag, or null when none is active. The pointer listeners live on
+  // `window`, not on the pill, so they outlive the island's DOM: the effects below call this to end
+  // a drag when the island is hidden or the webview tears down mid-gesture, rather than leaving the
+  // handlers moving a window the user can no longer see (and persisting where it lands).
+  const dragCleanupRef = useRef<(() => void) | null>(null);
 
   // The pill's REAL painted box, per mode, and the element it is measured from.
   //
@@ -461,7 +466,24 @@ export function HelperApp() {
       setHelperBounds(lastX, lastY, width, height);
     };
     const DRAG_SLOP = 3; // px of travel before a press counts as a drag rather than a click
-    const onMove = (ev: PointerEvent) => {
+    // Remove the window-level drag listeners and drop any pending frame. Shared by the normal
+    // release (onUp) and the out-of-band cancel stored in dragCleanupRef, so the two cannot drift
+    // over which listeners a drag actually installed. Defined before onMove/onUp — which are hoisted
+    // function declarations for exactly that reason — so this can name them.
+    const detach = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      // A gesture the OS took away from us (a native drag, a system swipe) ends in pointercancel
+      // and NO pointerup — without this the move listener would outlive the drag.
+      window.removeEventListener("pointercancel", onUp);
+      // Drop any frame still pending so it can't land AFTER the clamp/snap on release and undo it.
+      if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+      dragCleanupRef.current = null;
+    };
+    function onMove(ev: PointerEvent) {
       const dx = ev.screenX - startX;
       const dy = ev.screenY - startY;
       // Under the slop this is still a CLICK, so move nothing at all. Committing sub-slop frames
@@ -473,18 +495,9 @@ export function HelperApp() {
       lastY = originY + dy;
       // Move live and unclamped for a responsive feel; the clamp/snap happens once on release.
       if (!raf) raf = requestAnimationFrame(commit);
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      // A gesture the OS took away from us (a native drag, a system swipe) ends in pointercancel
-      // and NO pointerup — without this the move listener would outlive the drag.
-      window.removeEventListener("pointercancel", onUp);
-      // Drop any frame still pending so it can't land AFTER the clamp/snap below and undo it.
-      if (raf) {
-        cancelAnimationFrame(raf);
-        raf = 0;
-      }
+    }
+    function onUp() {
+      detach();
       // A press that never travelled is a CLICK — the sparkle mark, or any bare part of the strip.
       // There is nothing to clamp, snap or persist: bailing here is what keeps a click from
       // writing an x/y (and re-running the placement effect) every single time the user taps the
@@ -510,11 +523,29 @@ export function HelperApp() {
           setPosition(clamped.x, clamped.y);
         }
       })();
-    };
+    }
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
+    // Let an in-flight drag be ended from OUTSIDE the gesture. detach() clears this when the drag
+    // ends normally; the effect below calls it when the island is hidden mid-drag or the webview
+    // unmounts. It tears the listeners down WITHOUT the clamp-and-persist above — a drag the user
+    // can no longer see must write no position — and resets the click/drag latch so the next press
+    // starts clean.
+    dragCleanupRef.current = () => {
+      detach();
+      draggedRef.current = false;
+    };
   }, [renderMode, width, height, pillW, pillH, setPosition, setEdge]);
+
+  // End any in-flight drag when the island is hidden or this component unmounts. The pointer
+  // listeners live on `window`, so a pill removed mid-drag — Sparkle came forward, the View menu
+  // toggled the island off, or the webview is tearing down — would otherwise keep moving the
+  // now-invisible window and, on release, persist a position the user never saw.
+  useEffect(() => {
+    if (!visible) dragCleanupRef.current?.();
+  }, [visible]);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
 
   const onChiclet = useCallback((band: Tier) => {
     emitFocusTier({ band });
