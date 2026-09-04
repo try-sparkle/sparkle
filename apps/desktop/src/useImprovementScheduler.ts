@@ -8,7 +8,9 @@ import {
   hourlySlotStamp,
   IMPROVEMENT_TICK_MS,
   isHourlySlotDue,
+  isPassRunning,
   notePaneStatus,
+  passRetryDueAt,
   runImprovementPass,
   shouldRunImprovementPass,
 } from "./services/improvementPass";
@@ -18,9 +20,72 @@ import {
   resetImprovePassLiveness,
 } from "./services/improvePassLiveness";
 import { readPassGate, refreshImproveDuty } from "./services/improveDutySnapshot";
-import { SPARKLE_AGENT_ID } from "./services/sparkleAgent";
+import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID } from "./services/sparkleAgent";
+import { humanBlockFor } from "./services/humanBlockFor";
+import { runIdleReEngage } from "./improvementReadiness";
+import { useBeadsStore } from "./stores/beadsStore";
+import { useConnectionStore } from "./stores/connectionStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
-import { useSettingsStore } from "./stores/settingsStore";
+import { useSettingsStore, type SparkleImprovementConsent } from "./stores/settingsStore";
+
+/**
+ * NEVER-IDLE ENFORCEMENT (bead sparkle-hrzitj, P0). Bind the live stores to the pure re-engage
+ * decision and, on a re-engage verdict, start a pass with the SAME mechanism the hourly path uses —
+ * `runImprovementPass`. Called only when the hourly slot is NOT due (the agent is between passes), so
+ * it never races or double-runs the hourly pass.
+ *
+ * The re-engage uses the ordinary DISCOVERY mission (`runImprovementPass(consent, false)`), NOT the
+ * claimed-drain (`focusBead`) path: the drain mission's prompt asserts the target bead is already
+ * CLAIMED (labelled `draining`) by the backlog-drainer supervisor, which is untrue for a bead the
+ * scheduler picked itself — telling the agent that would risk two agents on one bead. The discovery
+ * mission instead drains the inbox and pulls the highest-value ready item, CLAIMING as it goes, which
+ * is the safe way to re-dispatch onto the top actionable item. The chosen `focus` is logged so the
+ * verdict is legible; the mission finds and claims it.
+ *
+ * `freshSlot: false` and no `focusBead` means the pass does NOT touch the hourly connectivity-retry
+ * latch beyond the ordinary reset — and the decision additionally stands down entirely when a retry is
+ * armed (`retryArmed`), so the hourly slot's one re-attempt is never disturbed.
+ *
+ * `unstaffedEpicCount` is passed as 0: the robust "buildable epic with no live orchestrator" reading
+ * needs the orchestrator-liveness join that lives in `services/pusherMount.improveUnstaffedEpics`,
+ * which this scheduler does not own. Clause B of the founder's rule (no unstaffed epics) is therefore
+ * covered by the pusher's existing unstaffed-epic three-alarm nudge; this scheduler enforces clause A
+ * (no actionable P0/P1 ready work), which is the half the never-idle watcher did not previously verify
+ * against the human-gated distinction. The orchestrator can later feed a real count here (see report).
+ */
+function maybeReEngageWhenIdle(consent: SparkleImprovementConsent): void {
+  runIdleReEngage({
+    now: () => Date.now(),
+    consent: () => consent,
+    paneStatus: () => useRuntimeStore.getState().status[SPARKLE_AGENT_ID],
+    // The self-report the founder distrusts, read live so it cannot go stale (humanBlockFor re-reads
+    // the flag table on every call, and Rust clears the flag the instant the agent moves).
+    selfReportedBlockedOnHuman: () => humanBlockFor(SPARKLE_AGENT_ID) !== undefined,
+    passRunning: () => isPassRunning(),
+    retryArmed: () => passRetryDueAt() !== null,
+    online: () => useConnectionStore.getState().isOnline,
+    readyBacklog: () => {
+      const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
+      // An absent snapshot is UNREADABLE, never an empty board (bead sparkle-hrzitj): the poll is gated
+      // on this window owning the project and can fail to start, so `undefined` is routine. The decision
+      // stands down on `boardReadable: false` rather than reading it as "nothing to do".
+      return { boardReadable: snap !== undefined, readyBeads: snap?.board.backlog ?? [] };
+    },
+    unstaffedEpicCount: () => 0,
+    reEngage: (focus) => {
+      if (focus) {
+        console.warn(
+          "improvement scheduler: auto-re-engaging idle agent — top actionable bead",
+          focus.id,
+          `(P${focus.priority})`,
+        );
+      } else {
+        console.warn("improvement scheduler: auto-re-engaging idle agent against actionable backlog");
+      }
+      void runImprovementPass(consent, false);
+    },
+  });
+}
 
 export function useImprovementScheduler(enabled: boolean) {
   useEffect(() => {
@@ -52,7 +117,18 @@ export function useImprovementScheduler(enabled: boolean) {
       // Order matters by one line: `notePaneStatus` above is the SAMPLER (this tick is the only
       // one), and the reader consumes the latch it just advanced via the read-only `paneBusySinceAt`.
       const due = shouldRunImprovementPass(readPassGate(now));
-      if (!due) return;
+      if (!due) {
+        // NEVER-IDLE ENFORCEMENT (bead sparkle-hrzitj, P0). The hourly slot is not due, so the agent is
+        // resting between passes. The founder's standing rule is that it must NOT rest while there is
+        // actionable P0/P1 work or an unstaffed epic — and today the only thing deciding whether it may
+        // rest is the agent's own `blocked-on-human` self-report, which nothing checks against the real
+        // backlog. `maybeReEngageWhenIdle` verifies that self-report against the ready column and, when
+        // the idle is illegitimate, AUTO-RE-ENGAGES a pass. Every safety guard (working pane, a pass
+        // already running, an armed connectivity retry, an unreadable board, the cooldown) lives inside
+        // `runIdleReEngage`/`decideReEngage`, so this call is safe on every tick.
+        maybeReEngageWhenIdle(consent);
+        return;
+      }
       // Which kind of run this is, read BEFORE the stamp below overwrites the clock: the hourly
       // slot coming due (re-earns the one retry) or the early re-attempt (spends it).
       const freshSlot = isHourlySlotDue(settings.improvementLastRunAt, now);
