@@ -21,6 +21,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   canSelfMarkMet,
   selfMarkRefusal,
+  selfMarkRefusalOffersSelfClose,
   parseGoalVerify,
   type GoalVerify,
   type GoalVerifyEvidence,
@@ -2123,6 +2124,134 @@ function sameGoalVerify(stated: GoalVerify, stored: GoalVerify | undefined): boo
 }
 
 /**
+ * WHICH ARM REFUSED A `set_agent_goal_met`, spelled as a value so it can be reported.
+ *
+ * ── WHY THIS EXISTS (bead sparkle-gj8s4n) ────────────────────────────────────────────────────────
+ * A `goal_not_self_markable` refusal is reached through five different computations that produce
+ * copy about landing but never say WHICH ONE decided. Measured live: a PR was MERGED, `git
+ * merge-base --is-ancestor` returned 0 for the branch tip AND the merge commit, a fetch ran
+ * immediately before each attempt, the refusal repeated minutes apart — and the SAME call then
+ * SUCCEEDED with nothing changed in between. So the input was TRANSIENT, and the agent was resumed
+ * on a goal it could not close until the retry ceiling escalated a false alarm to a human.
+ *
+ * The investigation that followed could not name the arm, because that needs the app-side values
+ * (`landedReading`, `authoredWorkSeen`, `landedSource`) at that moment and none of them is visible
+ * from an agent worktree. That is the whole cost: a FALSE refusal and a TRUE one are byte-identical
+ * from outside, so every occurrence is a fresh investigation rather than a reading.
+ *
+ * ⚠️ THIS NAMES A DECISION, IT DOES NOT MAKE ONE. Nothing here is read by `canSelfMarkMet` or by
+ * `selfMarkRefusal`; the set of accepted calls is identical with and without it. The guard those
+ * arms implement is deliberate and correct — an agent that authored nothing satisfies ancestry
+ * trivially, so a probe `true` alone must never close a landed goal.
+ *
+ * ⚠️ NO ARM NAME MAY CONTAIN THE BARE WORD `landed`, and that is a RULE rather than a preference.
+ * `@sparkle/core/testing/landedClaim` audits the WHOLE refusal string this handler returns for an
+ * unconditional claim that the work is on origin/main, and `\blanded\b` matches the token
+ * `landed:git-probe-unproven` — a diagnostic label is not a claim, but the auditor cannot know that,
+ * and weakening a guard so a label can keep its spelling is the wrong trade. `ancestry:` says what
+ * the probe actually measures anyway; it is also the more accurate name for what git was asked.
+ */
+type SelfMarkArm =
+  /** The probe ran and git said NOT an ancestor. `landedSource: "git-probe"`. */
+  | "ancestry:git-probe-negative"
+  /** ⚠️ THE SUSPECT ARM. Git said ANCESTOR and we refused it, because no authored work is provable
+   *  on this branch. This is the arm a genuinely-landed agent would be stuck in. */
+  | "ancestry:git-probe-unproven"
+  /** The probe ran and could not tell (a dead worktree, a failed fetch, serde's `null`). */
+  | "ancestry:probe-inconclusive"
+  /** The INITIAL value for a `landed` goal, held while the probe gate is still ahead. No refusal
+   *  can carry it: the only way past that gate without probing is a window-local `true`, a reopen,
+   *  or the concierge — and all three ACCEPT. It exists so the arm is never unset, not as a state. */
+  | "ancestry:probe-not-run"
+  /** `command` or `human` — the claimant never answers those, so no landing evidence is gathered. */
+  | "verify-kind-not-self-markable";
+
+/** The inputs that decided a `goal_not_self_markable`, as read at the moment of the refusal. */
+interface SelfMarkDecision {
+  arm: SelfMarkArm;
+  /** Did the git ancestry probe run at all? Separates "not asked" from "asked, could not tell". */
+  probeRan: boolean;
+  /** What the probe answered. `undefined` = it could not tell (never "no" — see `probeLandedFromGit`). */
+  probe: boolean | undefined;
+  /** The reading `canSelfMarkMet` actually gated on. `undefined` = nobody looked. */
+  landedReading: boolean | undefined;
+  /** What `authoredWorkSeen` answered. `undefined` = not consulted (the probe never ran). */
+  authoredWorkSeen: boolean | undefined;
+  /** The provenance `selfMarkRefusal` picked its copy from. `undefined` = unrecorded. */
+  landedSource: GoalVerifyEvidence["landedSource"];
+}
+
+/** `undefined` is NOT LOOKED UP and must never render as `false` — that is the distinction the whole
+ *  evidence type is built on, and a diagnostic that flattens it re-creates the ambiguity it exists to
+ *  remove. Each field spells its own reason for being blank rather than sharing one word, because
+ *  "the probe was never asked" and "the probe was asked and could not tell" send a reader to
+ *  different places. */
+function selfMarkDecisionLines(d: SelfMarkDecision): string[] {
+  return [
+    `arm: ${d.arm}`,
+    `probe (git ancestry): ${d.probeRan ? (d.probe === undefined ? "could-not-tell" : String(d.probe)) : "not-run"}`,
+    `landedReading: ${d.landedReading === undefined ? "unread" : String(d.landedReading)}`,
+    `authoredWorkSeen: ${d.authoredWorkSeen === undefined ? "not-consulted" : String(d.authoredWorkSeen)}`,
+    `landedSource: ${d.landedSource ?? "unrecorded"}`,
+  ];
+}
+
+/**
+ * THE BLOCK APPENDED TO THE REFUSAL THE AGENT READS.
+ *
+ * ⚠️ A REFUSAL IS AN INSTRUCTION THE AGENT WILL FOLLOW, so what this adds must be SAFE under every
+ * arm that can reach it (AGENTS.md, "User-facing copy is code"). Two halves, and the split is the
+ * whole point:
+ *
+ * THE UNIVERSAL HALF is the one fact true on every arm that the agent cannot otherwise know:
+ * re-sending while these inputs are UNCHANGED is refused identically, and an agent's own re-set
+ * never refills the retry budget — only a human typing a message does. The measured failure was an
+ * agent re-marking met, being refused identically, and being auto-continued to an escalation.
+ *
+ * THE CLOSING CLAUSE IS ARM-AWARE, and it must be (roborev job 80848, a HIGH). A constant
+ * "report it to a human rather than marking met again" CONTRADICTED three arms whose own sentence
+ * ends "mark it met again; no human is needed" — two opposed instructions in one message, whose
+ * surviving reading (escalate) is the sparkle-gj8s4n shape this code exists to PREVENT. It was
+ * worst exactly where it mattered most: `probe-inconclusive` is the TRANSIENT input the bead
+ * documents, the one arm where re-sending genuinely IS the remedy once the reading lands.
+ *
+ * So the escalate clause is emitted ONLY where the copy names no door. Where it names one, the block
+ * DEFERS to that instruction instead of overriding it, and says why re-marking then is not the retry
+ * the universal half warns about: the inputs will have MOVED.
+ *
+ * ⚠️ AND THE DOOR BIT IS READ FROM THE COPY'S OWN LADDER, NOT FROM THE ARM (roborev job 80862, a
+ * second HIGH on the first fix). The arm is too coarse: `ancestry:git-probe-negative` is set for
+ * EVERY `landed === false`, and `selfMarkRefusal` splits that population in two — one half ends
+ * "land it … and mark this goal met again", the SQUASH/REBASE half ends "ask the concierge" and can
+ * never self-close, because under a squash landing no commit of the agent's will ever be an
+ * ancestor. Keyed on the arm, the squash population was told to retry forever: the same
+ * sparkle-gj8s4n shape, reintroduced by the fix for it. `selfMarkRefusalOffersSelfClose` answers
+ * from the same conditions the ladder branches on, and a parity test renders the real copy for every
+ * population and asserts the two agree.
+ */
+function selfMarkDiagnosticsBlock(
+  d: SelfMarkDecision,
+  offersSelfClose: boolean,
+): string {
+  const universal =
+    "These are the inputs that decided it. Re-sending set_agent_goal_met while they are UNCHANGED " +
+    "will be refused identically — a bare retry is not a remedy. Your own re-set never refills the " +
+    "retry budget; only a human typing a message to you does.";
+  const closing = !offersSelfClose
+    ? "The refusal above names no step you can take alone, so if you believe it is wrong, report it " +
+      "with the values above and let a human read them — rather than marking met again and being " +
+      "auto-continued toward an escalation."
+    : "The refusal above names what has to CHANGE first; do that, then mark it met again exactly " +
+      "as it says. That is not the bare retry warned about here — by then these inputs will have " +
+      "MOVED, which is the whole difference.";
+  return [
+    "REFUSAL DIAGNOSTICS (bead sparkle-gj8s4n):",
+    ...selfMarkDecisionLines(d),
+    `${universal} ${closing}`,
+  ].join("\n");
+}
+
+/**
  * set_agent_goal_met → the agent's own way to say it is finished.
  *
  * Exposed alongside the setter deliberately. `metAt` is the ONLY thing that makes an idle agent
@@ -2296,8 +2425,27 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
   // stays `"window-local"` — "the probe could not tell" is not "git said no".
   let landedSource: GoalVerifyEvidence["landedSource"] =
     landedReading === undefined ? undefined : "window-local";
+  // ── THE ARM AND ITS INPUTS, RECORDED AS THEY ARE DECIDED (bead sparkle-gj8s4n) ──────────────────
+  // Written by every branch below and READ BY NOTHING that decides — see `SelfMarkArm`. The default
+  // is the state before the probe gate: a `landed` goal whose window-local reading already answered
+  // (so no probe is needed), or a kind that gathers no landing evidence at all.
+  let selfMarkArm: SelfMarkArm =
+    goal.verify?.kind === "landed" ? "ancestry:probe-not-run" : "verify-kind-not-self-markable";
+  let probeRan = false;
+  let probeVerdict: boolean | undefined;
+  let authoredSeen: boolean | undefined;
   if (goal.verify?.kind === "landed" && landedReading !== true && met && !isConcierge) {
     const probed = await probeLandedFromGit(targetId);
+    probeRan = true;
+    probeVerdict = probed;
+    // READ ONCE, UNCONDITIONALLY, AND DECIDE ON THE SAME VALUE. `authoredWorkSeen` is a pure read of
+    // already-polled store state (no git, no IPC), so hoisting it out of the `||` below costs one
+    // store lookup and changes no outcome — the arm that consumed it consumes the identical value.
+    // What it buys is that the diagnostic can report the input on the arms that short-circuited past
+    // it, which is exactly the population the bead is about: a refusal whose decisive input was
+    // never printed reads the same whether it was `false` because no work exists or `false` because
+    // nothing had polled the pane.
+    authoredSeen = authoredWorkSeen(targetId);
     // `undefined` MUST NOT OVERWRITE a reading we already have. The probe's every failure path
     // answers `undefined`, and clobbering a window-local `false` with it would downgrade a real
     // (if weak) negative into "nobody looked" — a different refusal, sending the agent to wait for
@@ -2314,14 +2462,19 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
     if (probed === false) {
       landedReading = false;
       landedSource = "git-probe";
+      selfMarkArm = "ancestry:git-probe-negative";
       // …and the guard applies ONLY where the regression is: OVERTURNING a window-local `false`.
       // A BLANK reading (`undefined`) is the pre-existing path — nothing has polled this pane, so
       // there is no `committedWorkSeen` input to consult and no window verdict being overruled;
       // requiring authored work there would refuse the very agent the probe exists to serve, and
       // its own test ("MARKS MET when git says the worktree's HEAD is an ancestor") pins that.
-    } else if (probed === true && (landedReading === undefined || authoredWorkSeen(targetId))) {
+    } else if (probed === true && (landedReading === undefined || authoredSeen)) {
       landedReading = true;
       landedSource = "git-probe";
+      // NO ARM NAME IS RECORDED HERE, deliberately: this branch CLOSES the goal, and the diagnostic
+      // block is emitted only on a refusal — so a value written here could never be read by anything
+      // and no mutation of it could ever fail a test. Naming the accepting path would be a label
+      // that exists only to look complete.
     } else if (probed === true) {
       // GIT ANSWERED, AND WE REFUSED ITS ANSWER — RECORD THAT, do not drop it (roborev 72328).
       // Leaving `landedSource` at "window-local" here made the refusal deny git had spoken while
@@ -2330,6 +2483,14 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
       // human-mediated false close plus a false escalation. The READING stays `false`, so the gate
       // is untouched; only the provenance changes, which is what lets the copy tell the truth.
       landedSource = "git-probe-unproven";
+      selfMarkArm = "ancestry:git-probe-unproven";
+    } else {
+      // THE PROBE ANSWERED `undefined` — it ran and could not tell. That is a THIRD state, not a
+      // shade of git's no: `probeLandedFromGit` answers `undefined` on every failure path precisely
+      // so a dead worktree or a failed fetch can never be reported as "git says it is not on
+      // origin/main". The reading is left exactly as it was, which is what the arm has always done;
+      // only its name is new.
+      selfMarkArm = "ancestry:probe-inconclusive";
     }
   }
   // `stated` always rides along: `selfMarkRefusal` uses it to decide WHAT TO TELL the agent (whether
@@ -2363,10 +2524,32 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
     chosenHere: goal.verifyStated === true && goal.verifyInherited !== true,
   };
   if (!isConcierge && met && !canSelfMarkMet(goal.verify, evidence) && goal.verify) {
+    // ── MAKE THE REFUSAL LEGIBLE, WITHOUT CHANGING IT (bead sparkle-gj8s4n) ──────────────────────
+    // Every value here was already computed above; nothing is re-derived, and nothing below feeds
+    // `canSelfMarkMet`, which has already decided by the time this line is reached. Both audiences
+    // are served on the channels this file already uses: the AGENT gets the block appended to the
+    // refusal it reads, and a HUMAN gets the same values on the `[control]` console channel every
+    // other diagnostic in this file writes to — because the agent's copy of it lives inside a
+    // refusal string the human never sees, and the console line survives after the agent is gone.
+    const decision: SelfMarkDecision = {
+      arm: selfMarkArm,
+      probeRan,
+      probe: probeVerdict,
+      landedReading,
+      authoredWorkSeen: authoredSeen,
+      landedSource,
+    };
+    const decisionLine = selfMarkDecisionLines(decision).join(", ");
+    console.warn(`[control] goal_not_self_markable ${targetId} (${goal.verify.kind}): ${decisionLine}`);
     return {
       ok: false,
       code: "goal_not_self_markable",
-      error: selfMarkRefusal(goal.verify, evidence),
+      error:
+        `${selfMarkRefusal(goal.verify, evidence)}\n\n` +
+        // THE DOOR BIT COMES FROM THE COPY'S OWN LADDER, never from the arm name. One arm
+        // (`ancestry:git-probe-negative`) covers two populations whose copy says opposite things —
+        // see `selfMarkRefusalOffersSelfClose` (roborev job 80862).
+        `${selfMarkDiagnosticsBlock(decision, selfMarkRefusalOffersSelfClose(goal.verify, evidence))}`,
     };
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);

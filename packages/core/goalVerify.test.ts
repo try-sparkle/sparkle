@@ -17,6 +17,7 @@ import {
   inferGoalVerify,
   canSelfMarkMet,
   selfMarkRefusal,
+  selfMarkRefusalOffersSelfClose,
   describeGoalVerify,
   GOAL_VERIFY_KINDS,
   type GoalVerify,
@@ -935,5 +936,184 @@ describe("describeGoalVerify", () => {
     expect(describeGoalVerify({ kind: "human" })).toContain("person");
     // ABSENT must read as absent, never as a check that exists.
     expect(describeGoalVerify(undefined)).toBe("no check stated");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// PARITY: the door predicate and the COPY must never disagree (roborev job 80862, a HIGH)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// `selfMarkRefusalOffersSelfClose` mirrors `selfMarkRefusal`'s ladder, and two functions reading one
+// set of facts is precisely the drift this repo keeps paying for. So the agreement is ASSERTED
+// rather than maintained by care: every population below is rendered through the REAL refusal, and
+// the predicate must match what that copy actually says.
+//
+// The defect it exists to catch was keyed on the ARM: `ancestry:git-probe-negative` covers every
+// `landed === false`, and `selfMarkRefusal` splits that in two — one half ends "mark this goal met
+// again", the SQUASH half ends "ask the concierge" and can never self-close, because under a squash
+// landing no commit of the agent's will ever be an ancestor. An arm-keyed answer told the squash
+// population to retry forever, which is the sparkle-gj8s4n shape the diagnostics exist to remove.
+//
+// THE ORACLE IS THE COPY, NOT A SECOND COPY OF THE RULE. `offersSelfClose` is compared against
+// whether the emitted sentence actually invites the agent to mark met again by itself — so a future
+// arm added to the ladder and forgotten here goes RED, which is the whole point.
+describe("selfMarkRefusalOffersSelfClose agrees with the copy selfMarkRefusal emits", () => {
+  const landed = { kind: "landed" } as const;
+  /** How many DISTINCT refusals the `landed` ladder can emit, measured over the CROSS-PRODUCT of
+   *  the evidence fields it reads — not over the population list below, which cannot see an arm
+   *  nobody added to it (roborev 80888). Pinned so that adding an arm has to break something. */
+  const LANDED_LADDER_DISTINCT_COPIES = 6;
+  const populations: Array<{
+    name: string;
+    verify: GoalVerify;
+    evidence?: GoalVerifyEvidence;
+  }> = [
+    { name: "command — never claimant-answerable", verify: { kind: "command", cmd: "true" } },
+    { name: "human — never claimant-answerable", verify: { kind: "human" } },
+    {
+      name: "git said ancestor, no authored work provable (no door: concierge only)",
+      verify: landed,
+      evidence: { landed: false, landedSource: "git-probe-unproven" },
+    },
+    {
+      name: "git says NOT an ancestor and work IS outstanding (door: land it, mark met YOURSELF)",
+      verify: landed,
+      evidence: { landed: false, unlandedWork: true, landedSource: "git-probe" },
+    },
+    {
+      name: "SQUASH/REBASE: not an ancestor AND nothing outstanding, from git (no door)",
+      verify: landed,
+      evidence: { landed: false, unlandedWork: false, landedSource: "git-probe" },
+    },
+    {
+      name: "nothing observed landing, nothing outstanding, no git verdict (door)",
+      verify: landed,
+      evidence: { landed: false, unlandedWork: false },
+    },
+    {
+      name: "not landed, work outstanding (door: land it, then mark met again)",
+      verify: landed,
+      evidence: { landed: false, unlandedWork: true },
+    },
+    { name: "reading never taken (door: mark it met again once a poll lands)", verify: landed, evidence: {} },
+    { name: "no evidence at all (door)", verify: landed },
+  ];
+
+  for (const p of populations) {
+    it(`${p.name}`, () => {
+      const copy = selfMarkRefusal(p.verify, p.evidence);
+      const predicate = selfMarkRefusalOffersSelfClose(p.verify, p.evidence);
+      // The copy's OWN invitation to self-close. BOTH spellings the ladder actually emits: the
+      // watermark/blank arms say "mark it met AGAIN", and the plain git-probe-negative arm says
+      // "you can mark this goal met YOURSELF". Matching only the first scored that arm as no-door
+      // while the predicate correctly said door — so the one live population where the two would
+      // have disagreed was the one the list omitted, and adding it would have reddened the suite
+      // against CORRECT production behaviour, pointing the reader at the predicate (roborev 80882).
+      //
+      // …AND IT MUST NOT MATCH A DENIAL. Widening to `yourself` immediately matched the `command`
+      // arm's own prohibition — "so you cannot mark it met yourself" — scoring a no-door arm as a
+      // door. That is AGENTS.md's copy-ratchet trap verbatim: the honest copy DENIES the claim in
+      // so many words, so the naive pattern matches its own required denial. The negation
+      // lookbehind is what separates the offer from the refusal of it, and a lookbehind is safe
+      // HERE because this is a test — it must never leak into the shipped module, which is pinned
+      // to a WebView that cannot parse one.
+      const copyOffersSelfClose =
+        /(?<!cannot )(?<!can not )(?<!may not )(?<!not )mark (it|this|this goal) met (again|yourself)/i.test(
+          copy,
+        );
+      expect(
+        predicate,
+        `predicate said ${predicate} but the emitted copy ${copyOffersSelfClose ? "DOES" : "does NOT"} ` +
+          `invite a self-close.\n---\n${copy}\n---`,
+      ).toBe(copyOffersSelfClose);
+    });
+  }
+
+  // ANTI-VACUITY: the oracle must actually separate the populations. If every copy matched (or none
+  // did), every assertion above would pass against a predicate hardcoded to one value.
+  it("the populations really do split both ways — or the parity assertions prove nothing", () => {
+    const verdicts = populations.map((p) => selfMarkRefusalOffersSelfClose(p.verify, p.evidence));
+    expect(verdicts).toContain(true);
+    expect(verdicts).toContain(false);
+  });
+
+  // ⚠️ THE ENUMERATED LIST IS NOT THE COVERAGE BOUNDARY — THE CROSS-PRODUCT IS (roborev 80888).
+  //
+  // Two previous attempts at this claim were FALSE IN THE SAME DIRECTION, and the second was worse
+  // than the first because it carried a confident failure message. Both computed their answer from
+  // `populations` — the list in THIS file — so adding an arm to `selfMarkRefusal` contributed no
+  // population, routed nothing new, and left every assertion green. The guard asserting a property
+  // it cannot observe is worse than its absence.
+  //
+  // So the ladder is driven over the CROSS-PRODUCT of the evidence fields its `landed` arm actually
+  // reads. That side is generated, not enumerated, so it is independent of the list above: a new arm
+  // keyed on any combination of those fields produces a copy the cross-product reaches whether or not
+  // anyone remembered this file. 36 cases, and the whole suite still runs in milliseconds.
+  const LANDED_EVIDENCE_AXES = {
+    landed: [true, false, undefined],
+    unlandedWork: [true, false, undefined],
+    landedSource: ["git-probe", "git-probe-unproven", "window-local", undefined],
+  } as const;
+  const landedCrossProduct: GoalVerifyEvidence[] = [];
+  for (const landedV of LANDED_EVIDENCE_AXES.landed)
+    for (const unlandedWork of LANDED_EVIDENCE_AXES.unlandedWork)
+      for (const landedSource of LANDED_EVIDENCE_AXES.landedSource)
+        landedCrossProduct.push({
+          ...(landedV === undefined ? {} : { landed: landedV }),
+          ...(unlandedWork === undefined ? {} : { unlandedWork }),
+          ...(landedSource === undefined ? {} : { landedSource }),
+        } as GoalVerifyEvidence);
+
+  // THE REAL PARITY GUARANTEE. Every reachable `landed` refusal — not just the ones somebody
+  // thought to list — must agree with the predicate. This is what makes an unmatched new arm red:
+  // its copy either offers a self-close or does not, and the predicate has to say the same thing.
+  it("predicate and copy agree across EVERY reachable `landed` evidence shape, not just the listed ones", () => {
+    const disagreements: string[] = [];
+    for (const evidence of landedCrossProduct) {
+      const copy = selfMarkRefusal(landed, evidence);
+      const predicate = selfMarkRefusalOffersSelfClose(landed, evidence);
+      const copyOffers =
+        /(?<!cannot )(?<!can not )(?<!may not )(?<!not )mark (it|this|this goal) met (again|yourself)/i.test(
+          copy,
+        );
+      if (predicate !== copyOffers) {
+        disagreements.push(`${JSON.stringify(evidence)} → predicate ${predicate}, copy ${copyOffers}`);
+      }
+    }
+    expect(
+      disagreements,
+      "selfMarkRefusalOffersSelfClose disagrees with the copy selfMarkRefusal emits. If you ADDED " +
+        "an arm to the ladder, give the predicate a matching clause — an unhandled arm falls " +
+        "through to `return true`, which tells an agent with no door to mark met again.",
+    ).toEqual([]);
+  });
+
+  // …and the count, now taken from the CROSS-PRODUCT so it moves when the ladder does. An arm added
+  // there emits a copy nothing else emits, so the distinct count rises and this reds — which is the
+  // property the two earlier versions claimed and did not have.
+  it("a new arm in the `landed` ladder changes the distinct-copy count and reds this", () => {
+    const copies = new Set(landedCrossProduct.map((e) => selfMarkRefusal(landed, e)));
+    expect(
+      copies.size,
+      "The `landed` ladder emits a different number of distinct refusals than expected. ADDED an " +
+        "arm? Give `selfMarkRefusalOffersSelfClose` a door verdict for it, add a named population " +
+        "above so the arm has a readable label, and raise this count. MERGED or DELETED one? Lower it.",
+    ).toBe(LANDED_LADDER_DISTINCT_COPIES);
+  });
+
+  // ANTI-VACUITY FOR THE CROSS-PRODUCT ITSELF: it has to REACH the arms. If the axes were wrong the
+  // two tests above would pass over a set that exercises one branch, so pin that both door verdicts
+  // occur there and that the named populations are a SUBSET of what it reaches — the list is then a
+  // documentation aid, which is all it was ever sound to be.
+  it("the cross-product reaches both door verdicts AND covers every named population's copy", () => {
+    const verdicts = landedCrossProduct.map((e) => selfMarkRefusalOffersSelfClose(landed, e));
+    expect(verdicts).toContain(true);
+    expect(verdicts).toContain(false);
+    const reached = new Set(landedCrossProduct.map((e) => selfMarkRefusal(landed, e)));
+    for (const p of populations.filter((q) => q.verify.kind === "landed")) {
+      expect(
+        reached.has(selfMarkRefusal(p.verify, p.evidence)),
+        `the cross-product never produces the copy for "${p.name}" — its axes are wrong`,
+      ).toBe(true);
+    }
   });
 });

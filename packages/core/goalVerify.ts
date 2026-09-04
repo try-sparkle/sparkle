@@ -764,6 +764,53 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
   }
 }
 
+/**
+ * DOES THE COPY `selfMarkRefusal` JUST EMITTED NAME A DOOR THE AGENT CAN OPEN ALONE?
+ *
+ * ⚠️ THIS IS A PROPERTY OF THE COPY, NOT OF THE ARM, and that distinction is the whole reason it
+ * exists (roborev job 80862, a HIGH). The caller's first cut keyed the same question on the
+ * diagnostic ARM NAME — and `ancestry:git-probe-negative` is set for EVERY `landed === false`, a
+ * population `selfMarkRefusal` then splits in two. One half is told "land it … and mark this goal
+ * met again". The other is the SQUASH/REBASE half, whose copy says the opposite: do NOT re-run
+ * ancestry, settle it by CONTENT, ask the concierge. Under a squash landing no commit of the
+ * agent's can ever become an ancestor, so `landed` stays `false` permanently and there is no door
+ * at all. Telling that agent to "mark it met again" is the sparkle-gj8s4n shape exactly — refused
+ * identically, auto-continued to escalation — so an arm-keyed answer is wrong for a population the
+ * arm cannot distinguish.
+ *
+ * ⚠️ ITS CONDITIONS MIRROR `selfMarkRefusal`'S LADDER AND MUST STAY IN STEP. Two functions reading
+ * one set of facts is exactly the drift AGENTS.md warns about, so this is NOT left to care: the
+ * suite renders the real refusal for every population and asserts the two agree — a copy that
+ * offers a self-close must answer `true` here and one that does not must answer `false`. Add an arm
+ * to the ladder without adding it here and that parity test goes red, which is the point.
+ *
+ * ⚠️ IT DECIDES NOTHING ABOUT ACCEPTANCE. Nothing here is read by `canSelfMarkMet`; the set of
+ * accepted calls is identical with and without it. It chooses which sentence a REFUSAL ends with.
+ */
+export function selfMarkRefusalOffersSelfClose(
+  verify: GoalVerify,
+  evidence?: GoalVerifyEvidence,
+): boolean {
+  // `command` and `human` are never claimant-answerable, so neither names a door the agent opens.
+  if (verify.kind !== "landed") return false;
+  // Git said ANCESTOR and we refused it: the copy routes to the concierge and explicitly forbids
+  // taking the ancestry result there as proof. No self-service step exists.
+  if (evidence?.landed === false && evidence?.landedSource === "git-probe-unproven") return false;
+  // THE SQUASH/REBASE POPULATION. Ancestry has just answered NO and can never answer otherwise for
+  // this landing shape, so its copy sends the agent to settle by CONTENT and then to the concierge.
+  if (
+    evidence?.landed === false &&
+    evidence?.unlandedWork === false &&
+    evidence?.landedSource === "git-probe"
+  ) {
+    return false;
+  }
+  // Everything else the `landed` arm emits ends by naming a step the agent takes and then marks
+  // met again itself.
+  return true;
+}
+
+
 /** One-line human-readable rendering, for a row, a prompt, or a scoreboard. */
 export function describeGoalVerify(verify: GoalVerify | undefined): string {
   if (!verify) return "no check stated";

@@ -2527,6 +2527,408 @@ describe("controlListener", () => {
       });
     });
 
+    // ── sparkle-gj8s4n: A REFUSAL MUST NAME THE ARM THAT MADE IT, AND THE INPUTS IT READ ─────────
+    //
+    // Measured live: a PR was MERGED, `git merge-base --is-ancestor` returned 0 for both the branch
+    // tip and the merge commit, a fetch ran immediately before each attempt, the refusal repeated
+    // minutes apart — and then the SAME call SUCCEEDED with nothing changed in between. So the
+    // deciding input was TRANSIENT. The investigation could not say WHICH arm fired, because that
+    // needs `landedReading`, `authoredWorkSeen` and `landedSource` at that moment and none of them
+    // is visible from an agent worktree. A FALSE refusal and a TRUE one are byte-identical from
+    // outside, so every occurrence costs a fresh investigation and the agent is auto-resumed until
+    // the retry ceiling escalates a false alarm to a human.
+    //
+    // ⚠️ EVERY CASE HERE ASSERTS THE ACCEPT/REFUSE OUTCOME TOO — the STORE's `metAt`, not the reply.
+    // Diagnostics that also moved the gate would be a behaviour change wearing an observability
+    // label, and the failure direction (closing a landed goal for an agent that authored nothing) is
+    // the exact thing this gate exists to prevent.
+    //
+    // ⚠️ AND THE INPUT VALUES ARE SEEDED PER CASE, NOT MATCHED AS A STATIC BLOCK. The same arm is
+    // driven twice with OPPOSITE `authoredWorkSeen` inputs, and each case asserts it does not carry
+    // the other's value — a block printed from a constant would satisfy any single case.
+    describe("the goal_not_self_markable refusal names its arm and its inputs", () => {
+      /** Every `console.warn` this handler wrote — the HUMAN-side channel, which is the only place
+       *  these values survive after the refusal string has gone back to an agent that is now gone.
+       *  `[control] …` is what every other diagnostic in controlListener.ts writes to; nothing new
+       *  was invented for this. */
+      let warnings: string[] = [];
+      let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
+      beforeEach(() => {
+        warnings = [];
+        warnSpy = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+          warnings.push(args.map(String).join(" "));
+        });
+      });
+      afterEach(() => {
+        warnSpy?.mockRestore();
+        warnSpy = undefined;
+      });
+
+      /** The line the human reads, for THIS agent. Selected by agent id so a sibling's refusal in the
+       *  same test cannot satisfy an assertion about this one. */
+      const refusalWarning = () => warnings.filter((w) => w.includes(`goal_not_self_markable ${callerId}`));
+      const refusalText = () => String((lastReply() as { error?: string }).error ?? "");
+
+      /** A `landed` goal on a real worktree, with NOTHING polled: `landedEvidenceFor` answers
+       *  `undefined` and `authoredWorkSeen` answers `false`. */
+      const seedUnpolled = () => {
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, callerId, "the fix is merged to origin/main", undefined, "agent", {
+            kind: "landed",
+          });
+        useProjectStore.setState({
+          projects: useProjectStore.getState().projects.map((p) =>
+            p.id === projectId
+              ? { ...p, agents: p.agents.map((a) => (a.id === callerId ? { ...a, worktreePath: "/wt/caller" } : a)) }
+              : p,
+          ),
+        } as never);
+        // Preconditions, ASSERTED rather than assumed: a seeded `branchStatus` would move BOTH
+        // inputs this fixture exists to hold at their blank values, and every case below would then
+        // be asserting the other fixture's numbers.
+        expect(useRuntimeStore.getState().branchStatus[callerId]).toBeUndefined();
+        expect(landedEvidenceFor(callerId)).toBeUndefined();
+      };
+
+      /** The same goal on a branch TWO COMMITS AHEAD: `landedEvidenceFor` answers `false` (a
+       *  positive test failing, having asked git nothing) and `authoredWorkSeen` answers `true`. */
+      const seedAheadTwo = () => {
+        seedUnpolled();
+        useRuntimeStore.getState().setBranchStatus(callerId, {
+          ahead: 2,
+          behind: 0,
+          dirty: false,
+          filesChanged: 1,
+          insertions: 5,
+          deletions: 0,
+          worktreeOnBranch: true,
+        });
+        expect(landedEvidenceFor(callerId)).toBe(false);
+      };
+
+      /** NOTHING OUTSTANDING: a clean tree with no commits ahead. Paired with a probe that answers
+       *  `false`, this is the SQUASH/REBASE population — the work is in main, the tip is not an
+       *  ancestor of it, and no commit of this branch's ever will be. */
+      const seedNothingOutstanding = () => {
+        seedUnpolled();
+        useRuntimeStore.getState().setBranchStatus(callerId, {
+          ahead: 0,
+          behind: 0,
+          dirty: false,
+          filesChanged: 0,
+          insertions: 0,
+          deletions: 0,
+          worktreeOnBranch: true,
+        });
+      };
+
+      /** Edits but NO commits — the shape that satisfies ancestry trivially and must never close a
+       *  goal: `landedEvidenceFor` is `false` and `authoredWorkSeen` is `false`. */
+      const seedDirtyNoCommits = () => {
+        seedUnpolled();
+        useRuntimeStore.getState().setBranchStatus(callerId, {
+          ahead: 0,
+          behind: 0,
+          dirty: true,
+          filesChanged: 3,
+          insertions: 40,
+          deletions: 2,
+          worktreeOnBranch: true,
+        });
+        expect(landedEvidenceFor(callerId)).toBe(false);
+      };
+
+      // ── ARM 1: git ran and said NOT an ancestor ────────────────────────────────────────────────
+      it("names ancestry:git-probe-negative, with authoredWorkSeen TRUE for a branch holding commits", async () => {
+        seedAheadTwo();
+        landedProbeReply = { landed: false, reason: "abc123 is not an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dg1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        // THE DECISION IS UNCHANGED — refused, and the STORE says so.
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:git-probe-negative");
+        expect(err).toContain("probe (git ancestry): false");
+        expect(err).toContain("landedReading: false");
+        expect(err).toContain("authoredWorkSeen: true");
+        expect(err).toContain("landedSource: git-probe");
+        // …and the human-side line carries the same values.
+        expect(refusalWarning()).toHaveLength(1);
+        expect(refusalWarning()[0]).toContain("arm: ancestry:git-probe-negative");
+        expect(refusalWarning()[0]).toContain("authoredWorkSeen: true");
+      });
+
+      // THE SAME ARM, THE OPPOSITE INPUT. Without this pair the case above is satisfied by a block
+      // printed from a per-arm constant, which is precisely the diagnostic that would have been
+      // useless to the investigation: it is the INPUT that varies between a true refusal and the
+      // false one, not the arm's name.
+      it("names the SAME arm with authoredWorkSeen FALSE when nothing has polled the pane", async () => {
+        seedUnpolled();
+        landedProbeReply = { landed: false, reason: "abc123 is not an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dg2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:git-probe-negative");
+        expect(err).toContain("authoredWorkSeen: false");
+        expect(err).not.toContain("authoredWorkSeen: true");
+      });
+
+      // ── ARM 2: git said ANCESTOR and we refused it. THE SUSPECT ARM. ───────────────────────────
+      it("names ancestry:git-probe-unproven — git said ancestor, and the refusal says so with its inputs", async () => {
+        seedDirtyNoCommits();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dg3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:git-probe-unproven");
+        // THE FOUR INPUTS THAT DECIDED IT, each at the value this fixture seeded. `probe: true` and
+        // `landedReading: false` disagreeing is the whole finding — that pair is what "git says
+        // LANDED and the caller refused git's answer" looks like, and it was invisible before.
+        expect(err).toContain("probe (git ancestry): true");
+        expect(err).toContain("landedReading: false");
+        expect(err).toContain("authoredWorkSeen: false");
+        expect(err).toContain("landedSource: git-probe-unproven");
+        expect(refusalWarning()[0]).toContain("arm: ancestry:git-probe-unproven");
+        expect(refusalWarning()[0]).toContain("probe (git ancestry): true");
+        // ⚠️ THE APPENDED BLOCK MUST NOT UNDO THIS ARM'S OWN REMEDY. This arm forbids taking the
+        // ancestry result to the concierge, so the diagnostics may not reintroduce the ancestry
+        // command as an action — a refusal is an instruction the agent will follow.
+        expect(err).not.toMatch(/merge-base --is-ancestor/);
+        expect(err).toMatch(/Do NOT take the ancestry result to the concierge/i);
+      });
+
+      // ── ARM 3: the probe RAN and could not tell — a third state, not a shade of git's no ───────
+      it("names ancestry:probe-inconclusive and reports the reading it did NOT overwrite", async () => {
+        seedAheadTwo();
+        landedProbeError = "worktree is gone";
+        fire({ reqId: "dg4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:probe-inconclusive");
+        expect(err).toContain("probe (git ancestry): could-not-tell");
+        // The window-local `false` SURVIVED, and its provenance says so — the two facts the copy
+        // above turns into "a merge watermark this window has not latched".
+        expect(err).toContain("landedReading: false");
+        expect(err).toContain("landedSource: window-local");
+      });
+
+      // THE BLANK-READING HALF OF THE SAME ARM. `unread` and `false` are different facts and the
+      // block must not flatten either into the other — that flattening is the ambiguity the whole
+      // evidence type exists to remove.
+      it("distinguishes an UNREAD reading from a `false` one on that same arm", async () => {
+        seedUnpolled();
+        landedProbeReply = { landed: null, reason: "no origin/main to compare against" };
+        fire({ reqId: "dg5", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:probe-inconclusive");
+        expect(err).toContain("landedReading: unread");
+        expect(err).not.toContain("landedReading: false");
+        expect(err).toContain("landedSource: unrecorded");
+      });
+
+      // ── ARM 4: a kind the claimant never answers. The probe is not even asked. ─────────────────
+      it("names verify-kind-not-self-markable for a human goal, and says the probe did NOT run", async () => {
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, callerId, "the founder likes the new layout", undefined, "agent", {
+            kind: "human",
+          });
+        landedProbeReply = { landed: true, reason: "irrelevant here" };
+        fire({ reqId: "dg6", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: verify-kind-not-self-markable");
+        // NOT-RUN IS NOT COULD-NOT-TELL. They send a reader to different places: one says no ancestry
+        // evidence was ever gathered for this kind, the other says git was asked and had no answer.
+        expect(err).toContain("probe (git ancestry): not-run");
+        expect(err).not.toContain("could-not-tell");
+        expect(err).toContain("authoredWorkSeen: not-consulted");
+        expect(err).toContain("landedSource: unrecorded");
+        expect(refusalWarning()[0]).toContain("(human)");
+      });
+
+      it("names the same arm for a COMMAND goal, whose check no ancestry reading can answer", async () => {
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, callerId, "the parser suite is green", undefined, "agent", {
+            kind: "command",
+            cmd: "pnpm test parser",
+          });
+        fire({ reqId: "dg7", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        const err = refusalText();
+        expect(err).toContain("arm: verify-kind-not-self-markable");
+        expect(err).toContain("probe (git ancestry): not-run");
+        expect(err).toContain("landedReading: unread");
+        expect(refusalWarning()[0]).toContain("(command)");
+        expect(landedProbeCalls).toEqual([]);
+      });
+
+      // ── WHAT TO DO, NOT JUST WHAT HAPPENED ────────────────────────────────────────────────────
+      // The measured failure was an agent re-marking met, being refused identically, and being
+      // auto-continued to an escalation. The block says the one thing that is true on EVERY arm and
+      // that the agent cannot otherwise know — a bare retry is not a remedy, and only a human typing
+      // a message refills the retry budget.
+      it("tells the agent that a bare retry is not a remedy and only a HUMAN refills the retry budget", async () => {
+        seedDirtyNoCommits();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dg8", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        const err = refusalText();
+        expect(err).toMatch(/refused identically/i);
+        expect(err).toMatch(/a bare retry is not a remedy/i);
+        expect(err).toMatch(/never refills the retry budget/i);
+        expect(err).toMatch(/only a human typing a message to you does/i);
+      });
+
+      // ── THE CLOSING CLAUSE IS ARM-AWARE, AND THESE THREE PIN WHY (roborev job 80848, a HIGH) ───
+      //
+      // A CONSTANT closing clause told every agent to "report it to a human rather than marking met
+      // again". On the arms whose OWN copy ends "mark it met again; no human is needed", that put
+      // two opposed instructions in one message — and the reading that survives ("escalate") is the
+      // sparkle-gj8s4n shape this whole handler exists to prevent. It was worst on
+      // `probe-inconclusive`, the TRANSIENT input the bead documents, where re-marking really is the
+      // remedy once the reading lands.
+      //
+      // Three tests, and the pairing is what makes them non-vacuous: an absence assertion alone
+      // would pass for a handler that stopped emitting the closing clause entirely, and a presence
+      // assertion alone would pass for the constant clause that caused the defect.
+
+      // (a) THE DOOR ARM: the block must NOT override the arm's own self-service instruction.
+      it("does NOT tell a self-serviceable arm to escalate — it defers to that arm's own instruction", async () => {
+        seedUnpolled();
+        landedProbeReply = { landed: null, reason: "no origin/main to compare against" };
+        fire({ reqId: "dgA1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:probe-inconclusive");
+        // The arm's OWN copy really does offer a self-close door — asserted, not assumed, so the
+        // absence check below is a statement about a real contradiction rather than about nothing.
+        expect(err).toMatch(/mark (it|this goal) met again/i);
+        expect(err).toMatch(/no human is needed/i);
+        // …so the block must not contradict it.
+        expect(err).not.toMatch(/rather than marking met again/i);
+        expect(err).not.toMatch(/let a human read them/i);
+        // The UNIVERSAL half still rides along on this arm — it is true everywhere.
+        expect(err).toMatch(/a bare retry is not a remedy/i);
+        expect(err).toMatch(/never refills the retry budget/i);
+        // …and it says WHY re-marking later is not the retry it just warned about.
+        expect(err).toMatch(/these inputs will have MOVED/i);
+      });
+
+      // (b) THE NO-DOOR ARM: the escalate clause is still emitted, because nothing else can help.
+      it("DOES tell an arm with no self-service door to report it to a human", async () => {
+        seedDirtyNoCommits();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dgA2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:git-probe-unproven");
+        expect(err).toMatch(/no step you can take alone/i);
+        expect(err).toMatch(/rather than marking met again/i);
+        expect(err).not.toMatch(/these inputs will have MOVED/i);
+      });
+
+      // (c) A GENUINELY DIFFERENT ARM REACHING THE SAME DOOR — `ancestry:git-probe-negative` with
+      // work outstanding. The previous version of this case claimed to do that and did NOT: it
+      // seeded `landedProbeError`, so the probe answered `undefined` and it landed back on
+      // `ancestry:probe-inconclusive`, the SAME arm as (a) — caught by roborev job 80862, which is
+      // also how the squash defect below stayed invisible. The probe must ANSWER `false` here.
+      it("defers on ancestry:git-probe-negative too, so the rule is not one arm's accident", async () => {
+        seedAheadTwo();
+        landedProbeReply = { landed: false, reason: "abc123 is not an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dgA3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        const err = refusalText();
+        expect(err).toContain("arm: ancestry:git-probe-negative");
+        expect(err).toContain("probe (git ancestry): false");
+        // This population HAS a door — its copy says to land it and mark met again — so the block
+        // must defer rather than override.
+        expect(err).toMatch(/mark this goal met (yourself|again)/i);
+        expect(err).not.toMatch(/rather than marking met again/i);
+        expect(err).toMatch(/these inputs will have MOVED/i);
+      });
+
+      // (d) THE SQUASH/REBASE POPULATION — the defect roborev job 80862 found, pinned.
+      //
+      // It shares arm `ancestry:git-probe-negative` with (c) and has the OPPOSITE door: ancestry has
+      // just answered NO and can never answer otherwise under a squash landing, so its copy sends
+      // the agent to settle by CONTENT and then to the concierge, and never says to mark met again.
+      // An ARM-keyed rule therefore got this backwards and told it to retry forever — the
+      // sparkle-gj8s4n shape. Same arm, opposite verdict, is exactly why the door bit is read from
+      // `selfMarkRefusalOffersSelfClose` (the copy's own ladder) rather than from the arm name.
+      it("does NOT invite a self-close on the SQUASH population, which shares an arm with (c)", async () => {
+        seedNothingOutstanding();
+        landedProbeReply = { landed: false, reason: "abc123 is not an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dgA4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        const err = refusalText();
+        // Same arm as (c) — asserted, because the whole point is that the arm cannot separate them.
+        expect(err).toContain("arm: ancestry:git-probe-negative");
+        expect(err).toContain("landedSource: git-probe");
+        // The arm's own copy offers NO self-close…
+        expect(err).toMatch(/ask the concierge to close this goal/i);
+        expect(err).not.toMatch(/mark (it|this|this goal) met again/i);
+        // …so the block must not manufacture one.
+        expect(err).not.toMatch(/these inputs will have MOVED/i);
+        expect(err).toMatch(/names no step you can take alone/i);
+      });
+
+      // ── THE ACCEPTING PATH PRINTS NONE OF IT ──────────────────────────────────────────────────
+      // Paired deliberately with the refusal below it, on the SAME fixture and the SAME probe verdict
+      // — the only difference is the one input the rule turns on. An absence assertion alone would
+      // pass for a handler that had stopped emitting the block at all.
+      it("prints NO diagnostic block when the goal is ACCEPTED", async () => {
+        seedUnpolled();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dg9", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+        expect(JSON.stringify(lastReply())).not.toContain("REFUSAL DIAGNOSTICS");
+        expect(JSON.stringify(lastReply())).not.toContain("arm: ");
+        // …and nothing was written to the human channel either.
+        expect(refusalWarning()).toEqual([]);
+      });
+
+      it("…and DOES print it on the same fixture once authored work is not provable", async () => {
+        seedDirtyNoCommits();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "dg10", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(refusalText()).toContain("REFUSAL DIAGNOSTICS");
+        expect(refusalWarning()).toHaveLength(1);
+      });
+
+      // A REOPEN IS NOT A REFUSAL, and neither is the concierge's close — both are accepted, so
+      // neither may carry the block. Without this, "print diagnostics on every call" would pass
+      // every assertion above.
+      it("prints nothing for a reopen (met: false), which is never refused", async () => {
+        seedDirtyNoCommits();
+        fire({ reqId: "dg11", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: false } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true, met: false });
+        expect(JSON.stringify(lastReply())).not.toContain("REFUSAL DIAGNOSTICS");
+        expect(refusalWarning()).toEqual([]);
+      });
+    });
+
     // ── sparkle-vfkqz: THE GATE MUST NOT FIRE ON WORK GIT SAYS IS LANDED ─────────────────────────
     // Twice on 2026-08-04 a FINISHED agent burned three auto-continues and escalated to the founder
     // over a merged PR, because `landed` was refused unconditionally while the app already knew the
