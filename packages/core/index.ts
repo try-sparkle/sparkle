@@ -1,5 +1,8 @@
 export * from "./risk";
 export * from "./bridgeRetry";
+// The process-level backstop shared by the long-lived stdio MCP servers (mcp-control,
+// mcp-orchestrator). Extracted here so the two servers keep ONE definition; each passes its own label.
+export * from "./processSafetyNet";
 export * from "./historyScope";
 export * from "./classifier";
 export * from "./analytics";
