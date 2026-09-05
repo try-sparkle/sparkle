@@ -222,6 +222,17 @@ export interface DrainerConfig {
  *  localStorage — re-read from the file each launch (see `settingsStore.ts` `autoscalerArmed`). */
 export interface AutoscalerConfig {
   armed: boolean;
+  /** THE FLOOR (Phase 4): the minimum number of local agents the loop maintains while the ready
+   *  backlog is NON-EMPTY. Ships **0**, which changes nothing until a human sets it.
+   *
+   *  A PACING floor, not a second ceiling. While the fleet is below it and there is ready work, one
+   *  pass may spend up to the shortfall instead of the ordinary per-pass cap. It can never exceed
+   *  `min(free capacity, ready backlog)`, so the worst a wrong floor does is reach the machine-wide
+   *  ceiling faster, never past it. `0` means "no floor", NOT "run no agents".
+   *
+   *  Rust sends it as a plain `u32` (always present, never null); optional here only to tolerate a
+   *  backend predating the key, which the reader treats as the `0` default. */
+  floor?: number;
 }
 /** 1Password env-backup state (chosen vault + worktree seeding). Machine-wide; ignored in a
  *  per-project file — and here that's a security boundary, not just tidiness: a project-level

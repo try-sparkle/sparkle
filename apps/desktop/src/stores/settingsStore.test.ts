@@ -1490,3 +1490,98 @@ describe("hydrateFromConfig — the concierge per-project mirror", () => {
     expect(useSettingsStore.getState().conciergeOwnOrgs).toEqual([]);
   });
 });
+
+describe("[autoscaler] mirror — the arming flag and the Phase-4 floor", () => {
+  /** A minimal-but-complete effective config, with `autoscaler` swapped in per case. */
+  const eff = (autoscaler?: { armed: boolean; floor?: number }): EffectiveConfig =>
+    ({
+      config: {
+        workflow: {
+          require_pr: true,
+          worktree_isolation: true,
+          default_branch: "main",
+          born_fresh_from_base: true,
+          delete_merged_branch: true,
+          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+        },
+        workers: { max_concurrent: 5 },
+        ai: {
+          auto_rename: true,
+          voice_dictation: true,
+          composer: true,
+          suggested_actions: true,
+          auto_approve: true,
+        },
+        roborev: { consent_prompted: false },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
+        ...(autoscaler === undefined ? {} : { autoscaler }),
+      },
+      warnings: [],
+    }) as unknown as EffectiveConfig;
+
+  it("an ABSENT [autoscaler] leaves the loop disarmed with NO floor", () => {
+    // The state the overwhelming majority of installs are in, and the one that must change nothing.
+    useSettingsStore.getState().hydrateFromConfig(eff());
+    expect(useSettingsStore.getState().autoscalerArmed).toBe(false);
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(0);
+  });
+
+  it("a floor set in config reaches the store", () => {
+    // Without this the whole of Phase 4 is dead code — the shape roborev 80524 caught on this epic,
+    // where the TS read a config key Rust never produced.
+    useSettingsStore.getState().hydrateFromConfig(eff({ armed: false, floor: 3 }));
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(3);
+  });
+
+  it("A FLOOR NEVER ARMS ANYTHING — the two are independent", () => {
+    // The load-bearing half. A floor on a disarmed loop must stay exactly as inert as the loop is,
+    // or setting one becomes an undocumented way to arm a spawner.
+    useSettingsStore.getState().hydrateFromConfig(eff({ armed: false, floor: 8 }));
+    expect(useSettingsStore.getState().autoscalerArmed).toBe(false);
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(8);
+  });
+
+  it("a backend older than the key reads as NO floor, never as a remembered number", () => {
+    // Start from a hydrate that DID set one, so a reader that simply left the field alone would
+    // pass. `?? 0` is the assertion.
+    useSettingsStore.getState().hydrateFromConfig(eff({ armed: true, floor: 5 }));
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(5);
+    useSettingsStore.getState().hydrateFromConfig(eff({ armed: true }));
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(0);
+  });
+
+  it("an unreadable floor fails to ZERO rather than to a number nobody chose", () => {
+    for (const bad of [-1, 2.7, Number.NaN, "3" as unknown as number]) {
+      useSettingsStore.getState().hydrateFromConfig(eff({ armed: false, floor: bad }));
+      const got = useSettingsStore.getState().autoscalerFloor;
+      // 2.7 is the one case that is not zero: a fractional floor is truncated, not discarded, so a
+      // reader who wrote a float still gets the whole number below it rather than silent nothing.
+      expect(got, `floor = ${String(bad)}`).toBe(bad === 2.7 ? 2 : 0);
+    }
+  });
+
+  it("the setter clamps too — the settings UI writes this store without going through Rust", () => {
+    useSettingsStore.getState().setAutoscalerFloor(4);
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(4);
+    useSettingsStore.getState().setAutoscalerFloor(-2);
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(0);
+    useSettingsStore.getState().setAutoscalerFloor(Number.NaN);
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(0);
+    useSettingsStore.getState().setAutoscalerFloor(3.9);
+    expect(useSettingsStore.getState().autoscalerFloor).toBe(3);
+  });
+});

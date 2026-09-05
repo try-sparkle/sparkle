@@ -389,6 +389,21 @@ export function chiefLibraryOwner(
   return null;
 }
 
+/**
+ * The backlog autoscaler's FLOOR as read off the config payload.
+ *
+ * FAILS TO ZERO — the shipped value, the one that changes nothing — for every reading that is not a
+ * whole non-negative number. Rust already refuses an out-of-range or wrong-typed `[autoscaler].floor`
+ * and warns, so anything reaching here that is not a clean number came from a backend older than the
+ * key or from a payload nobody validated. The floor is the one setting that makes a WRITING loop
+ * spawn faster than its ordinary pace, so an unreadable value must mean "no floor" and never a
+ * remembered number.
+ */
+function readAutoscalerFloor(raw: number | undefined): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return 0;
+  return Math.floor(raw);
+}
+
 function isChiefLibraryClaimed(
   links: Record<string, string>,
   chiefProjectId: string,
@@ -798,6 +813,17 @@ interface SettingsState {
    *  state-changing writes. Unarmed, the sweep behaves EXACTLY as Phase 1 did: compute, log, spawn
    *  nothing. A human arms it once, deliberately. */
   autoscalerArmed: boolean;
+  /** THE BACKLOG AUTOSCALER'S FLOOR — the minimum number of local agents the loop maintains while
+   *  the ready backlog is non-empty. Mirrors `[autoscaler].floor`. Config-backed, NOT persisted.
+   *
+   *  DEFAULTS TO 0, which changes nothing: the loop grows at its ordinary per-pass rate. It is a
+   *  PACING floor rather than a second ceiling — while the fleet is below it and there is ready
+   *  work, one pass may spend up to the shortfall — and it can never exceed
+   *  `min(free capacity, ready backlog)`, so the machine-wide ceiling still binds.
+   *
+   *  INDEPENDENT OF `autoscalerArmed`, and the independence is load-bearing: a floor on a DISARMED
+   *  loop is exactly as inert as the loop is. Setting one must never be a way to arm it. */
+  autoscalerFloor: number;
   /** Builder Index (tokenmaxxing leaderboard) reporting. Mirrors [tools].builder_index — the ONE
    *  tool that defaults OFF, because it's the only one that publishes anything about you. Even
    *  when on, the Rust reporter posts nothing until consent + a username + an API key are stored
@@ -886,6 +912,7 @@ interface SettingsState {
    *  side effect live in `configActions.setDrainerEnabled`. */
   setDrainerEnabled: (on: boolean) => void;
   setAutoscalerArmed: (on: boolean) => void;
+  setAutoscalerFloor: (n: number) => void;
   /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
   setAutoApplyUpdates: (on: boolean) => void;
   /** Toggle deleting a shipped agent's merged branch on close (optimistic; configActions persists). */
@@ -1049,6 +1076,7 @@ export const useSettingsStore = create<SettingsState>()(
       // OFF until a human says otherwise — see the field docs. Fail-closed: an absent or malformed
       // config key leaves this false rather than arming a spawner by accident.
       autoscalerArmed: false,
+      autoscalerFloor: 0,
       // Default OFF — nothing is published until the user opts in AND consents.
       builderIndexEnabled: false,
       straudeEnabled: false,
@@ -1071,6 +1099,11 @@ export const useSettingsStore = create<SettingsState>()(
       setCloudDictation: (on) => set({ cloudDictation: on }),
       setDrainerEnabled: (on) => set({ drainerEnabled: on }),
       setAutoscalerArmed: (on) => set({ autoscalerArmed: on }),
+      // Clamped and floored to a whole number here as well as in Rust. The store is also written by
+      // the settings UI, which Rust's TOML reader never sees, and a NaN or a negative reaching the
+      // sweep would make `max(0, floor - current)` either NaN or meaningless.
+      setAutoscalerFloor: (n) =>
+        set({ autoscalerFloor: Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0 }),
       setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
       setWindowSpanMode: (mode) => set({ windowSpanMode: mode }),
       setWindowAutoRespan: (on) => set({ windowAutoRespan: on }),
@@ -1398,6 +1431,9 @@ export const useSettingsStore = create<SettingsState>()(
           // `?? false` — the fail-closed default. Every other reading of a missing key in this
           // block picks the shipped behaviour; here the shipped behaviour IS off.
           autoscalerArmed: config.autoscaler?.armed ?? false,
+          // `?? 0` — the shipped default, and the one that changes nothing. A backend predating the
+          // key must read as "no floor", never as some remembered number.
+          autoscalerFloor: readAutoscalerFloor(config.autoscaler?.floor),
           // `?? false` here, unlike its on-by-default siblings: an absent [tools] block (older
           // backend) must read as "not opted in", never as "publishing".
           builderIndexEnabled: config.tools?.builder_index ?? false,

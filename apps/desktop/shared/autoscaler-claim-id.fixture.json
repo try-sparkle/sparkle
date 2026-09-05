@@ -1,0 +1,20 @@
+{
+  "note": "THE ONE PAYLOAD BOTH SUITES PARSE for the backlog autoscaler's durable bead claim. `beadIds` are ids the Sparkle board really carries and hands to `acquireBeadClaim`; `claimantIds` are what apps/desktop/src/services/autoscalerClaim.ts's mintAutoscalerClaimantId ACTUALLY produces. apps/desktop/src-tauri/src/autoscaler_claim.rs feeds every one of these to the REAL is_bead_id / is_actor_id validators, and the TS half pins the mint's OUTPUT to the same shape. Neither side may be edited alone. This exists because the sibling lease shipped a mint whose ':' and '#' its own Rust validator rejected — 49,381 sweeps, zero dispatches, not one log line naming the cause (sparkle-2hsrlz). A claim that is silently always `invalid` is a spawner with NO de-duplication at all.",
+  "maxLen": 128,
+  "beadIds": [
+    { "why": "The ordinary shape the board carries.", "id": "sparkle-n2feho" },
+    { "why": "A DOTTED CHILD bead. The autoscaler works an epic's children, so this is the common case, not an edge one — and '.' is exactly the character an agent-id validator would have rejected.", "id": "sparkle-n2feho.10" },
+    { "why": "A deeper child.", "id": "sparkle-a3f8.2.1" },
+    { "why": "Underscores appear in hand-filed ids.", "id": "sparkle_local-1" }
+  ],
+  "rejectedBeadIds": [
+    { "why": "Empty is not an id, and an empty store key would collide with anything.", "id": "" },
+    { "why": "A slash would let a hand-edited store forge a path-shaped key.", "id": "sparkle/n2feho" },
+    { "why": "Whitespace: a key that round-trips differently than it was typed.", "id": "sparkle n2feho" },
+    { "why": "Only dots — no alphanumeric at all, which is path-ish nonsense rather than a bead.", "id": ".." }
+  ],
+  "claimantIds": [
+    { "why": "The exact production shape mintAutoscalerClaimantId produces: a fixed prefix and 16 lowercase hex characters. No repo slug, no timestamp with a colon, nothing user-controlled — the sibling lease's mint took a repo slug and that is what made it forgeable into an invalid id.", "id": "autoscaler-0123456789abcdef" },
+    { "why": "All-zero randomness is a legal draw and must still be accepted.", "id": "autoscaler-0000000000000000" }
+  ]
+}

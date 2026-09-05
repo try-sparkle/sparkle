@@ -1711,6 +1711,11 @@ pub struct DrainerConfig {
     pub enabled: bool,
 }
 
+/// The largest `[autoscaler].floor` that will be honoured. Not a capacity limit — the machine-wide
+/// agent ceiling already bounds every spawn — but a sanity bound so a typo (`floor = 1000`) is
+/// reported rather than accepted into a setting whose whole job is to make the loop spawn faster.
+pub const AUTOSCALER_FLOOR_MAX: u32 = 64;
+
 /// THE BACKLOG AUTOSCALER's arming switch (`[autoscaler]`) — the pass that SPAWNS agents against the
 /// ready backlog. Ships `armed = false`, and an absent section means false.
 ///
@@ -1737,6 +1742,19 @@ pub struct AutoscalerConfig {
     /// Arms the spawning pass. Ships FALSE. While false the loop computes and logs exactly as its
     /// dry-run phase did, and starts nothing.
     pub armed: bool,
+    /// THE FLOOR (Phase 4): the minimum number of local agents the loop maintains while the ready
+    /// backlog is NON-EMPTY. Ships **0**, which changes nothing at all until a human sets it.
+    ///
+    /// It is a PACING floor, not a second ceiling, and the distinction is what makes it safe. The
+    /// per-pass cap normally holds the loop to a small number of spawns a minute; while the fleet is
+    /// below the floor and there is ready work, the pass may spend up to the shortfall instead. It
+    /// can never exceed `min(free capacity, ready backlog)` — the arithmetic is unchanged and the
+    /// machine-wide ceiling still binds — so the worst a wrong floor can do is reach the ceiling
+    /// faster, never past it.
+    ///
+    /// A floor of 0 means "no floor": the loop grows at the ordinary per-pass rate. It does NOT
+    /// mean "run no agents", and nothing here can start an agent while `armed` is false.
+    pub floor: u32,
 }
 
 /// Per-project STEERING FILES — the "where" and the "how" pushed into every agent at birth
@@ -2759,7 +2777,7 @@ impl Default for SparkleConfig {
             // literal so this line, the struct, and DEFAULT_TEMPLATE cannot drift apart.
             drainer: DrainerConfig { enabled: true },
             // DISARMED on purpose — see AutoscalerConfig. Every way of not deciding lands here.
-            autoscaler: AutoscalerConfig { armed: false },
+            autoscaler: AutoscalerConfig { armed: false, floor: 0 },
             // Ships OFF, unlike every neighbour here: this one merges pull requests. The remaining
             // values are the SAFE direction — roborev gates, and the only accepted strategy is the
             // merge commit that keeps `landed-by-ancestry` provable. Stated as literals so this
@@ -3091,6 +3109,7 @@ struct PartialDrainer {
 #[derive(Debug, Default, Deserialize)]
 struct PartialAutoscaler {
     armed: Option<toml::Value>,
+    floor: Option<toml::Value>,
     #[serde(flatten)]
     rest: std::collections::BTreeMap<String, toml::Value>,
 }
@@ -4551,6 +4570,31 @@ fn apply_autoscaler(into: &mut AutoscalerConfig, p: Option<PartialAutoscaler>) -
                     v.type_str()
                 ));
             }
+        }
+    }
+
+    if let Some(v) = p.floor {
+        // STRICT, AND FAIL-CLOSED, for the same reason `armed` is: the floor is the one setting that
+        // makes the loop spawn MORE than its ordinary pace, so a value nobody can read must leave it
+        // at whatever it already was rather than guess. An out-of-range value is refused rather than
+        // CLAMPED — clamping a fat-fingered `floor = 1000` down to the maximum would silently arm
+        // the most aggressive setting available, which is the opposite of what the typo meant.
+        match &v {
+            toml::Value::Integer(n) if (0..=AUTOSCALER_FLOOR_MAX as i64).contains(n) => {
+                into.floor = *n as u32;
+            }
+            toml::Value::Integer(n) => warnings.push(format!(
+                "[autoscaler].floor = {n} is outside 0..={AUTOSCALER_FLOOR_MAX}, so it has no \
+                 effect — the floor is still {}. The machine-wide agent ceiling bounds the loop \
+                 anyway; a floor above it buys nothing.",
+                into.floor
+            )),
+            _ => warnings.push(format!(
+                "[autoscaler].floor is a {}, not a whole number, so it has no effect — the floor is \
+                 still {}. Use `floor = 3`.",
+                v.type_str(),
+                into.floor
+            )),
         }
     }
 
@@ -9793,6 +9837,61 @@ quit_app = 42
             build_effective(SparkleConfig::default(), None, Some("[autoscaler]\narmed = true\n"));
         assert!(!hard);
         assert!(!cfg.autoscaler.armed, "a per-project [autoscaler] must be IGNORED");
+    }
+
+    #[test]
+    fn the_autoscaler_floor_ships_at_zero_and_only_a_whole_number_in_range_moves_it() {
+        // A FLOOR OF 0 IS THE SHIPPED STATE AND CHANGES NOTHING. This is the half a reader is most
+        // likely to get wrong: 0 means "no floor, grow at the ordinary pace", NOT "run no agents".
+        let (cfg, _w, hard) = build_effective(SparkleConfig::default(), Some(""), None);
+        assert!(!hard);
+        assert_eq!(cfg.autoscaler.floor, 0, "an absent [autoscaler] must leave the floor at zero");
+
+        // THE SETTING PATH IS REACHABLE. Without this the whole of Phase 4 is dead code — the exact
+        // defect roborev 80524 caught on this epic, where the TS read a key Rust never produced.
+        for n in [0u32, 1, 3, AUTOSCALER_FLOOR_MAX] {
+            let toml = format!("[autoscaler]\nfloor = {n}\n");
+            let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard, "floor = {n} must not be a hard error");
+            assert_eq!(cfg.autoscaler.floor, n, "`floor = {n}` must take: {warns:?}");
+        }
+
+        // OUT OF RANGE IS REFUSED, NOT CLAMPED, and it warns. Clamping `floor = 1000` down to the
+        // maximum would silently arm the most aggressive setting available — the opposite of what
+        // the typo meant. A negative is the same fact from the other side.
+        for bad in ["1000", "-1"] {
+            let toml = format!("[autoscaler]\nfloor = {bad}\n");
+            let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard, "an out-of-range floor must not discard the whole layer");
+            assert_eq!(cfg.autoscaler.floor, 0, "`floor = {bad}` must NOT take");
+            assert!(
+                warns.iter().any(|w| w.contains("[autoscaler].floor")),
+                "and it must SAY the edit did nothing: {warns:?}"
+            );
+        }
+
+        // A WRONG TYPE is refused and warns too — the same discipline `armed` applies, for the same
+        // reason: the floor is the one setting that makes the loop spawn FASTER than its pace.
+        for bad in ["\"3\"", "true", "3.5"] {
+            let toml = format!("[autoscaler]\nfloor = {bad}\n");
+            let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard);
+            assert_eq!(cfg.autoscaler.floor, 0, "`floor = {bad}` must NOT take");
+            assert!(warns.iter().any(|w| w.contains("[autoscaler].floor")), "{warns:?}");
+        }
+
+        // A PROJECT LAYER CANNOT SET IT, exactly as it cannot arm it: a cloned repo must not be able
+        // to raise the spawn rate on someone else's machine.
+        let (cfg, _w, hard) =
+            build_effective(SparkleConfig::default(), None, Some("[autoscaler]\nfloor = 5\n"));
+        assert!(!hard);
+        assert_eq!(cfg.autoscaler.floor, 0, "a per-project [autoscaler] floor must be IGNORED");
+
+        // AND SETTING A FLOOR DOES NOT ARM ANYTHING. The two are independent, and a floor on a
+        // disarmed loop must stay exactly as inert as the loop is.
+        let (cfg, _w, _h) =
+            build_effective(SparkleConfig::default(), Some("[autoscaler]\nfloor = 5\n"), None);
+        assert!(!cfg.autoscaler.armed, "a floor must never imply arming");
     }
 
     #[test]

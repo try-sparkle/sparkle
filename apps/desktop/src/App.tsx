@@ -381,17 +381,20 @@ function DrainerBridge() {
   return null;
 }
 
-// THE BACKLOG AUTOSCALER — PHASE 1, DRY RUN, READ-ONLY (bead sparkle-n2feho.6).
+// THE BACKLOG AUTOSCALER (bead `sparkle-n2feho`, phases .6/.7/.10).
 //
-// It computes `target = min(free capacity, ready backlog)` once a minute and LOGS it. It starts
-// nothing. There is no arming marker because there is no write to gate: the module calls no spawn,
-// no bd write and no PTY write, and `backlogAutoscaler.test.ts` ratchets that so Phase 2 cannot
-// slip a writer in behind this mount. Mounted anyway, and deliberately: a decision core that ships
-// tested but unmounted measures nothing, and the whole point of Phase 1 is to check the math
-// against the machine's real ceiling.
+// It computes `target = min(free capacity, ready backlog)` once a minute, LOGS it, and — ONLY when
+// `[autoscaler].armed` is true, which it is not by default — takes a durable claim on the next
+// ready bead and starts an agent on it.
+//
+// THE ARMING GATE IS NOT HERE, DELIBERATELY. It lives inside `sweepBacklogAutoscaler`, in the
+// callee, because THIS MOUNT is the thing whose commit deploys the loop: a gate at the call site is
+// a gate the deployment skips (AGENTS.md, "Deploying a hook IS running it"). Disarmed, the pass
+// reaches no writer at all — no claim, no journal line, no agent — and `backlogAutoscaler.test.ts`
+// asserts exactly that rather than trusting this comment.
 //
 // NOT OBSERVABLE IN THE RUNNING APP — it is a packaged build with no hot reload. These lines appear
-// only in a DMG built from a main containing this merge.
+// only in a DMG built from a main containing this merge, and even then only once a human arms it.
 function BacklogAutoscaler() {
   useEffect(() => startBacklogAutoscaler(), []);
   return null;

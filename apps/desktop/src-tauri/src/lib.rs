@@ -17,6 +17,10 @@ mod audio;
 mod audio_devices;
 mod auth;
 mod auto_send_tuner;
+/// The backlog autoscaler's durable, SELF-EXPIRING claim on a bead it is about to staff, so two
+/// Sparkle windows cannot spawn against the same one (bead sparkle-n2feho.10, Phase 3). NOT
+/// `notes::bead_claim`, which shells `bd update --claim` and never expires. See the module docs.
+mod autoscaler_claim;
 /// The durable one-driver-per-PR lease behind auto-dispatch of `/babysit-pr` (bead sparkle-5gxom).
 /// NOT `pr_claims` — that is explicitly a courtesy, not a lock. See the module docs.
 mod babysit_lease;
@@ -1644,6 +1648,10 @@ pub fn run() {
             babysit_lease::babysit_lease_heartbeat,
             babysit_lease::babysit_lease_release,
             babysit_lease::babysit_leases,
+            autoscaler_claim::autoscaler_claim_acquire,
+            autoscaler_claim::autoscaler_claim_heartbeat,
+            autoscaler_claim::autoscaler_claim_release,
+            autoscaler_claim::autoscaler_claims,
             sparkle_agent::ensure_sparkle_repo,
             drainer::ensure_backlog_drainer,
             drainer::read_drainer_queue,
