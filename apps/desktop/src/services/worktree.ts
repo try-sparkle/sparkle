@@ -311,6 +311,27 @@ export function installAgentHooks(worktree: string, projectRoot?: string): Promi
   return invoke<string>("install_agent_hooks", { worktree, projectRoot });
 }
 
+/** Register ONLY the Claude Code event hooks (the `sparkle-hook.mjs` emitter) in an APP-OWNED
+ *  worktree's `settings.local.json`, so peer messages queued to that agent drain at its next turn
+ *  boundary. Resolves to the absolute event-log path.
+ *
+ *  NOT a variant of {@link installAgentHooks} to reach for casually — it is the SURGICAL half, and
+ *  the difference is the point. `installAgentHooks` also pre-enables plugins and writes the
+ *  permission posture (`bypassPermissions` and its consent record); this writes event hooks and
+ *  nothing else. An app-owned worktree's posture is set elsewhere and must not change as a side
+ *  effect of registering a mailbox drain.
+ *
+ *  WHY IT IS CALLED AT PANE PREPARE (bead sparkle-6yrvqd). The drain rides the `Stop` hook, and
+ *  until this existed the only thing that ever registered that hook in the canonical
+ *  `__sparkle_self__` worktree was the hourly improvement pass. Measured 2026-09-04: it never had —
+ *  that worktree carried two hook events, neither of them the emitter, where an ordinary agent
+ *  carries nine — so 114 messages queued and `delivered` was 0 for the inbox's whole lifetime.
+ *  Registering here makes the drain a property of the agent being MOUNTED rather than of an
+ *  unrelated background pass having happened to run first. */
+export function installInboxDrainHooks(worktree: string): Promise<string> {
+  return invoke<string>("install_inbox_drain_hooks", { worktree });
+}
+
 /** What the install pass did for one plugin. `key` is the `[plugins]` TOML key
  *  (`superpowers`, `frontend_design`), which is how a caller maps an outcome back to its row. */
 export type PluginInstallOutcome = {

@@ -23,6 +23,7 @@ vi.mock("./SparkleConsentBanner", () => ({ SparkleConsentBanner: () => null }));
 vi.mock("../services/worktree", () => ({
   createAgentWorktree: vi.fn(() => Promise.resolve({ path: "/wt/sparkle-self", branch: "sparkle/agent-self" })),
   installWorktreeGuard: vi.fn(() => Promise.resolve()),
+  installInboxDrainHooks: vi.fn(() => Promise.resolve("/app-data/hook-events/__sparkle_self__.jsonl")),
   assertWorkspaceIntegrity: vi.fn(() => Promise.resolve()),
   acquireWorktreeLease: vi.fn(() => Promise.resolve()),
   releaseWorktreeLease: vi.fn(() => Promise.resolve()),

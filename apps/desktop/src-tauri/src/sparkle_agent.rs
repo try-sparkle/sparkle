@@ -33,7 +33,14 @@ pub(crate) const SPARKLE_PROJECT_ID: &str = "sparkle-self";
 /// The CANONICAL Sparkle agent id — the main window's interactive pane and the hourly headless
 /// pass share it (one worktree). MUST match `SPARKLE_AGENT_ID` in `src/services/sparkleAgent.ts`.
 /// Improve Sparkle is per-window; every OTHER (secondary) window uses `__sparkle_self__-<label>`.
-const SPARKLE_CANONICAL_AGENT_ID: &str = "__sparkle_self__";
+///
+/// `pub(crate)` so `hooks::heal_app_owned_drain_hooks` can ask whether an inbox belongs to this
+/// agent (bead sparkle-6yrvqd) without a fourth hand-written copy of the literal. Three copies of
+/// this string already exist in the crate — here, `mention.rs` and `sparkle_improve.rs` — and the
+/// hazard is not the duplication itself but that a mismatch is SILENT: `mayDrain` compares the
+/// exported id against the hook log's basename, so one stale copy makes an agent refuse to drain
+/// its own inbox and says nothing.
+pub(crate) const SPARKLE_CANONICAL_AGENT_ID: &str = "__sparkle_self__";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

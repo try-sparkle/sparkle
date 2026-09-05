@@ -387,6 +387,26 @@ pub struct InboxStatus {
     pub awaiting_ack: u32,
     /// Ids still pending, so a caller can name them rather than only count them.
     pub pending_ids: Vec<String>,
+    /// The `ts` of the OLDEST still-pending record, or `None` when nothing is pending.
+    ///
+    /// THE ONLY EVIDENCE HERE THAT RETENTION CANNOT RESET, and that is why it exists (bead
+    /// sparkle-6yrvqd, caught by review before it shipped). The obvious way to ask "is this
+    /// recipient draining?" is `delivered == 0 && acknowledged == 0`, and it is WRONG: both counters
+    /// are computed by iterating the records still present in `<agent>.jsonl`, and
+    /// `retention::reap_inbox` compacts that file at `2 × MAX_AGE_MS` (24h). So a long-lived,
+    /// perfectly healthy agent that delivered and acked yesterday reads `0` on both today, and any
+    /// few messages queued during one long turn would trip a "this recipient is not draining"
+    /// accusation against a working agent with a correct configuration.
+    ///
+    /// An oldest-pending timestamp cannot lie that way: the record it names is BY DEFINITION still
+    /// in the file, because it is the thing being counted. And it is what the claim actually rests
+    /// on — a drain runs at every turn boundary, so a message that has been pending far longer than
+    /// any turn really has had no boundary to ride.
+    ///
+    /// `Option<i64>` crosses the wire as `null`, never as an absent key (`AGENTS.md`), so the TS
+    /// side reads it as `number | null` and NOT as `field?: number`. Absent and null are the same
+    /// answer here — nothing is pending, so there is no age to report.
+    pub oldest_pending_ms: Option<i64>,
     /// The ceiling an incoming [`Severity::Fyi`] is judged against — [`FYI_CEILING`].
     ///
     /// CARRIED SO A SENDER CAN SEE THE DEPTH *BEFORE* IT IS REFUSED (bead sparkle-n2feho.4). `pending`
@@ -909,6 +929,11 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
             acknowledged: 0,
             awaiting_ack: 0,
             pending_ids: Vec::new(),
+            // NOT an age of zero. Nothing is pending on a refused id, so there is no oldest record
+            // to report — and `0` would be the epoch, i.e. the oldest possible timestamp, which the
+            // receipt would read as "waiting since 1970" and turn a refusal into the loudest
+            // possible not-draining accusation.
+            oldest_pending_ms: None,
             fyi_ceiling: FYI_CEILING as u32,
             act_ceiling: MAX_PER_AGENT as u32,
         };
@@ -920,6 +945,7 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
 
     let mut pending_ids = Vec::new();
     let (mut pending_n, mut delivered, mut acknowledged) = (0u32, 0u32, 0u32);
+    let mut oldest_pending: Option<i64> = None;
     for m in &msgs {
         // A record whose id cannot be a claim file name is counted in NO column.
         //
@@ -944,6 +970,14 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
         } else if !expired {
             pending_n += 1;
             pending_ids.push(m.id.clone());
+            // Tracked HERE, inside the same arm that decides a record is pending, so the two can
+            // never disagree about which records they are describing. Computed from the records
+            // rather than assumed from their order: the file is append-only today, but "the first
+            // pending one is the oldest" is an ordering assumption, and a `min` costs nothing.
+            oldest_pending = Some(match oldest_pending {
+                Some(prev) if prev <= m.ts => prev,
+                _ => m.ts,
+            });
         }
     }
     InboxStatus {
@@ -954,6 +988,7 @@ pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
         // Saturating: an ack for a message whose claim file was reaped must not underflow.
         awaiting_ack: delivered.saturating_sub(acknowledged),
         pending_ids,
+        oldest_pending_ms: oldest_pending,
         fyi_ceiling: FYI_CEILING as u32,
         act_ceiling: MAX_PER_AGENT as u32,
     }
@@ -1121,6 +1156,24 @@ pub async fn inbox_send(
     let sev = severity.unwrap_or(Severity::Fyi);
     let from = resolve_from(from);
     tauri::async_runtime::spawn_blocking(move || {
+        // MAKE SURE SOMETHING CAN COLLECT THIS BEFORE WE PUT IT IN THE BOX (bead sparkle-6yrvqd).
+        //
+        // Queueing is the easy half and it never failed; what failed was that for the app-owned
+        // Improve-Sparkle agent NOTHING WAS REGISTERED TO COLLECT. 114 messages went into a queue
+        // whose `Stop` hook had never been installed, `delivered` stayed 0 for the inbox's entire
+        // lifetime, and every send here returned Ok with a message id.
+        //
+        // This is the SECOND of two independent triggers for that registration — the pane installs
+        // it at mount, and this installs it at send. Two, because this mailbox has already shown
+        // that a single path can be dead for months with nothing noticing, and because these two
+        // fail for unrelated reasons: a pane that never mounted, versus an app that never sent.
+        //
+        // It is a no-op for every other agent (ordinary agents are registered by
+        // `AgentPane.prepare`'s `installAgentHooks`), it cannot fail this send — it returns `()` —
+        // and it runs INSIDE `spawn_blocking` beside the enqueue it protects, because it does
+        // filesystem work and this command exists on the blocking pool precisely so that work
+        // cannot park the main thread in front of the concierge's control surface.
+        crate::hooks::heal_app_owned_drain_hooks(&app, &agent_id);
         enqueue(&base, &agent_id, &text, sev, &from, now_ms(), uuid_v4())
     })
     .await
@@ -1292,6 +1345,64 @@ mod tests {
 
     fn send(base: &Path, agent: &str, text: &str, now: i64, id: &str) -> Result<String, String> {
         enqueue(base, agent, text, Severity::Fyi, "concierge", now, id.to_string())
+    }
+
+    // ── The oldest-pending age (bead sparkle-6yrvqd) ──────────────────────────────────────────
+    //
+    // The receipt's "this recipient is not draining" verdict is computed from this ONE field, and
+    // it exists because the obvious signal — `delivered == 0 && acknowledged == 0` — is reset by
+    // `retention::reap_inbox` at 24h and would therefore accuse a healthy agent. So these pin the
+    // property that makes it trustworthy: it names a record that is still in the file, and it is
+    // the OLDEST pending one rather than the newest or the first.
+
+    #[test]
+    fn oldest_pending_ms_is_none_when_nothing_is_queued() {
+        let base = tmp("oldest-empty");
+        assert_eq!(status_of(&base, "a1", 10_000).oldest_pending_ms, None);
+    }
+
+    #[test]
+    fn oldest_pending_ms_names_the_oldest_queued_record_not_the_newest() {
+        let base = tmp("oldest-min");
+        // Enqueued NEWEST FIRST, so a reader that took the first pending record it saw — or the
+        // last — would disagree with `min` and this would catch it.
+        send(&base, "a1", "newer", 5_000, "m-new").unwrap();
+        send(&base, "a1", "older", 1_000, "m-old").unwrap();
+        send(&base, "a1", "middle", 3_000, "m-mid").unwrap();
+        let st = status_of(&base, "a1", 6_000);
+        assert_eq!(st.pending, 3);
+        assert_eq!(st.oldest_pending_ms, Some(1_000));
+    }
+
+    /// A DELIVERED record must not hold the age down. `delivered` and `pending` are different
+    /// columns and the verdict is about the PENDING ones: an old message the agent already took is
+    /// evidence the drain WORKS, so counting it here would invert the signal.
+    #[test]
+    fn a_claimed_record_does_not_count_toward_the_oldest_pending_age() {
+        let base = tmp("oldest-claimed");
+        send(&base, "a1", "old and taken", 1_000, "m-old").unwrap();
+        send(&base, "a1", "recent and waiting", 5_000, "m-new").unwrap();
+        assert!(claim(&claims_dir(&base, "a1"), "m-old"));
+        let st = status_of(&base, "a1", 6_000);
+        assert_eq!(st.delivered, 1);
+        assert_eq!(st.pending, 1);
+        assert_eq!(
+            st.oldest_pending_ms,
+            Some(5_000),
+            "an already-delivered record is evidence the drain works, not evidence it is stuck"
+        );
+    }
+
+    /// An EXPIRED record is not pending either — `pending` excludes it, so the age must too, or a
+    /// queue whose only content is past its TTL would report itself as permanently stuck.
+    #[test]
+    fn an_expired_record_does_not_count_toward_the_oldest_pending_age() {
+        let base = tmp("oldest-expired");
+        send(&base, "a1", "long past its ttl", 1_000, "m-old").unwrap();
+        let now = 1_000 + MAX_AGE_MS + 1;
+        let st = status_of(&base, "a1", now);
+        assert_eq!(st.pending, 0);
+        assert_eq!(st.oldest_pending_ms, None);
     }
 
     /// Same as [`send`] but at [`Severity::Act`] — the class judged against the full ceiling.

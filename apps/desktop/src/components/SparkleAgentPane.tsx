@@ -3,6 +3,7 @@ import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors
 import {
   createAgentWorktree,
   installWorktreeGuard,
+  installInboxDrainHooks,
   assertWorkspaceIntegrity,
   acquireWorktreeLease,
   releaseWorktreeLease,
@@ -212,6 +213,40 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
       } catch (e) {
         console.warn("guard install failed (relocation still protects):", e);
       }
+      // REGISTER THE INBOX-DRAIN HOOKS HERE, NOT IN AN HOURLY PASS (bead sparkle-6yrvqd).
+      //
+      // The drain rides the `Stop` hook. This pane used to register nothing and rely on
+      // `sparkle_improve_run` having installed it — a dependency on a DIFFERENT code path having
+      // fired first, with nothing to notice when it had not. It had not: measured 2026-09-04, this
+      // worktree's settings.local.json carried `PreToolUse` (the write-guard) and
+      // `UserPromptSubmit` (a repo cadence script) and NOTHING ELSE, where an ordinary agent
+      // worktree carries nine events including `Stop`. So the turn-boundary drain had never run
+      // once, 114 peer messages queued up, and `delivered` was 0 for the inbox's entire lifetime
+      // while every `inbox_send` replied "queued".
+      //
+      // The app-side idle sweep could not cover for it, which is why this is not merely belt and
+      // braces: `fleetWatch.SAFE_TO_DELIVER` is `{idle, unmerged, blocked}` and this agent's status
+      // is permanently `working`, so that gate never opened either. Two independent paths, both
+      // silently inoperative.
+      //
+      // Registering it at PREPARE makes the drain a property of the agent being MOUNTED — the same
+      // moment `AgentPane.prepare` calls `installAgentHooks` for an ordinary agent — instead of a
+      // property of an unrelated background pass having happened to run.
+      //
+      // BEST-EFFORT, exactly like the guard above and for the same reason: a registration failure
+      // must never stop the pane from spawning. The cost of failing is bounded and self-healing —
+      // an unregistered hook leaves messages `pending` and UNCLAIMED, so the next prepare (or a
+      // pass) retries, and the fail-closed drain never double-sends. It is WARNED rather than
+      // swallowed because "this agent stopped receiving messages" is precisely the symptom that
+      // took a full day to diagnose with nothing in any log to explain it.
+      try {
+        await installInboxDrainHooks(wt.path);
+      } catch (e) {
+        console.warn(
+          "[inbox] drain-hook install failed; peer messages to this agent will stay queued until it succeeds:",
+          e,
+        );
+      }
       await assertWorkspaceIntegrity(wt.path);
       const claude = await checkClaude();
       if (!claude.installed || !claude.path) {
@@ -291,12 +326,18 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
             // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg): the same
             // window id the hook-events log and the inbox are keyed by.
             //
-            // LIVE FOR THE PRIMARY WINDOW. This pane does not call `installAgentHooks` itself, but the
-            // hourly improvement pass (`sparkle_improve_run` → `install_event_hooks_for_worktree`) now
-            // registers the Stop-hook drain in the SHARED canonical `__sparkle_self__` worktree, and
-            // this pane runs `claude` in that same worktree — so once a pass has registered the hook,
-            // the primary window's exported id IS consumed and its queued peer messages drain at a turn
-            // boundary. A SECONDARY window keys on `__sparkle_self__-<label>`, which the canonical log's
+            // LIVE FOR THE PRIMARY WINDOW, and this pane now REGISTERS the consuming hook itself —
+            // see the `installInboxDrainHooks` call in `prepare` above (bead sparkle-6yrvqd).
+            //
+            // IT USED TO DEPEND ON THE HOURLY PASS, and that is what broke. The prose here read
+            // "once a pass has registered the hook, the primary window's exported id IS consumed",
+            // which is true and was never reached: `sparkle_improve_run` was the ONLY caller of
+            // `install_event_hooks_for_worktree`, and measured on 2026-09-04 the canonical worktree
+            // had no emitter hook of any kind. An export whose consumer is registered by a different
+            // code path is not a mechanism, it is a hope — so the registration moved here, beside
+            // the export it pairs with, where the two cannot drift apart.
+            //
+            // A SECONDARY window keys on `__sparkle_self__-<label>`, which the canonical log's
             // basename never matches, so `mayDrain` refuses it (its own inbox, not the canonical one).
             // The export is still unconditional because the drain fails CLOSED: a missing one would
             // present as "the Improve-Sparkle agent stopped receiving messages" with nothing to explain

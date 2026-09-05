@@ -86,6 +86,7 @@ vi.mock("../services/worktree", () => ({
     Promise.resolve({ path: "/wt/sparkle-self", branch: "sparkle/agent-self" }),
   ),
   installWorktreeGuard: vi.fn(() => Promise.resolve()),
+  installInboxDrainHooks: vi.fn(() => Promise.resolve("/app-data/hook-events/__sparkle_self__.jsonl")),
   assertWorkspaceIntegrity: vi.fn(() => Promise.resolve()),
   // Worktree lease heartbeat (bead sparkle-hc7hvm): the pane claims/refreshes/releases it while
   // mounted so the hourly park won't reset this shared worktree out from under the live session.

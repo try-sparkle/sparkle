@@ -2500,6 +2500,130 @@ pub fn install_event_hooks_for_worktree(app: &AppHandle, worktree: &Path) -> Res
     Ok(log.to_string_lossy().into_owned())
 }
 
+/// Register the inbox-drain hooks for an APP-OWNED worktree, from the frontend, at the moment the
+/// pane prepares — the eager half of bead sparkle-6yrvqd.
+///
+/// WHY THIS COMMAND EXISTS, and it is a measured hole rather than a tidying. Until now the ONLY
+/// caller of [`install_event_hooks_for_worktree`] was `sparkle_improve::sparkle_improve_run`, so
+/// the canonical `__sparkle_self__` worktree got its `Stop` hook ONLY as a side effect of an
+/// hourly improvement pass having run. `SparkleAgentPane.prepare` knew this and said so in prose —
+/// "this pane does not call `installAgentHooks` itself, but the hourly improvement pass ... now
+/// registers the Stop-hook drain" — which is a dependency on another code path having fired first,
+/// with nothing to notice when it had not.
+///
+/// It had not. Measured on 2026-09-04: that worktree's `settings.local.json` registered exactly two
+/// events, `PreToolUse` (the worktree write-guard) and `UserPromptSubmit` (a repo cadence script) —
+/// NEITHER of them the emitter — where an ordinary agent worktree registers nine. So the
+/// turn-boundary drain had never run once, its inbox held 114 queued messages, and `delivered` had
+/// been 0 for the queue's entire lifetime. The app-side idle sweep could not cover for it either:
+/// that path is gated on the agent resting (`fleetWatch.SAFE_TO_DELIVER`) and this agent's status
+/// is permanently `working`. Two independent paths, both silently inoperative, and `inbox_send`
+/// replying `queued` throughout.
+///
+/// So the registration is moved to where the agent is REGISTERED rather than where it is
+/// improved. A pane that spawns `claude` in a worktree is the moment we know that worktree needs
+/// the hook, and it is the same moment `AgentPane.prepare` already calls `installAgentHooks` for
+/// an ordinary agent.
+///
+/// SURGICAL ON PURPOSE — this is [`install_event_hooks_for_worktree`], NOT [`install_agent_hooks`].
+/// It writes the event hooks and nothing else: no plugin pre-enable, no permission posture, no
+/// `bypassPermissions` consent record. An app-owned worktree's posture is not this call's to set,
+/// and widening it here would change the security posture of the Improve-Sparkle agent as a side
+/// effect of fixing its mailbox.
+///
+/// Runs on the BLOCKING pool for the reason [`install_agent_hooks`] documents: the body is a
+/// handful of synchronous filesystem operations and it fires on every pane prepare, so as a plain
+/// `#[tauri::command]` every one of them would run on the AppKit main thread.
+///
+/// Returns the absolute event-log path, exactly like [`install_agent_hooks`], so a caller can
+/// watch it. Confinement to the managed worktrees dir is inherited from
+/// [`install_event_hooks_for_worktree`] and is not relaxed here: this file drives executable hooks,
+/// so an unconfined path would be a write-anywhere primitive.
+#[tauri::command]
+pub async fn install_inbox_drain_hooks(app: AppHandle, worktree: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install_event_hooks_for_worktree(&app, Path::new(&worktree))
+    })
+    .await
+    .map_err(|e| format!("install_inbox_drain_hooks task failed: {e}"))?
+}
+
+/// Does this agent id name an APP-OWNED worktree whose drain hooks nothing else is responsible for?
+///
+/// Ordinary agents get their hooks from `AgentPane.prepare`'s `installAgentHooks`, which has always
+/// worked. The app-owned Improve-Sparkle agent is the one with no such owner — which is exactly why
+/// its registration could be absent for the whole life of its inbox with nothing noticing.
+///
+/// EXACT MATCH, not a prefix. A SECONDARY window keys on `__sparkle_self__-<label>` and lives in a
+/// DIFFERENT worktree whose basename never matches the canonical log's, so `mayDrain` refuses it by
+/// design; healing the canonical worktree on its behalf would register a hook for an inbox it does
+/// not own.
+pub fn is_app_owned_self_agent(agent_id: &str) -> bool {
+    agent_id == crate::sparkle_agent::SPARKLE_CANONICAL_AGENT_ID
+}
+
+/// Where the app-owned Improve-Sparkle agent's worktree lives:
+/// `<app_data>/worktrees/sparkle-self/__sparkle_self__`.
+///
+/// Derived rather than remembered — `mention.rs::canonical_worktree` builds the same path from the
+/// same two constants for the responder's cwd, and a third hand-written copy of a path is a third
+/// thing to get wrong.
+pub fn app_owned_self_worktree(app_data: &Path) -> PathBuf {
+    app_data
+        .join("worktrees")
+        .join(crate::sparkle_agent::SPARKLE_PROJECT_ID)
+        .join(crate::sparkle_agent::SPARKLE_CANONICAL_AGENT_ID)
+}
+
+/// SECOND, INDEPENDENT TRIGGER for the drain-hook registration — the redundancy half of bead
+/// sparkle-6yrvqd.
+///
+/// WHY REDUNDANCY IS THE REQUIREMENT AND NOT BELT-AND-BRACES. This mailbox already had two delivery
+/// paths and BOTH were silently inoperative at once: the turn-boundary drain had no `Stop` hook to
+/// ride, and the app-side idle sweep is gated on the agent resting while this agent's status is
+/// permanently `working`. Replacing one dead single path with another single path rebuilds exactly
+/// that. So the registration is now driven from two places that fail for DIFFERENT reasons — the
+/// pane at mount (`SparkleAgentPane.prepare`), and here, at the moment somebody actually sends.
+///
+/// SEND TIME IS THE RIGHT SECOND TRIGGER, and the alternative was measured and rejected. Healing
+/// from the fleet poll would mean reading an inbox for every non-resting agent on every 30s tick —
+/// a cost `pollFleetOnce` deliberately avoids, since it asks `inboxStatus` only for the agents it
+/// has already decided are delivery candidates. A send is rare, already off the main thread, and is
+/// the one moment the registration provably matters: a message is being queued RIGHT NOW against a
+/// hook that may not exist.
+///
+/// IDEMPOTENT, so repeating it costs nothing but the writes: `merge_event_hooks` drops any prior
+/// emitter entry before re-adding, and preserves every hook it does not own (the worktree
+/// write-guard's `PreToolUse` entry among them).
+///
+/// BEST-EFFORT BY CONTRACT — it returns `()` and never an error, because the ONE thing it must not
+/// do is turn a healable mailbox into a failed send. A registration that does not take leaves the
+/// message `pending` and UNCLAIMED, which is the fail-closed state the drain is built around: the
+/// next send, or the next pane mount, retries, and nothing is ever double-delivered.
+pub fn heal_app_owned_drain_hooks(app: &AppHandle, agent_id: &str) {
+    if !is_app_owned_self_agent(agent_id) {
+        return;
+    }
+    let Ok(app_data) = crate::dev_identity::app_data_dir(app) else {
+        return;
+    };
+    let worktree = app_owned_self_worktree(&app_data);
+    // A worktree that is not on disk yet is not a failure to report: the pane creates it at mount,
+    // and registering hooks into a directory nobody has cut would write a settings file for a
+    // worktree that may never exist.
+    if !worktree.is_dir() {
+        return;
+    }
+    if let Err(e) = install_event_hooks_for_worktree(app, &worktree) {
+        tracing::warn!(
+            error = %e,
+            agent_id,
+            "inbox: could not register the drain hook for the app-owned agent; this message stays \
+             pending and unclaimed until a later send or pane mount registers it"
+        );
+    }
+}
+
 /// Resolve the config layer whose `[plugins]` applies to a worktree. `project_root` must be an
 /// ABSOLUTE path to an existing directory to be used: `config::for_project` memoizes by the string
 /// it's handed, so a relative path, an empty string, or a stale/deleted root would both resolve
@@ -2828,6 +2952,62 @@ pub fn read_events_since_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The app-owned agent's drain-hook registration (bead sparkle-6yrvqd) ───────────────────
+    //
+    // The defect: `__sparkle_self__`'s worktree had no `Stop` hook, so its inbox drain had never
+    // run — 114 messages queued, `delivered` 0 for the queue's whole lifetime. These pin the two
+    // pure decisions the healing path makes. The install itself needs an `AppHandle` and is
+    // covered from the pane side in `SparkleAgentPane.inboxDrain.test.tsx`.
+
+    #[test]
+    fn recognises_the_app_owned_self_agent() {
+        assert!(is_app_owned_self_agent("__sparkle_self__"));
+    }
+
+    /// EXACT MATCH, NOT A PREFIX — and this is the arm that matters. A secondary window keys on
+    /// `__sparkle_self__-<label>` and lives in its OWN worktree; `mayDrain` compares the exported
+    /// id against the hook log's basename, so healing the canonical worktree on a secondary
+    /// window's behalf would register a hook for an inbox that window does not own, and its real
+    /// messages would keep queuing while everything reported success.
+    #[test]
+    fn does_not_treat_a_secondary_window_or_a_build_agent_as_the_app_owned_agent() {
+        assert!(!is_app_owned_self_agent("__sparkle_self__-window2"));
+        assert!(!is_app_owned_self_agent("__sparkle_self__-"));
+        assert!(!is_app_owned_self_agent("095218fd-cc6f-4e1f-bf4c-06773e4dd97e"));
+        assert!(!is_app_owned_self_agent(""));
+        assert!(!is_app_owned_self_agent("sparkle:concierge"));
+    }
+
+    /// The worktree path must be the one the drain actually reads. `sparkle-hook.mjs::inboxPaths`
+    /// derives the inbox id from the event log's BASENAME and `hooks::event_log_path` derives that
+    /// basename from the worktree's — so the last path segment being `__sparkle_self__` is not
+    /// cosmetic, it IS the inbox id, and a wrong one leaves `mayDrain` refusing forever while every
+    /// call still reports success.
+    #[test]
+    fn resolves_the_canonical_worktree_whose_basename_is_the_inbox_id() {
+        let p = app_owned_self_worktree(Path::new("/app-data"));
+        assert_eq!(p, Path::new("/app-data/worktrees/sparkle-self/__sparkle_self__"));
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some("__sparkle_self__"),
+            "the worktree basename IS the inbox id the drain matches on"
+        );
+    }
+
+    /// A path with a SPACE in it, because every worktree on the machines this ships to lives under
+    /// `~/Library/Application Support/…`. A resolver that only ever saw `/tmp/x` would pass while
+    /// being wrong for the only directory that matters here.
+    #[test]
+    fn resolves_correctly_under_a_path_containing_a_space() {
+        let p = app_owned_self_worktree(Path::new("/Users/x/Library/Application Support/ai.sparkle.desktop"));
+        assert_eq!(
+            p,
+            Path::new(
+                "/Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/sparkle-self/__sparkle_self__"
+            )
+        );
+    }
 
     // ── Plugin hook command quoting repair (bead sparkle-iuzz5y) ──────────────────────────────
     //

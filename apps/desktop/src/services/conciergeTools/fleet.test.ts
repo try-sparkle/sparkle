@@ -7,7 +7,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
-import type { InboxEntry, InboxView } from "./fleet";
+import type { InboxEntry, InboxStatusRow, InboxView } from "./fleet";
 import {
   DRAIN_NOTES,
   FLEET_OPS,
@@ -408,6 +408,128 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
         actCeiling: 50,
       })?.pending,
     ).toBe(38);
+  });
+
+  /**
+   * A QUEUE THAT IS NOT BEING DRAINED SAYS SO (bead sparkle-6yrvqd).
+   *
+   * The measured incident: `__sparkle_self__`'s inbox held 114 messages, the oldest queued 11.6
+   * hours, because its worktree had no `Stop` hook and the drain rides that hook. Every
+   * `inbox_send` replied `state: "queued"` with a depth note that read as routine bookkeeping, and
+   * two agents each spent a session believing they were coordinating with the other.
+   *
+   * THE VERDICT IS AN AGE, NOT THE COUNTERS, and the `post-compaction` test below is why. Every
+   * case here therefore pins a CLOCK explicitly: an age judged against `Date.now()` cannot be
+   * asserted in either direction.
+   */
+  const NOW = 1_700_000_000_000;
+  const HOUR = 60 * 60 * 1000;
+  /** A row in the measured shape: nothing has been handed over and the oldest has waited `hrs`. */
+  const rowPending = (pending: number, hrs: number, extra: Partial<InboxStatusRow> = {}) => ({
+    agentId: "__sparkle_self__",
+    pending,
+    delivered: 0,
+    acknowledged: 0,
+    awaitingAck: 0,
+    pendingIds: [],
+    oldestPendingMs: NOW - hrs * HOUR,
+    fyiCeiling: 40,
+    actCeiling: 50,
+    ...extra,
+  });
+
+  it("says so when the oldest queued message has waited far past any turn boundary", () => {
+    const q = recipientQueueFromRow(rowPending(28, 11.6), NOW);
+    expect(q?.notDraining).toBe(true);
+    expect(q?.note, "a sender must be told its message is unlikely to arrive").toMatch(
+      /NOT DRAINING/,
+    );
+    // The lead clause must come FIRST: a reader takes the opening of a receipt as its verdict, and
+    // the depth sentence reads as routine whatever number it carries.
+    expect(q?.note.indexOf("NOT DRAINING")).toBeLessThan(
+      q?.note.indexOf("queued and undelivered") ?? -1,
+    );
+    // ...and it names the remedy, because "your message may not arrive" with no next step is the
+    // same dead end in a louder voice.
+    expect(q?.note).toMatch(/Stop` hook|settings\.local\.json/);
+  });
+
+  /**
+   * THE CASE THAT KILLED THE FIRST DRAFT OF THIS FEATURE, kept as a fixture so it cannot come back.
+   *
+   * The obvious test is `delivered === 0 && acknowledged === 0`. It is wrong: `inbox::status_of`
+   * derives both counters from the records still in `<agent>.jsonl`, and `retention::reap_inbox`
+   * compacts that file at `2 x MAX_AGE_MS` (24h). So a long-lived, perfectly healthy agent that
+   * delivered and acked yesterday reads ZERO on both today — and three messages queued during one
+   * long turn (ordinary: a drain only runs at a `Stop` boundary) would have produced an unhedged
+   * "THIS RECIPIENT IS NOT DRAINING" against a working agent, with a remedy pointing at a
+   * `settings.local.json` that is correctly configured.
+   *
+   * This row IS that shape. It must stay quiet.
+   */
+  it("stays quiet on a healthy agent whose counters were reset by retention compaction", () => {
+    const q = recipientQueueFromRow(rowPending(3, 0.2), NOW);
+    expect(
+      q?.notDraining,
+      "post-compaction zero counters are not evidence of a dead drain",
+    ).toBe(false);
+    expect(q?.note, "a working recipient must not be accused").not.toMatch(/NOT DRAINING/);
+  });
+
+  it("stays QUIET on a healthy queue that has delivered recently", () => {
+    const q = recipientQueueFromRow(
+      rowPending(2, 0.1, { delivered: 7, acknowledged: 5, awaitingAck: 2, agentId: "a1" }),
+      NOW,
+    );
+    expect(q?.notDraining).toBe(false);
+    expect(q?.note, "a working recipient must not be reported as broken").not.toMatch(
+      /NOT DRAINING/,
+    );
+  });
+
+  /** Nothing queued means no message at risk, so there is nobody to warn — whatever the counters say. */
+  it("stays quiet when there is nothing queued at all", () => {
+    const q = recipientQueueFromRow(
+      { ...rowPending(0, 0), oldestPendingMs: null, agentId: "a1" },
+      NOW,
+    );
+    expect(q?.notDraining).toBe(false);
+    expect(q?.note).not.toMatch(/NOT DRAINING/);
+  });
+
+  /**
+   * A ROW THAT CANNOT SAY is not a row that says "broken". An older backend, or any row minted
+   * before `oldestPendingMs` existed, carries no age — and inferring a dead drain from a missing
+   * field is how a reporting gap becomes a false accusation.
+   */
+  it("refuses to accuse when the row carries no age to judge", () => {
+    const { oldestPendingMs: _drop, ...noAge } = rowPending(28, 11.6);
+    const q = recipientQueueFromRow(noAge, NOW);
+    expect(q?.notDraining).toBe(false);
+    expect(q?.oldestPendingMs).toBeNull();
+    expect(q?.note).not.toMatch(/NOT DRAINING/);
+  });
+
+  /**
+   * THE THRESHOLD IS PINNED FROM BOTH SIDES. Without the just-under case the bound could be moved
+   * to zero and every test above would still pass, which is the widening direction that turns this
+   * into the alarm nobody reads.
+   */
+  it("does not fire just under the threshold, and does fire just over it", () => {
+    expect(recipientQueueFromRow(rowPending(5, 1.9), NOW)?.notDraining).toBe(false);
+    expect(recipientQueueFromRow(rowPending(5, 2.1), NOW)?.notDraining).toBe(true);
+  });
+
+  /**
+   * THE DEFAULT CLOCK IS COVERED, because a seam every caller supplies is a seam nothing drives:
+   * delete the `= Date.now()` default and every test above still passes while production loses its
+   * clock (AGENTS.md, the defaulted seam).
+   */
+  it("uses the real clock when none is passed", () => {
+    const longAgo = { ...rowPending(9, 0), oldestPendingMs: Date.now() - 9 * HOUR };
+    expect(recipientQueueFromRow(longAgo)?.notDraining).toBe(true);
+    const justNow = { ...rowPending(9, 0), oldestPendingMs: Date.now() };
+    expect(recipientQueueFromRow(justNow)?.notDraining).toBe(false);
   });
 
   it("does NOT report itself as delivered", async () => {

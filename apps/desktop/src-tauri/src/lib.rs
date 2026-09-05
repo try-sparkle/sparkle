@@ -1553,6 +1553,9 @@ pub fn run() {
             worktree::install_worktree_guard,
             deps_bootstrap::bootstrap_worktree_deps,
             hooks::install_agent_hooks,
+            // The surgical event-hook install for APP-OWNED worktrees (bead sparkle-6yrvqd). Distinct
+            // from `install_agent_hooks`: event hooks only, no plugin or permission-posture write.
+            hooks::install_inbox_drain_hooks,
             hooks::heal_agent_hooks,
             // The durable mirror of an agent's goal, for the SessionStart hook that reads it back to
             // an agent waking with no session context (docs/agent-goal-record.md).

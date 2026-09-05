@@ -182,6 +182,19 @@ export interface InboxStatusRow {
   awaitingAck: number;
   pendingIds: string[];
   /**
+   * `ts` of the OLDEST still-pending record — the one signal here that retention cannot reset
+   * (bead sparkle-6yrvqd). See {@link RecipientQueue.notDraining} for why the counters above cannot
+   * answer "is this recipient draining?": `reap_inbox` compacts the record file at 24h, so a
+   * healthy agent reads `delivered: 0, acknowledged: 0` a day after its last delivery.
+   *
+   * `number | null`, NOT `number?`. It is `Option<i64>` in Rust, which serde emits as an explicit
+   * `null` rather than omitting the key, and a TS `field?: T` excludes `null` — the exact seam
+   * `AGENTS.md` documents, where the parser describes a shape the wire cannot produce. The `?` is
+   * here too only so rows hand-built by existing fixtures keep compiling; read it with a finiteness
+   * test and treat anything else as "cannot say".
+   */
+  oldestPendingMs?: number | null;
+  /**
    * The ceilings `pending` is judged against — `inbox::FYI_CEILING` and `inbox::MAX_PER_AGENT`.
    *
    * CARRIED FROM RUST RATHER THAN RE-DECLARED HERE. Two literals in two packages are two numbers
@@ -221,12 +234,60 @@ export interface RecipientQueue {
   actCeiling: number;
   fyiHeadroom: number;
   actHeadroom: number;
+  /**
+   * THIS RECIPIENT IS NOT DRAINING — its oldest still-queued message has been waiting longer than
+   * {@link NOT_DRAINING_AFTER_MS} (bead sparkle-6yrvqd).
+   *
+   * WHY AN AGE AND NOT THE COUNTERS, which is the whole correctness of this field. The obvious test
+   * is `delivered === 0 && acknowledged === 0`, and it is WRONG: `inbox::status_of` computes both
+   * counters by iterating the records still present in `<agent>.jsonl`, and `retention::reap_inbox`
+   * compacts that file at `2 × MAX_AGE_MS` (24h). A long-lived, perfectly healthy agent that
+   * delivered and acked yesterday therefore reads `0` on both today — so a counter-based test
+   * accuses a WORKING recipient, with a remedy pointing at a `settings.local.json` that is
+   * correctly configured. That is the same "an alarm on every send is an alarm nobody reads"
+   * failure this warning exists to prevent, rebuilt one level up. (Caught in review before it
+   * shipped; the first draft of this field made exactly that mistake and asserted the opposite in
+   * its own doc comment.)
+   *
+   * The age cannot lie that way. The record it names is BY DEFINITION still in the file, because it
+   * is one of the records being counted — retention removing it would remove the `pending` it is
+   * derived from too. And it is what the copy actually claims: a drain runs at every turn boundary,
+   * so a message pending far longer than any turn has had no boundary to ride.
+   */
+  notDraining: boolean;
+  /** `ts` of the oldest still-queued message, or `null` when nothing is queued or the row is old. */
+  oldestPendingMs: number | null;
   /** One sentence a language model can repeat to a human verbatim. */
   note: string;
 }
 
-/** Build a {@link RecipientQueue} from a status row, or `null` when the row cannot tell us. */
-export function recipientQueueFromRow(row: InboxStatusRow | undefined | null): RecipientQueue | null {
+/**
+ * How long the oldest queued message must have waited before the receipt says the recipient is not
+ * draining.
+ *
+ * TWO HOURS, chosen to sit above the longest plausible SINGLE TURN and far below the measured
+ * failure. A drain rides the `Stop` hook, so the honest question is "has this agent reached a turn
+ * boundary since the message arrived" — and turns here genuinely run long (the desktop unit stage
+ * alone is ~22 minutes, and an agent can chain several such steps inside one turn). Crying wolf at
+ * thirty minutes would fire on ordinary long work and train everyone to ignore the warning, which
+ * is precisely how the real outage went unread for eleven and a half hours. The measured incident
+ * had messages pending 11.6h, so this is not a close call in the direction that matters.
+ */
+const NOT_DRAINING_AFTER_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Build a {@link RecipientQueue} from a status row, or `null` when the row cannot tell us.
+ *
+ * `nowMs` DEFAULTS to the real clock rather than being a required parameter, and the default is
+ * covered by its own test. A seam every caller supplies is a seam nothing drives: delete the
+ * default and the suite stays green while production loses its clock (`AGENTS.md`, the defaulted
+ * seam). It is injectable at all because the not-draining verdict is an AGE, and an age judged
+ * against an untestable clock cannot be pinned in either direction.
+ */
+export function recipientQueueFromRow(
+  row: InboxStatusRow | undefined | null,
+  nowMs: number = Date.now(),
+): RecipientQueue | null {
   if (!row) return null;
   const { pending, fyiCeiling, actCeiling } = row;
   // A row that carries no ceilings is a row from an older shape or a hand-built fixture. Reporting a
@@ -241,7 +302,30 @@ export function recipientQueueFromRow(row: InboxStatusRow | undefined | null): R
   }
   const fyiHeadroom = Math.max(0, fyiCeiling - pending);
   const actHeadroom = Math.max(0, actCeiling - pending);
-  const note =
+  // HOW LONG HAS THE OLDEST QUEUED MESSAGE WAITED? `Number.isFinite` rather than a truthiness test:
+  // the field is `Option<i64>` in Rust and therefore arrives as `null` when nothing is queued, and
+  // as `undefined` from a row minted before it existed. Neither is an age, and neither is evidence
+  // — so an unreadable value means "cannot say", the same answer this function gives for a missing
+  // ceiling, and never "not draining".
+  const oldestPendingMs = Number.isFinite(row.oldestPendingMs)
+    ? (row.oldestPendingMs as number)
+    : null;
+  const waitedMs = oldestPendingMs === null ? null : nowMs - oldestPendingMs;
+  const notDraining = waitedMs !== null && waitedMs >= NOT_DRAINING_AFTER_MS && pending > 0;
+  // THE LEAD CLAUSE, and it goes FIRST on purpose. A reader — human or model — takes the opening of
+  // a receipt as its verdict, and the depth-and-headroom sentence below reads as routine bookkeeping
+  // no matter what number it carries. The one thing a sender most needs to know is that its message
+  // may reach nobody, so that has to displace the bookkeeping rather than trail it.
+  const hoursWaited = waitedMs === null ? 0 : Math.floor(waitedMs / (60 * 60 * 1000));
+  const notDrainingNote = !notDraining
+    ? ""
+    : `THIS RECIPIENT IS NOT DRAINING ITS INBOX: its oldest queued message has been waiting ` +
+      `${hoursWaited}h and ${pending} are queued. A drain runs at every turn boundary, so a ` +
+      "message waiting this long has had none — treat this send as UNLIKELY TO ARRIVE and use " +
+      "another channel if it matters. The usual cause is that the recipient's worktree has no " +
+      "`Stop` hook registered (bead sparkle-6yrvqd); check its `.claude/settings.local.json` for a " +
+      "`sparkle-hook.mjs` entry. ";
+  const depthNote =
     fyiHeadroom > 0
       ? `${pending} of this agent's messages are queued and undelivered; ${fyiHeadroom} more ` +
         `\`fyi\` send(s) fit before the oldest one starts being evicted to make room, and ` +
@@ -252,7 +336,16 @@ export function recipientQueueFromRow(row: InboxStatusRow | undefined | null): R
         `evict and which is refused outright. ${actHeadroom} \`act\` send(s) remain before an ` +
         "`act` is refused. Either way it is not reading what it already has — consider whether " +
         "another message helps.";
-  return { pending, fyiCeiling, actCeiling, fyiHeadroom, actHeadroom, note };
+  return {
+    pending,
+    fyiCeiling,
+    actCeiling,
+    fyiHeadroom,
+    actHeadroom,
+    notDraining,
+    oldestPendingMs,
+    note: `${notDrainingNote}${depthNote}`,
+  };
 }
 
 /**
