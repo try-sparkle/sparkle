@@ -237,7 +237,7 @@ export function buildConcurrencySample(): ConcurrencySampleIn {
  *
  * Cached rather than awaited because `handleGetState` in services/controlListener is SYNCHRONOUS,
  * and the concierge's read of this goes through it. Same poll-and-cache shape as
- * `memoryAdmission.currentMemoryAdmission`, and for the same reason.
+ * `memoryAdmission.currentMemoryAdmissionReading`, and for the same reason.
  */
 let cached: PeakRecord | null = null;
 

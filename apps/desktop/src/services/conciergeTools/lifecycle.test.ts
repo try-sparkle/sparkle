@@ -498,10 +498,17 @@ describe("spawnBuildAgent", () => {
   });
 
   // BUG 1 of the ceiling audit. The old clause told the human the over-cap agents were ones "you
-  // haven't opened yet, and each one starts as soon as you do". They are ALREADY RUNNING —
-  // closed-tab projects were observed with a running-agent count equal to their full roster — so
-  // the sentence sent a human hunting for processes that would start later when they were already
-  // up. `live` measures "has a mounted pane in THIS window", and the copy may not claim more.
+  // haven't opened yet, and each one starts as soon as you do". Closed-tab projects were observed
+  // with a running-agent count equal to their full roster, so the sentence sent a human hunting for
+  // processes that were already up. `live` measures "has a mounted pane in THIS window", and the
+  // copy may not claim more.
+  //
+  // ── AND THE CORRECTION OVERSHOT, so this test now pins BOTH directions (bead `sparkle-ftapmp`) ──
+  // The fix for BUG 1 became "most are already running, they're just not on screen", and that was
+  // measured FALSE on 2026-09-04: 60 rows on this machine against TWENTY real `claude` processes.
+  // Both claims are true of different rows and `live` can separate neither, so the copy must assert
+  // NOTHING about process state in either direction — which is what these assertions now say. A test
+  // that demanded one of the two claims is a test that pins whichever mistake was made last.
   it("does not tell the human that off-screen agents have not started yet", async () => {
     const pid = seedProject();
     seedBuild(pid);
@@ -513,11 +520,17 @@ describe("spawnBuildAgent", () => {
     expect(r.reason).toBe("at-capacity");
     expect(r.message).not.toMatch(/already running 2/i);
     expect(r.message).toMatch(/2 of its 2/); // the numbers it actually hit
-    // The retracted claims, both directions: they have not "not started", and opening a tab is not
-    // what starts them.
+    // THE RETRACTED CLAIMS, ALL THREE. Neither "they have not started" (BUG 1) nor "they are
+    // already running" (`sparkle-ftapmp`) is something this window can know, and opening a tab is
+    // not what starts them.
     expect(r.message).not.toMatch(/haven't opened yet/i);
     expect(r.message).not.toMatch(/starts as soon as you do/i);
-    expect(r.message).toMatch(/already running/i);
+    expect(r.message).not.toMatch(/already running/i);
+    // THE POSITIVE, so the pair above cannot be satisfied by copy that simply says nothing —
+    // deleting a claim is not the same fact as stating what IS known. It reports what `live`
+    // measures and says the count is of slots.
+    expect(r.message).toMatch(/showing in this window/i);
+    expect(r.message).toMatch(/slots, not of processes/i);
   });
 
   // BUG 2. Rust's `Bound` exists precisely to stop the app mis-attributing the ceiling — its own

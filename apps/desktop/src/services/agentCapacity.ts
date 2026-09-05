@@ -12,7 +12,13 @@
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore, enforcedWorkerCap, concurrencyBasis } from "../stores/settingsStore";
-import { currentMemoryAdmission, refreshMemoryAdmission } from "./memoryAdmission";
+import {
+  ceilingInPopulationOf,
+  countWhenReadingArrived,
+  currentMemoryAdmissionReading,
+  refreshMemoryAdmission,
+} from "./memoryAdmission";
+import { mountedPaneCount } from "./paneResidencyAdmission";
 import { wasProjectVisited } from "./sessionProjects";
 
 export interface CapacityReading {
@@ -177,13 +183,85 @@ export function localAgentCapacity(): CapacityReading {
   // reading byte-for-byte as it was before this block existed. An unmeasured machine is not a
   // squeezed one, and the failure mode of getting that backwards is refusing every spawn on the
   // strength of an unrelated backend error.
-  const admission = currentMemoryAdmission();
+  const reading = currentMemoryAdmissionReading();
+  const admission = reading?.admission ?? null;
   // Set inside the load branch below: true when the MEMORY term is the one that produced `limit`,
   // even though Rust attributed the reading to the run queue. Drives which sentence the refusal
   // quotes; see the note at the assignment.
   let loadPathMemoryBinds = false;
-  if (admission && admission.sampled) {
-    const narrowed = Math.max(1, Math.min(staticLimit, Math.floor(admission.effective)));
+  if (reading && admission && admission.sampled) {
+    // ── EVERY CEILING ON THIS PAYLOAD IS DENOMINATED IN RESIDENTS. TRANSLATE ONCE, HERE (bead
+    // `sparkle-ftapmp`) ──────────────────────────────────────────────────────────────────────────
+    //
+    // Rust's `sampled_admission` returns `in_use + available/per_agent`, and `pollMemoryAdmission`
+    // sends `live` as that `in_use`. So `effective` and `memory_admitted` both count RESIDENT
+    // agents — while the one comparison every consumer reads is `used >= limit`, which counts ROWS.
+    // The load branch below was already fixed for exactly this class (`sparkle-e57k99.1`); the
+    // memory term was not, and it is the same defect:
+    //
+    //   MEASURED 2026-09-04 — 60 rows, 21 residents, 26 GiB free, `memory_admitted` 39. `limit`
+    //   became `min(static, 39)` and `used(60) >= 39` refused. Retiring one agent moved `used`
+    //   60→59 AND `limit` 39→38, because the retire lowered `live` too — the gap stayed exactly
+    //   21 and no action available to anyone could close it. Every dormant row cost a slot twice:
+    //   it inflated the left side and contributed nothing to the right.
+    //
+    // So carry the HEADROOM across instead of the number, exactly as the load branch does: whatever
+    // room the reading grants on top of the residents it measured, grant on top of the rows.
+    //
+    // THE HEADROOM IS SIGNED, and that is load-bearing rather than sloppy. A ceiling BELOW the
+    // resident count is a real over-commit — `by_level` collapses `admitted` to `in_use` under
+    // critical pressure, and `static_max` can clamp it under `in_use` outright — and clamping the
+    // subtraction at zero would silently forgive it, turning "you are already past what memory
+    // holds" into "no opinion". `Math.max(1, Math.min(staticLimit, …))` at each use site is what
+    // keeps the two standing invariants: never below 1, and NEVER ABOVE `staticLimit`.
+    //
+    // `reading.inUse` — NOT `live` — is what the headroom is measured from. They are equal in
+    // production (`pollMemoryAdmission` sends this module's own `live`), but only across a poll
+    // boundary the fleet can move over, and `AGENTS.md` records the cost of subtracting a count of
+    // your own from a number built on someone else's: it is how a rate's ceiling came to equal the
+    // count it was compared against. `memoryAdmission` remembers what it SENT so this line does not
+    // have to guess.
+    // ONE shared translation, in `memoryAdmission` beside the denomination it is about, because
+    // `orchestrationListener.globalGateBinds` needs the identical displacement against a WORKER-only
+    // count and the first cut of this fix left that gate comparing raw (roborev 81139, High).
+    //
+    // ANCHORED, NOT LIVE (roborev 81142, High). Displacing by `used` AT GATE TIME puts it on both
+    // sides of `used >= limit`, where it cancels: the comparison reduces to `headroom <= 0 || used >=
+    // staticLimit`, so a reading saying "room for exactly one more" admits row after row up to the
+    // static ceiling, spending the same allowance every call. The headroom is a per-SAMPLE grant, so
+    // the count it is added to has to be the one that was true at that sample.
+    //
+    // THE ALLOWANCE THIS BRANCH ACTUALLY ENFORCES, so `countWhenReadingArrived` can tell a fleet
+    // that grew INTO its ceiling (hold the anchor — that is the cancellation it exists to stop)
+    // from one already PAST it (retake — the anchor is about a different fleet).
+    //
+    // NARROWEST, NOT WIDEST, and getting that backwards left the whole fix inert on the load branch
+    // (roborev 81181, High). The enforced ceiling there is `min(anchor + memoryHeadroom,
+    // anchor + load_headroom)` and `load_headroom` is 0 or 1 BY CONSTRUCTION, while
+    // `memory_admitted` is `static_max` whenever RAM is not the constraint — which is precisely when
+    // Rust attributes a reading to the queue. Asking the retake question with the max held the
+    // anchor until the count passed `anchor + 81` while the gate refused at `anchor + 1`: on this
+    // machine's own normal 2.6-5.9x per-core band, a render in the hydration gap anchored 0 and the
+    // 60 rows that followed read as `limit = 1`, at capacity, quoting the throttle sentence.
+    //
+    // A term that is not anchor-relative contributes NO constraint, hence the infinity: a payload
+    // predating `memory_admitted` puts the bare `staticLimit` into the `min` below, which the anchor
+    // cannot move, so it must not narrow the retake question either.
+    const memoryRoom =
+      admission.memory_admitted === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.floor(admission.memory_admitted) - reading.inUse;
+    const anchorRoom =
+      admission.bound === "load"
+        ? Math.min(memoryRoom, Math.max(0, Math.floor(admission.load_headroom ?? 0)))
+        : Math.floor(admission.effective) - reading.inUse;
+    const rowsAtReading = countWhenReadingArrived("rows", reading.seq, used, anchorRoom);
+    const residentsToRows = (residents: number): number =>
+      ceilingInPopulationOf(residents, rowsAtReading, reading.inUse);
+    const narrowed = Math.max(
+      1,
+      Math.min(staticLimit, residentsToRows(Math.floor(admission.effective))),
+    );
     if (admission.bound === "load") {
       // ── THE LOAD CEILING IS IN A DIFFERENT POPULATION THAN THE COMPARISON (bead
       // `sparkle-e57k99.1`) ─────────────────────────────────────────────────────────────────────
@@ -211,6 +289,9 @@ export function localAgentCapacity(): CapacityReading {
       // equal in production, since `pollMemoryAdmission` sends exactly this `live` as `in_use` — but
       // only by a coupling across a process boundary that nothing checks, and the whole defect here
       // was a number meaning one population being spent against another.
+      // ANCHORED for the same reason the memory term is (roborev 81142, High): `used + headroom`
+      // with a LIVE `used` cancels against `used >= limit`, so a trickle of 1 admitted rows without
+      // bound within a poll window rather than the one per sample its own comment promises.
       const headroom = Math.max(0, Math.floor(admission.load_headroom ?? 0));
       // CLAMPED BY MEMORY TOO, because `bound` is not a partition (roborev, High). `bound === "load"`
       // does NOT mean memory declined to narrow — `load_binds` is true whenever the queue has an
@@ -218,17 +299,33 @@ export function localAgentCapacity(): CapacityReading {
       // real RAM-derived ceiling in hand. Spending run-queue headroom without it re-opens exactly the
       // jetsam path the memory sampler exists to close: measured on the failure this fix was reviewed
       // against, RAM said room for 6 and this branch would have admitted 31.
-      const byMemory = Math.max(1, Math.floor(admission.memory_admitted ?? staticLimit));
-      const byLoad = used + headroom;
+      //
+      // …AND IT IS TRANSLATED TO ROWS FIRST (bead `sparkle-ftapmp`). `memory_admitted` is residents,
+      // `byLoad` is rows, and this line used to `min` them directly — the very mismatch the comment
+      // three lines below already NAMED, and then answered by fixing which SENTENCE gets quoted
+      // rather than the arithmetic. Both terms are rows now, so the `min` compares like with like
+      // and the memory clamp still binds whenever RAM is genuinely the tighter of the two.
+      //
+      // A payload PREDATING `memory_admitted` contributes `staticLimit` DIRECTLY, not
+      // `residentsToRows(staticLimit)`. The field's own contract is "absent means memory had no
+      // opinion", and a no-opinion term must be inert; pushing the static ceiling through the
+      // translation would make it depend on `used - inUse`, so a reading taken while the fleet was
+      // larger than it is now would narrow on the strength of a field that was never sent.
+      const byMemory =
+        admission.memory_admitted === undefined
+          ? staticLimit
+          : residentsToRows(Math.floor(admission.memory_admitted));
+      const byLoad = rowsAtReading + headroom;
       limit = Math.max(1, Math.min(staticLimit, byMemory, byLoad));
       // WHICH TERM BOUND IS NOW A REAL QUESTION, and getting it wrong writes a dead instruction
       // (roborev, High). Rust attributes this reading to the queue — `load_binds` is true only when
-      // the queue's ceiling is BELOW memory's — but the two arrive here in different denominations:
-      // `memory_admitted` is residents, `byLoad` is rows. With dormant rows present the memory term
-      // can be the smaller one HERE while `bound` still says `"load"`. Quoting the queue then tells
-      // a human to wait for it to drain, which will never help, while available RAM is the actual
-      // constraint. That is the same misattribution that once sent someone chasing memory 94% free,
-      // pointed the other way.
+      // the queue's ceiling is BELOW memory's, measured in RESIDENTS. Both terms are rows by the
+      // time they reach this line, and the two orderings still come apart: the translation displaces
+      // the memory term by `used - inUse` while the queue's is `used + headroom`, so with a stale or
+      // simply different resident count the memory term can be the smaller one HERE while `bound`
+      // still says `"load"`. Quoting the queue then tells a human to wait for it to drain, which
+      // will never help, while available RAM is the actual constraint. That is the same
+      // misattribution that once sent someone chasing memory 94% free, pointed the other way.
       loadPathMemoryBinds = byMemory < byLoad && byMemory < staticLimit;
     } else if (narrowed < staticLimit) {
       limit = narrowed;
@@ -278,10 +375,31 @@ export function atCapacitySentence(capacity: CapacityReading, lead: string): str
   // `live < used` is normal, not a bug: a row in a project tab the user hasn't opened holds a slot
   // without holding a process. Saying so is the difference between an actionable refusal and one
   // that reads as a miscount.
+  //
+  // ── IT MAY NOT CLAIM A PROCESS STATE IN EITHER DIRECTION, AND BOTH DIRECTIONS HAVE BEEN WRONG
+  // HERE ────────────────────────────────────────────────────────────────────────────────────────
+  //
+  // The clause has now been corrected twice, in opposite directions, and the resolution is that it
+  // must make no claim at all.
+  //
+  //   • BUG 1 OF THE CEILING AUDIT retracted "you haven't opened yet, and each one starts as soon as
+  //     you do": closed-tab projects were observed with a running-agent count equal to their full
+  //     roster, so the sentence sent a human hunting for processes that were already up.
+  //   • THEN THAT CORRECTION OVERSHOT into "most are already running, they're just not on screen",
+  //     and bead `sparkle-ftapmp` measured it false: on 2026-09-04 this machine held 60 rows while
+  //     `ps -Ao rss,comm` found TWENTY real `claude` processes between them, 5.8 GiB in total. That
+  //     sentence is why counting those rows against a memory ceiling read as defensible to every
+  //     reviewer who looked at it.
+  //
+  // Both observations are true of different rows, and `live` cannot separate them: it measures
+  // "has a mounted pane IN THIS WINDOW", which is neither "is running" nor "is not". So the clause
+  // reports exactly that and stops — the count is of SLOTS, and the copy says so rather than
+  // implying a process count in either direction.
   const dormant =
     capacity.live < capacity.used
       ? ` (${capacity.live} of them showing in this window; the rest are in project tabs that ` +
-        `aren't open here — most are already running, they're just not on screen)`
+        `aren't open here — this window can't tell which of those still hold a running process, ` +
+        `so the count is of slots, not of processes)`
       : "";
   // "N of its M slots taken" IS ONLY TRUE WHILE N <= M, and a runtime narrowing routinely breaks
   // that. `limit` is `min(staticLimit, effective)`, and `effective` lands BELOW the row count in
@@ -328,12 +446,100 @@ export function atCapacitySentence(capacity: CapacityReading, lead: string): str
  * crediting them with a per-agent share inflates the ceiling by `(used - live) × per_agent`, in the
  * permissive direction, which stopped the available-memory bound from narrowing at all.
  *
- * Note the asymmetry with the gate below, which is deliberate: we ask the question in RESIDENT
- * agents (what memory has actually been consumed) and enforce the answer against ROWS (`used >=
- * limit`), because a dormant row becomes resident the moment its tab is clicked, with no gate in
- * between. Sending `live` and comparing `used` is what makes the ceiling mean "agents this machine
- * can hold" while still refusing rows it cannot hold one click later.
+ * ── THE ASYMMETRY THIS NOTE USED TO DEFEND IS GONE (bead `sparkle-ftapmp`) ────────────────────────
+ * It read: "we ask the question in RESIDENT agents and enforce the answer against ROWS, because a
+ * dormant row becomes resident the moment its tab is clicked, with no gate in between." The premise
+ * was true and the conclusion did not follow. Spending a residents-denominated ceiling against rows
+ * is not a conservative rounding — it is a ONE-WAY RATCHET, because retiring an agent lowers `used`
+ * and `live` together and therefore lowers both sides of the comparison by one. Measured 2026-09-04:
+ * two refusals 90 seconds apart with one retire between them moved `used` 60→59 and `limit` 39→38;
+ * the gap stayed exactly 21, and no action available to the concierge or to a human could ever close
+ * it. `localAgentCapacity` now translates the ceiling into rows before comparing.
+ *
+ * SO THE "NO GATE IN BETWEEN" HALF HAD TO BE SUPPLIED, and it was: `services/paneResidencyAdmission`
+ * + `hooks/usePaneResidencyAdmission` hold back a dormant row's pane when the machine is genuinely at
+ * its residents ceiling, visibly (a banner) and recoverably (the next poll releases it). That is the
+ * gate whose absence justified the mismatch. Removing one without the other would over-commit the
+ * machine, which is the jetsam path all of this exists to close.
  */
 export function pollMemoryAdmission(): Promise<void> {
-  return refreshMemoryAdmission(localAgentCapacity().live);
+  // ── WHAT `live` IS A PROXY FOR, AND WHERE THE PROXY BROKE (roborev 81145, High) ───────────────
+  //
+  // `live` is `openAgentIds ∩ visited projects` — a good stand-in for "holds a process" right up
+  // until something started DEFERRING those mounts, at which point it counts rows that hold nothing.
+  // Feeding it back as `in_use` made the residency ceiling a function of the very count it is spent
+  // against: Rust returns `in_use + available/per_agent` and a reading at or above the static
+  // ceiling is discarded, so every surviving ceiling was `>= live` and the mount gate could never
+  // bind. Verified exhaustively — zero deferrable states over the whole reachable space.
+  //
+  // The gate publishes what it has actually mounted, so send that. `null` means it has never run in
+  // this window, and the fallback is the old number exactly: an unmeasured window is not an empty
+  // one, and sending 0 would report a machine with no residents and narrow the ceiling on a fiction.
+  return refreshMemoryAdmission(mountedPaneCount() ?? localAgentCapacity().live);
+}
+
+/**
+ * THE CEILING IN RESIDENTS — how many agents may hold a process on this machine right now, or `null`
+ * when there is no basis to hold anything back.
+ *
+ * The mount gate's counterpart to `localAgentCapacity().limit`, and the two are deliberately in
+ * DIFFERENT denominations because they answer different questions. `limit` is rows, and gates
+ * SPAWNING (may this machine acquire another row?). This is residents, and gates RESIDENCY (may
+ * another row acquire a process?). Both are the same reading translated for the population being
+ * counted; that they must agree in denomination with their own comparison is the whole of bead
+ * `sparkle-ftapmp`.
+ *
+ * `null` — no reading, a stale one, `sampled: false`, or a reading in which MEMORY DID NOT NARROW —
+ * means "no basis", and every caller must then behave byte-for-byte as it did before this existed.
+ * The last of those four is the important one: a healthy machine's `memory_admitted` equals
+ * `static_max`, and treating the static prediction as a residency ceiling would start deferring
+ * panes on machines that have never been measured to be short of anything. A gate that fires when
+ * nothing is wrong gets switched off, and then the class is unguarded.
+ */
+export function residentAdmissionCeiling(): number | null {
+  return residentAdmission()?.ceiling ?? null;
+}
+
+/**
+ * The SENTENCE that goes with {@link residentAdmissionCeiling}, or `null` when there is no ceiling.
+ *
+ * IT MUST NOT BE TAKEN FROM `CapacityReading.basis` (roborev 81141, High). That one explains the
+ * ROW ceiling and is only replaced by a memory sentence when the ROW comparison narrowed —
+ * `narrowed < staticLimit || bound === "load"` — which is a different condition from the one this
+ * ceiling fires on. They come apart in exactly the shape this bead is about: at 60 rows, 21
+ * residents and `memory_admitted` 39, the row ceiling is `60 + 18 = 78`, i.e. NOT narrowed, so
+ * `basis` is still `"CPU-bound: 6 cores × 2 agents per core"` while the residents ceiling is a live
+ * 39. A bar reading "this machine is at the number of agents its memory can hold (CPU-bound: …)"
+ * is the wrong-dimension attribution `basis` exists to prevent, and it has already sent one human
+ * chasing memory that was 94% free.
+ *
+ * So the number and its explanation come out of ONE branch, here. `memory_basis` is the sentence
+ * Rust composed next to `memory_admitted`; `basis` is the fallback for a payload predating it, and a
+ * blank one yields `null` rather than an empty parenthetical — a causeless number beats a wrong
+ * cause, exactly as `localAgentCapacity` decides it.
+ */
+export function residentAdmissionBasis(): string | null {
+  return residentAdmission()?.basis ?? null;
+}
+
+/** The residency ceiling and its sentence, derived together so the two cannot disagree. `null` when
+ *  there is no basis to hold anything back — see {@link residentAdmissionCeiling}. */
+function residentAdmission(): { ceiling: number; basis: string | null } | null {
+  const reading = currentMemoryAdmissionReading();
+  const admission = reading?.admission;
+  if (!admission || !admission.sampled) return null;
+  const admitted = admission.memory_admitted;
+  // Memory had no opinion (absent field, or a ceiling that did not undercut the static one).
+  if (admitted === undefined || !Number.isFinite(admitted) || admitted >= admission.static_max) {
+    return null;
+  }
+  // Same one-directional rule as `limit`: a sample may only ever LOWER a ceiling. The `Math.min`
+  // against the enforced cap is the frontend refusing to let a backend bug or a tampered payload
+  // raise one (sparkle-01xv / sparkle-asz5); the `Math.max(1, …)` is so a squeezed machine still
+  // lets the user see ONE pane rather than going blank.
+  const staticLimit = Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
+  return {
+    ceiling: Math.max(1, Math.min(staticLimit, Math.floor(admitted))),
+    basis: admission.memory_basis?.trim() || admission.basis?.trim() || null,
+  };
 }

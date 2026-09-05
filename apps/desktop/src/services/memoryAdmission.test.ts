@@ -6,7 +6,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import {
   refreshMemoryAdmission,
-  currentMemoryAdmission,
+  currentMemoryAdmissionReading,
   resetMemoryAdmission,
   setMemoryAdmissionClock,
   MEMORY_ADMISSION_TTL_MS,
@@ -55,13 +55,13 @@ describe("refreshMemoryAdmission", () => {
     // Tauri v2 camelCases args (`in_use` on the Rust side) — same convention as config.ts's
     // `projectRoot`. Getting this wrong makes the command reject on every tick, silently.
     expect(invoke).toHaveBeenCalledWith("memory_admission", { inUse: 7 });
-    expect(currentMemoryAdmission()?.effective).toBe(3);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(3);
   });
 
   it("a REJECTED invoke leaves the cache null and does not throw (older backends reject every tick)", async () => {
     invoke.mockRejectedValue(new Error("Command memory_admission not found"));
     await expect(refreshMemoryAdmission(2)).resolves.toBeUndefined();
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
   });
 
   it("ONE failed poll does NOT drop the narrowing — the TTL owns expiry, not the error path", async () => {
@@ -72,12 +72,12 @@ describe("refreshMemoryAdmission", () => {
     // mid-pressure (roborev 55383).
     invoke.mockResolvedValue(admission());
     await refreshMemoryAdmission(2);
-    expect(currentMemoryAdmission()?.effective).toBe(3);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(3);
 
     invoke.mockRejectedValue(new Error("transient IPC hiccup"));
     await refreshMemoryAdmission(2);
     // Still narrowing, on the reading we already had.
-    expect(currentMemoryAdmission()?.effective).toBe(3);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(3);
   });
 
   it("a backend that keeps failing releases the ceiling via the TTL, without any successful poll", async () => {
@@ -91,7 +91,7 @@ describe("refreshMemoryAdmission", () => {
       await refreshMemoryAdmission(2);
       now += MEMORY_ADMISSION_POLL_MS;
     }
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
   });
 
   it("a SLOW reply cannot overwrite a newer one, and cannot land stamped as fresh", async () => {
@@ -109,13 +109,13 @@ describe("refreshMemoryAdmission", () => {
     now += MEMORY_ADMISSION_POLL_MS;
     invoke.mockResolvedValueOnce(admission({ effective: 2, bound: "pressure" }));
     await refreshMemoryAdmission(2);
-    expect(currentMemoryAdmission()?.effective).toBe(2);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(2);
 
     // Now A finally resolves with its older, laxer view. It must be discarded.
     now += 1_000;
     releaseSlow(admission({ effective: 11, bound: "cpu" }));
     await a;
-    expect(currentMemoryAdmission()?.effective).toBe(2);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(2);
   });
 
   it("a SUSTAINEDLY slow backend still keeps the cache fresh — overlapping polls do not starve it", async () => {
@@ -156,9 +156,9 @@ describe("refreshMemoryAdmission", () => {
     await Promise.all(inFlight.slice(0, 3));
 
     // Under the old guard every one of those replies was superseded and NOTHING was ever cached.
-    const got = currentMemoryAdmission();
+    const got = currentMemoryAdmissionReading();
     expect(got).not.toBeNull();
-    expect(got?.effective).toBe(5); // 3 + 2, the newest reply that resolved
+    expect(got?.admission.effective).toBe(5); // 3 + 2, the newest reply that resolved
   });
 
   it("a reply in flight across resetMemoryAdmission() is dropped, not applied into the cleared cache", async () => {
@@ -176,18 +176,18 @@ describe("refreshMemoryAdmission", () => {
     const inFlight = refreshMemoryAdmission(2);
 
     resetMemoryAdmission();
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
 
     release(admission({ effective: 3 }));
     await inFlight;
 
     // Must still be null — the pre-reset reply has no business populating a cache that was cleared.
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
 
     // ...and the seam is not wedged: a fresh request after the reset applies normally.
     invoke.mockResolvedValueOnce(admission({ effective: 4 }));
     await refreshMemoryAdmission(2);
-    expect(currentMemoryAdmission()?.effective).toBe(4);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(4);
   });
 
   it("a LATE rejection cannot evict a newer good reading", async () => {
@@ -200,62 +200,62 @@ describe("refreshMemoryAdmission", () => {
 
     invoke.mockResolvedValueOnce(admission({ effective: 4 }));
     await refreshMemoryAdmission(2);
-    expect(currentMemoryAdmission()?.effective).toBe(4);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(4);
 
     rejectSlow(new Error("the stalled call finally gave up"));
     await a;
-    expect(currentMemoryAdmission()?.effective).toBe(4);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(4);
   });
 
   it("rejects a payload whose effective is not a finite number, rather than caching NaN", async () => {
     invoke.mockResolvedValue({ ...admission(), effective: "lots" });
     await refreshMemoryAdmission(1);
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
 
     invoke.mockResolvedValue({ ...admission(), effective: Number.NaN });
     await refreshMemoryAdmission(1);
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
   });
 
   it("caches null when the command resolves with nothing at all", async () => {
     invoke.mockResolvedValue(undefined);
     await refreshMemoryAdmission(1);
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
   });
 });
 
-describe("currentMemoryAdmission staleness", () => {
+describe("currentMemoryAdmissionReading staleness", () => {
   it("returns the reading right up to the TTL, then null once it expires", async () => {
     invoke.mockResolvedValue(admission());
     await refreshMemoryAdmission(1);
 
     now += MEMORY_ADMISSION_TTL_MS - 1;
-    expect(currentMemoryAdmission()?.effective).toBe(3);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(3);
 
     now += 1; // exactly TTL old
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
   });
 
   it("a spike does not hold the ceiling down forever — a later refresh replaces the expired one", async () => {
     invoke.mockResolvedValue(admission({ effective: 1 }));
     await refreshMemoryAdmission(1);
     now += MEMORY_ADMISSION_TTL_MS * 2;
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
 
     invoke.mockResolvedValue(admission({ effective: 9, bound: "available" }));
     await refreshMemoryAdmission(1);
-    expect(currentMemoryAdmission()?.effective).toBe(9);
+    expect(currentMemoryAdmissionReading()?.admission.effective).toBe(9);
   });
 
   it("a clock that jumps BACKWARD expires the reading instead of freezing it fresh", async () => {
     invoke.mockResolvedValue(admission());
     await refreshMemoryAdmission(1);
     now -= MEMORY_ADMISSION_TTL_MS * 3; // NTP correction / manual time change
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
   });
 
   it("returns null before anything has ever been sampled", () => {
-    expect(currentMemoryAdmission()).toBeNull();
+    expect(currentMemoryAdmissionReading()).toBeNull();
     expect(invoke).not.toHaveBeenCalled();
   });
 });

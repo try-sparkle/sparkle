@@ -51,6 +51,7 @@ import { BlockedAgentsBanner } from "./BlockedAgentsBanner";
 import { DictationEngineBanner } from "./DictationEngineBanner";
 import { UpdateBanner } from "./UpdateBanner";
 import { StaleBuildBanner } from "./StaleBuildBanner";
+import { PaneResidencyBanner } from "./PaneResidencyBanner";
 import { ClosePrompt } from "./ClosePrompt";
 import { StatusStrip } from "./StatusStrip";
 import {
@@ -134,6 +135,7 @@ import {
 } from "../services/resurrectionAdmission";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { useStaggeredPaneMounts } from "../hooks/useStaggeredPaneMounts";
+import { usePaneResidencyAdmission } from "../hooks/usePaneResidencyAdmission";
 import { useTornOutProjects } from "../hooks/useTornOutProjects";
 import { focusSatellite, reclaimProject, reconcileSatellites } from "../services/satelliteWindows";
 import { startPresenceTracking } from "../stores/presenceStore";
@@ -2094,16 +2096,32 @@ export function Workspace() {
     [paneVisibleAgentId],
   );
   const mountablePaneIds = useStaggeredPaneMounts(liveIds, panePriorityIds);
-  // RETURN `live` ITSELF once the queue has drained, rather than an equal copy. Agent ids are
-  // globally unique and this set is a subset of them, so equal sizes means equal contents — and
+  // ── HOW MANY OF THOSE PANES THE MACHINE'S MEMORY CAN ACTUALLY HOLD (bead `sparkle-ftapmp`) ──────
+  //
+  // A SECOND, DIFFERENT GATE, stacked on the stagger queue rather than folded into it. The queue
+  // above is about FRAMES: every id drains within a few of them and nothing is ever withheld. This
+  // one is about RAM, and it genuinely does withhold — which is why it is a separate concept with a
+  // separate module and a banner of its own, instead of a condition bolted onto a hook whose header
+  // promises it will never become a virtualiser.
+  //
+  // It closes the hole that used to justify `agentCapacity` spending a residents-denominated memory
+  // ceiling against a count of rows: "a dormant row becomes resident the moment its tab is clicked,
+  // with no gate in between". This is that gate. It is inert on any machine whose memory reading has
+  // not narrowed — which is every healthy machine — and its deferrals are announced by
+  // `PaneResidencyBanner` and released by the next poll. See `services/paneResidencyAdmission`.
+  const residency = usePaneResidencyAdmission(liveIds, panePriorityIds);
+  // RETURN `live` ITSELF once both gates have cleared, rather than an equal copy. Agent ids are
+  // globally unique and each set is a subset of them, so equal sizes means equal contents — and
   // handing back the same reference is what lets `MemoAgentPaneList` keep bailing out at pointer
   // rate during a seam drag (roborev 55316), which a fresh array every render would silently undo.
   const stagedLive = useMemo(
     () =>
-      mountablePaneIds.size === live.length
+      mountablePaneIds.size === live.length && residency.admitted.size === live.length
         ? live
-        : live.filter(({ agent }) => mountablePaneIds.has(agent.id)),
-    [live, mountablePaneIds],
+        : live.filter(
+            ({ agent }) => mountablePaneIds.has(agent.id) && residency.admitted.has(agent.id),
+          ),
+    [live, mountablePaneIds, residency],
   );
 
   // NO PLAN/BUILD HANDLERS HERE ANY MORE. The board used to render its own duplicate of the
@@ -2192,6 +2210,20 @@ export function Workspace() {
           warning about an action in progress. */}
       <UpdateBanner />
       <StaleBuildBanner />
+      {/* Panes held back because the machine is at the number of agents its memory can hold (bead
+          `sparkle-ftapmp`). Below the updater pair — an update in progress is a warning about an
+          action, this is a condition — and above the rest because it is the one bar that explains a
+          status the user can SEE is frozen. Renders nothing while nothing is deferred, which is
+          every healthy machine. */}
+      <PaneResidencyBanner
+        deferredCount={residency.deferred.length}
+        // THE SENTENCE COMES FROM THE SAME BRANCH AS THE CEILING (roborev 81141, High). This used to
+        // read `localAgentCapacity().basis`, which explains the ROW ceiling and is only replaced by a
+        // memory sentence when the ROW comparison narrowed — a different condition, and they come
+        // apart in exactly the shape this gate fires in. The bar then said "at the number of agents
+        // its memory can hold (CPU-bound: 6 cores × 2 agents per core)".
+        basis={residency.basis ?? undefined}
+      />
       <OfflineBanner />
       <ZeroCreditBanner />
       {/* The WORST-CASE AI bar, and the reason it leads the AI group: a session/usage limit is

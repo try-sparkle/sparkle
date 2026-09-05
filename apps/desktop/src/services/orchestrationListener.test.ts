@@ -22,9 +22,31 @@ vi.mock("@tauri-apps/api/event", () => ({
 //     byte-for-byte. `importActual` is spread first so the module's other exports (used elsewhere in
 //     this import graph) keep working; only the one accessor is overridden. ---
 let admissionReading: import("./memoryAdmission").ConcurrencyAdmission | null = null;
+// The RESIDENT count that reading was measured from — Rust's `in_use`, which `pollMemoryAdmission`
+// fills with `agentCapacity`'s `live`. It is a separate knob because every ceiling on the payload is
+// `in_use + available/per_agent` and therefore means nothing without it: the gate recovers the
+// HEADROOM by subtracting exactly this number before comparing against its own worker-row count
+// (bead `sparkle-ftapmp`). 0 is the default because most tests below carry no memory ceiling at all,
+// and for those it is never read.
+let admissionInUse = 0;
+// A DISTINCT `seq` PER READING OBJECT, which is what production gives and what the gate's anchor
+// keys on: the headroom is a per-SAMPLE allowance, so the worker count it is added to is frozen at
+// the reading that granted it (roborev 81142). A fixed `seq` here would anchor once for the whole
+// FILE and leak one test's worker count into the next; every `admissionReading = {…}` in a test
+// mints a new object, so identity is exactly the right grain.
+const admissionSeqs = new WeakMap<object, number>();
+let admissionSeqNext = 0;
 vi.mock("./memoryAdmission", async (importActual) => ({
   ...(await importActual<typeof import("./memoryAdmission")>()),
-  currentMemoryAdmission: () => admissionReading,
+  currentMemoryAdmissionReading: () => {
+    if (!admissionReading) return null;
+    let seq = admissionSeqs.get(admissionReading);
+    if (seq === undefined) {
+      seq = ++admissionSeqNext;
+      admissionSeqs.set(admissionReading, seq);
+    }
+    return { admission: admissionReading, inUse: admissionInUse, seq };
+  },
 }));
 
 // vi.fn() with no impl → typed as Mock<any[], any>, so spreading unknown[] into it is allowed.
@@ -129,6 +151,8 @@ describe("orchestrationListener", () => {
     // Reset the store so projects don't accumulate across tests (liveWorkerCount scans all of them).
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     useRuntimeStore.setState({ openAgentIds: [] });
+    admissionReading = null;
+    admissionInUse = 0;
     useSettingsStore.setState({ maxConcurrentWorkers: 4, effectiveMaxConcurrentWorkers: 20 });
     scanWorkerManifestsMock.mockReset();
     scanWorkerManifestsMock.mockResolvedValue([]); // default: nothing on disk to reconcile
@@ -814,10 +838,15 @@ describe("orchestrationListener", () => {
     await flush();
     expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // one worker live, well under the static 20
 
+    // ONE RESIDENT AGENT, and `memory_admitted: 1` measured from it — i.e. RAM allows exactly what
+    // is already running and not one more. The number alone cannot say that (bead `sparkle-ftapmp`):
+    // a ceiling of 1 measured from 0 residents would mean "room for one MORE", which is a different
+    // machine. The gate reads the difference, so the fixture has to state both.
+    admissionInUse = 1;
     admissionReading = {
       effective: 1,
       load_headroom: 1, // throttling, NOT the hard stop — the branch under test
-      memory_admitted: 1, // ← RAM allows one
+      memory_admitted: 1, // ← RAM allows one — and one is already resident, so: no more
       static_max: 20,
       static_bound: "cpu",
       bound: "load",
@@ -835,6 +864,284 @@ describe("orchestrationListener", () => {
     fire({ reqId: "m2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "yes" } });
     await flush();
     expect(spawnWorkerMock).toHaveBeenCalledTimes(3); // m1 released by the drain, plus m2
+  });
+
+  it("spends the memory HEADROOM against worker rows, not the residents number (sparkle-ftapmp)", async () => {
+    // ── THE ONE-WAY RATCHET, ON THE GATE THAT ACTUALLY ADMITS WORKERS ──────────────────────────
+    //
+    // `memory_admitted` is `in_use + available/per_agent` where `in_use` is the count of agents
+    // holding a PROCESS. `globalUsedSlots()` counts worker ROWS, dormant ones included. Comparing
+    // them directly is the defect bead `sparkle-ftapmp` measured on the sibling reading: every
+    // dormant row inflates the left side and contributes nothing to the right, and retiring a
+    // RESIDENT worker lowers both sides at once, so the gap never closes. The first cut of that fix
+    // landed only in `agentCapacity` and left THIS gate raw (roborev 81139, High) — so the
+    // founder-visible reading admitted while the gate that admits worker spawns still refused.
+    //
+    // The fixture makes the two populations differ, which is the only way to tell the arithmetic
+    // apart: THREE worker rows, a reading measured from ONE resident, and memory admitting TWO —
+    // i.e. room for exactly one more agent. Raw, that is `3 >= min(20, 2)` → REFUSED. Translated, it
+    // is `3 >= min(20, 3 + (2 - 1))` → `3 >= 4` → ADMITTED, which is what the machine can actually
+    // hold.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    // Three workers live, with no reading at all — the baseline, so the verdict below is provably
+    // caused by the reading and not by a fixture that was already at its ceiling.
+    admissionReading = null;
+    for (const id of ["r1", "r2", "r3"]) {
+      fire({ reqId: id, op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: id } });
+      await flush();
+    }
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3);
+
+    admissionInUse = 1; // one agent actually resident when the sample was taken
+    admissionReading = {
+      effective: 2,
+      memory_admitted: 2, // ← room for ONE more on top of that one resident
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "available",
+      basis: "refused: only 2.0 GiB of memory is available right now — room for 1 more on top of the 1 running",
+      sampled: true,
+      sample: null,
+    };
+    fire({ reqId: "r4", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "yes" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(4); // ← admitted; raw, this was refused forever
+
+    // …AND THE HEADROOM IS SPENT, NOT RE-SPENT (roborev 81142, High). This is the assertion that
+    // separates "translate the ceiling" from "the count cancels". Displaced by the LIVE count, the
+    // comparison is `u >= min(cap, u + h)`, which reduces to `h <= 0` — so r5, r6, r7 … would ALL be
+    // admitted on a reading that said room for exactly ONE, up to the static 20. That is the jetsam
+    // path the sampler exists to close. The count the headroom is added to is frozen at the reading,
+    // so the second spawn against the SAME reading is refused.
+    invokeMock.mockClear();
+    fire({ reqId: "r5", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(4); // held: the one seat is taken
+
+    // DRAIN BEFORE LEAVING — a deferred reply is listener state that outlives the test that queued it.
+    admissionReading = null;
+    fire({ reqId: "r6", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "again" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(6); // r5 released by the drain, plus r6
+  });
+
+  it("still REFUSES a worker when memory grants no headroom at all (sparkle-ftapmp)", async () => {
+    // THE PAIRED NEGATIVE, and the reason the test above is not "the gate stopped gating". Identical
+    // fleet, identical reading in every respect but ONE number: memory admits exactly the resident it
+    // measured, so there is room for nobody. A gate that simply admitted everything — which is what
+    // dropping the memory clamp here would look like — passes the test above and fails this one.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionReading = null;
+    for (const id of ["n1", "n2", "n3"]) {
+      fire({ reqId: id, op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: id } });
+      await flush();
+    }
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3);
+
+    admissionInUse = 1;
+    admissionReading = {
+      effective: 1,
+      memory_admitted: 1, // ← the one resident, and nothing on top of it
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "available",
+      basis: "refused: memory pressure is CRITICAL — holding at the 1 agent(s) already running",
+      sampled: true,
+      sample: null,
+    };
+    invokeMock.mockClear();
+    fire({ reqId: "n4", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3); // held by memory
+
+    // DRAIN BEFORE LEAVING — a deferred reply is listener state that outlives the test that queued
+    // it, and leaving one behind makes the NEXT test's spawn look refused.
+    admissionReading = null;
+    fire({ reqId: "n5", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "again" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(5); // n4 released by the drain, plus n5
+  });
+
+  it("HOLDS the worker anchor on the THROTTLE path while the fleet grows into its ceiling", async () => {
+    // ── THE MIRROR OF agentCapacity's LOAD-BRANCH HOLD TEST (roborev 81192, High) ──────────────
+    //
+    // The anchor stops the memory allowance being re-spent on every call. Set this branch's room to
+    // 0 and `workersAtReading` tracks `globalUsedSlots()` live, so the enforced ceiling becomes
+    // `u >= min(staticCap, u + memoryRoom)` — false for any positive room — and worker after worker
+    // is admitted up to the static cap against a reading whose RAM granted ONE seat. That is the
+    // roborev-81142 cancellation on the gate that actually spawns processes.
+    //
+    // NOTHING PINNED IT. The two load fixtures in this file are single-call: one has
+    // `memory_admitted === admissionInUse`, so its room is already 0 and the mutant is arithmetically
+    // identical; its pair is a NEW reading object, hence a new `seq`, and the first call after a new
+    // seq anchors at the current count whatever room it is passed. The discriminator is a SECOND
+    // spawn against the SAME reading object — no reassignment, so `seq` does not move.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionReading = null;
+    for (const id of ["h1", "h2", "h3"]) {
+      fire({ reqId: id, op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: id } });
+      await flush();
+    }
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3);
+
+    admissionInUse = 1; // one agent actually resident when the sample was taken
+    admissionReading = {
+      effective: 2,
+      load_headroom: 1, // THROTTLING, so this is the branch under test and not the hard stop
+      memory_admitted: 2, // ← RAM: room for exactly ONE more on top of that resident
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "load",
+      basis: "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core…)",
+      sampled: true,
+      sample: null,
+    };
+    // Anchor 3 workers, room 1 → a ceiling of 4. The fourth is the seat RAM granted.
+    fire({ reqId: "h4", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "yes" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(4);
+
+    // THE ASSERTION. Same reading object, so the same `seq`: the anchor must stay at 3 and the seat
+    // must stay spent. Under a room of 0 it retakes to 4, re-grants the seat and admits.
+    invokeMock.mockClear();
+    fire({ reqId: "h5", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(4);
+
+    // DRAIN BEFORE LEAVING — a deferred reply is listener state that outlives the test that queued it.
+    admissionReading = null;
+    fire({ reqId: "h6", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "again" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(6); // h5 released by the drain, plus h6
+  });
+
+  it("RETAKES the worker anchor once the fleet has overshot the ceiling it implied", async () => {
+    // ── THE OTHER HALF OF THE SAME PREDICATE (roborev 81226, High) ────────────────────────────
+    //
+    // The test above pins HOLD. This pins RETAKE, and without it the room argument can be widened
+    // back to a non-anchor-relative term (the roborev-81181 shape) with the whole file still green:
+    // every other fixture here either takes its anchor on the first call after a NEW `seq`, where
+    // the room is unobservable, or sits EXACTLY AT `anchor + room`, the boundary, where a wider room
+    // gives the same verdict. The mutant only changes an outcome when the count OVERSHOOTS the
+    // anchor's ceiling under an UNCHANGED reading.
+    //
+    // Reaching that state needs workers appearing from OUTSIDE this gate — which is the real shape:
+    // a row restored on launch, another window's spawn, a manual add. Seeded straight into the store
+    // here, so the gate is never consulted for them.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionReading = null;
+    fire({ reqId: "k1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "k1" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+    admissionInUse = 1;
+    admissionReading = {
+      effective: 2, // room for exactly ONE more on top of the one resident
+      memory_admitted: 2,
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "available",
+      basis: "refused: only 2.0 GiB of memory is available right now",
+      sampled: true,
+      sample: null,
+    };
+    // Anchor 1, room 1 → a ceiling of 2, and the second worker is the seat it granted.
+    fire({ reqId: "k2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "k2" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+
+    // THREE MORE WORKERS APPEAR WITHOUT PASSING THE GATE. The anchor of 1 is now describing a fleet
+    // that no longer exists, so it must be retaken — otherwise the ceiling stays at 2 against a
+    // count of 5 and the gate refuses forever on a reading that says the machine has room.
+    const ps = useProjectStore.getState();
+    for (let i = 0; i < 3; i += 1) ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+
+    // SAME reading object, so the same `seq`: only the retake rule can admit here.
+    fire({ reqId: "k3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "k3" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("RETAKES the worker anchor on the LOAD arm too — the branch this machine actually lives on", async () => {
+    // ── THE TWIN OF THE TEST ABOVE, ON THE OTHER ARM (roborev 81227, High) ────────────────────
+    //
+    // The RETAKE test above uses `bound: "available"`, so it exercises only the memory arm of the
+    // room ternary. The LOAD arm — the one the previous three findings were about, and the one this
+    // machine's normal 2.6-5.9x per-core band lands on — was pinned in the retake direction by
+    // nothing: mutate that arm alone to a non-anchor-relative term and the whole file stays green,
+    // because every other load fixture either carries no `memory_admitted` (already the
+    // `undefined -> Infinity` sub-branch), has a room of 0, or sits EXACTLY AT the boundary.
+    //
+    // It is load-bearing on that arm. `atCapacity()` is reached from `drainQueue` on every store
+    // change, so a spawn queued before the project list hydrates anchors the worker count at ~0; the
+    // rows then arrive from hydration rather than through the gate, and without the retake the
+    // throttle ceiling stays `0 + (memory_admitted - inUse)` against a real count — every queued
+    // spawn starves until its wait expires. That is roborev 81146 on the throttle path.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionInUse = 1;
+    admissionReading = {
+      effective: 2,
+      load_headroom: 1, // THROTTLING — this is the load arm, not the hard stop
+      memory_admitted: 2, // room for exactly ONE more on top of the one resident
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "load",
+      basis: "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core…)",
+      sampled: true,
+      sample: null,
+    };
+    // Anchor 0 against an empty fleet, ceiling 1 — the one seat the reading grants.
+    fire({ reqId: "g1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "g1" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+    // Rows arrive WITHOUT passing the gate — hydration, a reconcile, another window.
+    const ps = useProjectStore.getState();
+    for (let i = 0; i < 3; i += 1) ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+
+    // SAME reading object, so the same `seq`. The anchor of 0 now describes a fleet that is gone, so
+    // it must be retaken; held, the ceiling stays 1 against a count of 4 and this starves.
+    fire({ reqId: "g2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "g2" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a retake on the LOAD arm still REFUSES when the reading grants no headroom", async () => {
+    // The paired negative, so the retake above cannot degrade into "use the live count". Identical
+    // arm and identical gesture; the only difference is that memory admits exactly the resident it
+    // measured, so the retaken ceiling is the count itself and `count >= count` still refuses.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionInUse = 1;
+    admissionReading = {
+      effective: 1,
+      load_headroom: 1,
+      memory_admitted: 1, // ← nothing on top of the one resident
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "load",
+      basis: "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core…)",
+      sampled: true,
+      sample: null,
+    };
+    const ps = useProjectStore.getState();
+    for (let i = 0; i < 3; i += 1) ps.addAgent(projectId, { kind: "worker", parentId: buildId });
+
+    invokeMock.mockClear();
+    fire({ reqId: "g3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(0); // held: no seat, retake or not
+
+    // DRAIN BEFORE LEAVING — a deferred reply is listener state that outlives the test.
+    admissionReading = null;
+    fire({ reqId: "g4", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "again" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2); // g3 released by the drain, plus g4
   });
 
   it("counts workers MACHINE-WIDE against the RAM cap, not per build agent (sparkle-hfhs)", async () => {

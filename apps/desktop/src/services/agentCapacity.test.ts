@@ -4,7 +4,12 @@ const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
-import { localAgentCapacity, atCapacitySentence, pollMemoryAdmission } from "./agentCapacity";
+import {
+  localAgentCapacity,
+  atCapacitySentence,
+  pollMemoryAdmission,
+  residentAdmissionCeiling,
+} from "./agentCapacity";
 import {
   refreshMemoryAdmission,
   resetMemoryAdmission,
@@ -86,10 +91,17 @@ function admission(over: Partial<ConcurrencyAdmission> = {}): ConcurrencyAdmissi
 let now = 1_000_000;
 
 /** Push one reading through the REAL refresh path (mocked invoke), so the test exercises the
- *  wiring the app uses rather than reaching into the cache. */
+ *  wiring the app uses rather than reaching into the cache.
+ *
+ *  IT GOES THROUGH `pollMemoryAdmission`, NOT `refreshMemoryAdmission(0)` (bead `sparkle-ftapmp`).
+ *  Every ceiling on the payload is denominated in RESIDENT agents and is only meaningful relative to
+ *  the `in_use` that produced it, so a helper that hardcoded `0` was seeding a reading no production
+ *  poll can ever produce — one measured from an empty machine and then read against a fleet. The
+ *  gate now recovers the headroom by subtracting exactly what was sent, so the fixture has to send
+ *  what production sends: `localAgentCapacity().live`, which is what `pollMemoryAdmission` does. */
 async function sample(over: Partial<ConcurrencyAdmission> = {}): Promise<void> {
   invoke.mockResolvedValue(admission(over));
-  await refreshMemoryAdmission(0);
+  await pollMemoryAdmission();
 }
 
 beforeEach(() => {
@@ -200,14 +212,23 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     // alone has silently dropped the memory one, re-opening the jetsam path the sampler exists to
     // close.
     //
-    // The numbers are the reviewed failure: memory admits 6, the fleet holds 10 rows / 3 resident,
-    // and the queue is merely throttling. Without the memory clamp `limit` is `used + 1 = 11` and
-    // the gate admits; RAM said room for 6.
+    // ── AND THE MEMORY TERM IS TRANSLATED TO ROWS FIRST (bead `sparkle-ftapmp`) ───────────────
+    //
+    // The numbers moved when the denomination was fixed, and the movement IS the fix. This fixture
+    // used to read `memory_admitted: 6` and assert `limit === 6` / at capacity — i.e. a ceiling
+    // MEASURED FROM 3 RESIDENTS spent directly against 10 ROWS. The 7 dormant rows hold no process,
+    // so they cannot be what memory is short of; what the reading actually says is "room for
+    // `memory_admitted - in_use` more residents", and that displacement is what carries across.
+    //
+    // Here memory admits 4 against the 3 residents it measured — room for ONE more — so the memory
+    // ceiling is 10 + 1 = 11 rows, while the queue's trickle of 3 would allow 13. Memory is still
+    // the binding term, which is what this test exists to prove; it simply binds at the honest
+    // number instead of one that counted every dormant row twice.
     seedDormant(10, 3);
     await sample({
-      effective: 4, // min(memory 6, load 3+1)
-      load_headroom: 1,
-      memory_admitted: 6, // ← what RAM alone allows
+      effective: 4, // min(memory 4, load 3+3)
+      load_headroom: 3,
+      memory_admitted: 4, // ← what RAM alone allows, in RESIDENTS
       memory_basis: MEMORY_BASIS, // ← and the sentence that goes with it
       bound: "load",
       basis: THROTTLE_BASIS,
@@ -216,8 +237,9 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     });
 
     const cap = localAgentCapacity();
-    expect(cap.limit).toBe(6); // the memory ceiling, not `used + headroom` (11) and not the static 12
-    expect(cap.atCapacity).toBe(true); // 10 rows against a RAM ceiling of 6
+    expect(cap.used).toBe(10);
+    expect(cap.live).toBe(3);
+    expect(cap.limit).toBe(11); // the memory term (10 + 1), not the queue's 13 and not the static 12
     // …AND IT NAMES THE TERM THAT BOUND (roborev, High). The reading is attributed to the queue —
     // Rust only sets `bound = load` when the queue's ceiling is below memory's — but the two arrive
     // here in different denominations, so memory is what produced `limit`. Quoting the run queue
@@ -225,6 +247,32 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     // can follow forever without effect.
     expect(cap.basis).toBe(MEMORY_BASIS);
     expect(cap.basis).not.toBe(THROTTLE_BASIS);
+  });
+
+  it("still REFUSES on the load path when memory grants NO headroom at all", async () => {
+    // THE PAIRED CASE FOR THE CLAMP, and the one that keeps the jetsam guard real after the
+    // denomination fix (bead `sparkle-ftapmp`). Identical fleet and an identical throttling queue;
+    // the ONLY difference is that memory admits exactly the residents it measured, i.e. room for
+    // zero more. Without this, "translate the memory ceiling into rows" would be indistinguishable
+    // from "drop the memory clamp", which is the regression the test above was written against.
+    seedDormant(10, 3);
+    expect(localAgentCapacity().atCapacity).toBe(false); // baseline: provably not already refusing
+
+    await sample({
+      effective: 3,
+      load_headroom: 3, // the queue would happily allow three more
+      memory_admitted: 3, // ← RAM: nothing on top of the 3 already resident
+      memory_basis: MEMORY_BASIS,
+      bound: "load",
+      basis: THROTTLE_BASIS,
+      sample: null,
+      sampled: true,
+    });
+
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(10); // held at the rows already taken — memory grants no eleventh
+    expect(cap.atCapacity).toBe(true);
+    expect(cap.basis).toBe(MEMORY_BASIS);
   });
 
   it("does NOT clamp to memory when memory is not narrowing — the throttle still admits", async () => {
@@ -249,6 +297,43 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     // THE PAIRED ATTRIBUTION. Memory did not bind, so the run queue keeps the sentence — without
     // this, a gate that ALWAYS preferred the memory basis would pass the assertion above.
     expect(cap.basis).toBe(THROTTLE_BASIS);
+  });
+
+  it("HOLDS the anchor on the load path while the fleet grows INTO its ceiling", async () => {
+    // ── THE HOLD DIRECTION OF THE LOAD BRANCH (roborev 81187, High) ───────────────────────────
+    //
+    // The retake threshold on this branch is `min(memoryRoom, load_headroom)`, which is 1 in the
+    // ordinary throttling case. Narrowing it from the widest allowance fixed a false refusal, and it
+    // also made this direction easy to break: set that room to 0 and the anchor tracks `used` on
+    // every call, so `byLoad = used + 1` and `used >= used + 1` is never true — row after row
+    // admitted up to the static ceiling on a reading that granted exactly ONE. That is the
+    // cancellation of `sparkle-e57k99.1` back on the jetsam path.
+    //
+    // NOTHING PINNED IT, because every other load-branch test here calls `localAgentCapacity()` just
+    // ONCE after sampling, and the first call after a new `seq` anchors at the current count
+    // whatever room it is passed — so the room argument was unobservable in all of them. The
+    // discriminator is a SECOND call against the SAME reading with the fleet one larger.
+    seedDormant(5, 3);
+    await sample({
+      effective: 4, // min(memory 12, load 3+1)
+      load_headroom: 1, // throttling: one more on top of the 3 residents
+      memory_admitted: STATIC_LIMIT, // RAM is NOT the constraint, which is why `bound` is load
+      memory_basis: MEMORY_BASIS,
+      bound: "load",
+      basis: THROTTLE_BASIS,
+      sample: null,
+      sampled: true,
+    });
+    // First call: anchor 5, the queue grants a sixth row.
+    expect(localAgentCapacity().limit).toBe(6);
+    expect(localAgentCapacity().atCapacity).toBe(false);
+
+    // The sixth row appears — and NO new reading arrives. The one seat the queue granted is now
+    // taken, so the same reading must refuse a seventh.
+    seedDormant(6, 3);
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(6); // held at 5 + 1, NOT re-granted as 6 + 1
+    expect(cap.atCapacity).toBe(true);
   });
 
   it("REFUSES on the same fleet when the run queue is at its hard stop", async () => {
@@ -511,5 +596,356 @@ describe("pollMemoryAdmission — which count reaches Rust", () => {
     // measured headroom, which is what stopped the available bound from ever narrowing.
     expect(cap.used - sent.inUse).toBe(6);
     expect(sent.inUse).toBeLessThan(cap.used);
+  });
+});
+
+// ══ THE ONE-WAY RATCHET (bead `sparkle-ftapmp`) ═════════════════════════════════════════════════
+//
+// Seeded from the state MEASURED on the founder's machine on 2026-09-04, at the moment the sixth
+// consecutive spawn refusal of that session landed:
+//
+//   128 GiB installed, 26 GiB free
+//   60 local build/worker ROWS registered across all projects
+//   21 of them RESIDENT (`live`) — and `ps -Ao rss,comm | grep -i "[c]laude"` found 20 real
+//     processes holding 5.8 GiB between them, so `live` is a good proxy for true residency and
+//     `used` is not
+//   `memory_admitted` 39 — Rust's `in_use + available/per_agent`, i.e. 21 residents + room for 18
+//   the app refused, citing "holding 60 agents against 39 agent slots"
+//
+// The defect was that 39 counts RESIDENTS and 60 counts ROWS. A retire lowers BOTH — measured, two
+// refusals 90s apart with one retire between moved used 60→59 and limit 39→38, gap fixed at 21 — so
+// the fleet could only ever get more blocked, and no action available to anyone closed it.
+describe("localAgentCapacity — the measured 60-row / 21-resident machine", () => {
+  // Above `memory_admitted` on purpose: this machine's refusal quoted 39, so the static ceiling was
+  // not what bound, and a fixture where the static cap did the refusing would prove nothing about
+  // the memory term.
+  const MEASURED_STATIC = 81;
+  const MEASURED_BASIS = "CPU-bound: 40 cores × 2 agents per core";
+  /** The memory sentence Rust composes for an `available`-bound reading, with the real numbers. */
+  const MEASURED_MEMORY_BASIS =
+    "refused: only 26.0 GiB of memory is available right now ÷ 3379 MiB per agent = room for 18 " +
+    "more on top of the 21 running — the static ceiling of 81 assumes memory this machine does not " +
+    "currently have free";
+
+  /** `rows` local build rows, the first `resident` of them with a mounted pane. */
+  function seedMeasured(rows: number, resident: number): void {
+    seedDormant(rows, resident);
+    useSettingsStore.setState({
+      maxConcurrentWorkers: MEASURED_STATIC,
+      effectiveMaxConcurrentWorkers: MEASURED_STATIC,
+      machineMaxConcurrentWorkers: MEASURED_STATIC,
+      concurrencyBasis: MEASURED_BASIS,
+      concurrencyBound: "cpu",
+    } as never);
+  }
+
+  /** The exact payload `memory_admission` returned at the refusal, parameterised only by what
+   *  memory admits — so the admitting and the refusing cases differ in ONE number. */
+  async function sampleMeasured(memoryAdmitted: number): Promise<void> {
+    await sample({
+      effective: memoryAdmitted,
+      static_max: MEASURED_STATIC,
+      static_bound: "cpu",
+      bound: "available",
+      basis: MEASURED_MEMORY_BASIS,
+      memory_admitted: memoryAdmitted,
+      memory_basis: MEASURED_MEMORY_BASIS,
+      sampled: true,
+      sample: {
+        total_bytes: 137_438_953_472,
+        available_bytes: 27_917_287_424,
+        compressed_bytes: 0,
+        swap_used_bytes: 0,
+        level: "normal",
+      },
+    });
+  }
+
+  it("ADMITS at the measured state — 60 rows, 21 residents, memory admitting 39", async () => {
+    seedMeasured(60, 21);
+    const before = localAgentCapacity();
+    // Baseline, so the assertions below are provably about the reading and not about a machine that
+    // was never full: nothing has been sampled yet, so the static ceiling stands and 60 < 81.
+    expect(before.used).toBe(60);
+    expect(before.live).toBe(21);
+    expect(before.limit).toBe(MEASURED_STATIC);
+
+    await sampleMeasured(39);
+
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(60);
+    expect(cap.live).toBe(21);
+    // 39 residents admitted against the 21 measured = room for 18 more. Carried across to rows:
+    // 60 + 18 = 78, under the static 81, so THAT is the enforced ceiling.
+    expect(cap.limit).toBe(78);
+    // THE FINISH LINE OF THE BEAD: a spawn succeeds while memory reports free slots.
+    expect(cap.atCapacity).toBe(false);
+    // And the ceiling still names the term that produced it.
+    expect(cap.basis).toBe(MEASURED_MEMORY_BASIS);
+  });
+
+  it("REFUSES on the same fleet when memory grants no room on top of the residents", async () => {
+    // THE PAIRED NEGATIVE, and the reason the test above is not "the gate stopped gating". Identical
+    // 60 rows and identical 21 residents; the ONLY difference is that memory admits exactly the
+    // residents it measured. A gate that simply admitted everything would pass the test above.
+    seedMeasured(60, 21);
+    await sampleMeasured(21);
+
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(60); // held at the rows already taken — no sixty-first
+    expect(cap.atCapacity).toBe(true);
+  });
+
+  it("REFUSES on a genuinely full machine — every row resident and memory holding at that", async () => {
+    // The other shape of "genuinely full": no dormant rows at all, so `used === live` and the
+    // translation is the identity. If the fix had been "ignore the memory ceiling when rows exceed
+    // it", this would admit.
+    seedMeasured(60, 60);
+    await sampleMeasured(60);
+
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(60);
+    expect(cap.live).toBe(60);
+    expect(cap.limit).toBe(60);
+    expect(cap.atCapacity).toBe(true);
+  });
+
+  it("RETIRING AN AGENT NOW CLOSES THE GAP — the one-way ratchet is gone", async () => {
+    // THE BEAD'S OWN EVIDENCE, replayed. Two refusals 90 seconds apart with one retire between them:
+    // used 60→59 AND limit 39→38, gap fixed at exactly 21. Retiring lowered both sides because the
+    // retired agent was resident, so it left `live` too — which is why no amount of retiring could
+    // ever help. Here the same retire has to move the machine strictly TOWARDS admitting.
+    seedMeasured(60, 21);
+    await sampleMeasured(39);
+    const before = localAgentCapacity();
+
+    // One resident agent retired: it leaves BOTH lists, and the next poll re-measures from 20.
+    seedMeasured(59, 20);
+    await sampleMeasured(38); // 20 residents + the same room for 18
+    const after = localAgentCapacity();
+
+    expect(after.used).toBe(before.used - 1);
+    // The gap the bead measured — `used - limit` — must SHRINK, not hold. Under the old arithmetic
+    // it was 21 before and 21 after.
+    expect(before.used - before.limit).toBe(-18);
+    expect(after.used - after.limit).toBe(-18);
+    // Stated as the property rather than the pair of numbers: retiring never leaves the machine
+    // further from admitting than it was.
+    expect(after.used - after.limit).toBeLessThanOrEqual(before.used - before.limit);
+  });
+
+  it("SPENDS the headroom rather than re-spending it as the fleet grows", async () => {
+    // ── THE CANCELLATION (roborev 81142, High) ────────────────────────────────────────────────
+    //
+    // Displacing by the LIVE `used` puts it on BOTH sides of `used >= limit`: the comparison is
+    // `used >= min(staticLimit, used + h)`, which reduces to `h <= 0 || used >= staticLimit`. So a
+    // reading granting room for 18 more would admit row after row all the way to the static ceiling
+    // of 81, spending the same 18 seats over and over — the jetsam path the sampler exists to close,
+    // reopened by the fix for the ratchet.
+    //
+    // The headroom is a per-SAMPLE grant, so the count it is added to is frozen at the sample. Here
+    // that is 60 rows + 18 = 78, and the fleet growing INTO that ceiling — with the reading
+    // unchanged — has to flip the verdict.
+    seedMeasured(60, 21);
+    await sampleMeasured(39);
+    expect(localAgentCapacity().atCapacity).toBe(false); // baseline: 60 rows, room for 18
+
+    // 77 rows and the SAME reading: still one seat left.
+    seedMeasured(77, 21);
+    expect(localAgentCapacity().limit).toBe(78);
+    expect(localAgentCapacity().atCapacity).toBe(false);
+
+    // 78: the 18 seats the reading granted are taken.
+    seedMeasured(78, 21);
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(78); // NOT 78 + 18 — the ceiling did not move with the fleet
+    expect(cap.atCapacity).toBe(true);
+  });
+
+  it("ADMITS when the reading landed before the project list had hydrated", async () => {
+    // ── THE OTHER DIRECTION OF THE ANCHOR (roborev 81146, High) ───────────────────────────────
+    //
+    // The pair for the test above, and the reason a one-sided mutation set is not enough for a
+    // predicate that both blocks and allows. Freezing the count stops it cancelling; freezing it at
+    // the WRONG moment is the original bug back on a shorter clock.
+    //
+    // Reachable on an ordinary launch: `localAgentRowIds().used` reads the project store with no
+    // visited filter, so it is 0 until the list hydrates from Rust, while `pollMemoryAdmission()`
+    // fires on mount and sends `live = 0`. Any render in that gap anchors `rows = 0`, and `limit`
+    // becomes the bare headroom — 18 here. The 60 rows arriving a moment later would then read as
+    // AT CAPACITY, citing memory, for up to a poll interval.
+    seedMeasured(0, 0); // the unhydrated store
+    await sampleMeasured(18); // 18 residents admitted against the 0 measured: room for 18
+    // A render happens in the gap and takes the anchor. This is the call that used to poison the
+    // whole poll window.
+    expect(localAgentCapacity().used).toBe(0);
+
+    // …and now the project list arrives.
+    seedMeasured(60, 21);
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(60);
+    // Under a one-directional anchor this was `limit = 0 + 18 = 18` and `60 >= 18` → refused.
+    expect(cap.limit).toBe(78);
+    expect(cap.atCapacity).toBe(false);
+  });
+
+  it("ADMITS on the LOAD branch too when the reading landed before hydration", async () => {
+    // ── THE RETAKE HAS TO BE ASKED WITH THE ENFORCED ALLOWANCE (roborev 81181, High) ───────────
+    //
+    // The pair above goes through `sampleMeasured`, which sends `bound: "available"` and no
+    // `load_headroom` — and THERE `memory_admitted === effective`, so the widest allowance and the
+    // narrowest are the same number and a `max` is indistinguishable from a `min`. The retake was
+    // therefore pinned only in the one regime where the choice does not matter, and was inert in the
+    // regime this machine actually lives in.
+    //
+    // On a load-attributed reading the enforced ceiling is `min(anchor + memoryHeadroom,
+    // anchor + load_headroom)`, and `load_headroom` is 0 or 1 BY CONSTRUCTION while
+    // `memory_admitted` is `static_max` whenever RAM is not the constraint — which is exactly when
+    // Rust attributes a reading to the queue. Asked with the max, the anchor was held until the
+    // count passed `anchor + 81` while the gate refused at `anchor + 1`.
+    seedMeasured(0, 0); // the unhydrated store
+    await sample({
+      effective: 1, // the queue holds at what is running (0) plus its trickle
+      load_headroom: 1, // THROTTLING — this box's normal 2.6-5.9x per-core band, not the hard stop
+      memory_admitted: MEASURED_STATIC, // RAM is not the constraint, which is why `bound` is load
+      memory_basis: MEASURED_MEMORY_BASIS,
+      static_max: MEASURED_STATIC,
+      static_bound: "cpu",
+      bound: "load",
+      basis: "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core…)",
+      sampled: true,
+      sample: null,
+    });
+    // The render in the hydration gap that takes the anchor.
+    expect(localAgentCapacity().used).toBe(0);
+
+    // …and the project list arrives.
+    seedMeasured(60, 21);
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(60);
+    // Held at 0, this was `min(81, 0 + 81, 0 + 1) = 1` — at capacity on 60 rows, quoting the
+    // throttle sentence. Retaken, the queue grants one more on top of the 60 rows that exist.
+    expect(cap.limit).toBe(61);
+    expect(cap.atCapacity).toBe(false);
+  });
+
+  it("does NOT let a fleet that grew underneath it talk a FULL machine into admitting", async () => {
+    // The paired case for the retake, and the one that keeps it from becoming "use the live count".
+    // Same overshoot, but the reading grants ZERO headroom — so the retaken ceiling is the count
+    // itself and `used >= limit` still refuses. A retake may only ever restore the honest ceiling,
+    // never manufacture room the machine does not have.
+    seedMeasured(0, 0);
+    await sampleMeasured(0); // memory admits nothing on top of the 0 it measured
+    expect(localAgentCapacity().used).toBe(0);
+
+    seedMeasured(60, 21);
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(60);
+    expect(cap.atCapacity).toBe(true);
+  });
+
+  it("gives the SAME verdict when the same inputs are driven TWICE", async () => {
+    // Bead `sparkle-yskany`: four tests on the sibling epic pinned the defect rather than the intent
+    // because their fixtures varied something production holds constant. A capacity reading is a
+    // pure function of (rows, residents, reading), so driving it twice with nothing changed must
+    // produce a byte-identical verdict — no counter, no accumulation, no dependence on how many
+    // times a poll has run.
+    seedMeasured(60, 21);
+    await sampleMeasured(39);
+    const first = localAgentCapacity();
+
+    // The identical poll again — same fleet, same payload, same clock.
+    await sampleMeasured(39);
+    const second = localAgentCapacity();
+
+    expect(second).toEqual(first);
+    // And a bare re-read with no poll in between is the same reading too.
+    expect(localAgentCapacity()).toEqual(first);
+  });
+
+  it("the refusal claims NOTHING about whether the dormant rows are running", async () => {
+    // ── THE COPY (bead `sparkle-ftapmp`, part 3), AND IT HAS NOW BEEN WRONG BOTH WAYS ──────────
+    //
+    // The clause said the rows in unopened tabs were "most are already running, they're just not on
+    // screen" — measured false at 60 rows and 20 processes, and it is why this arithmetic read as
+    // defensible to every reviewer who looked at it. But that sentence was itself the fix for BUG 1
+    // of the ceiling audit, which retracted the OPPOSITE claim ("each one starts as soon as you
+    // do") on the observation that closed-tab projects were running their full roster.
+    //
+    // Both are true of different rows, and `live` — "has a mounted pane IN THIS WINDOW" — separates
+    // neither. So the honest clause asserts NOTHING about process state and says what it does
+    // measure. Asserted here as a pair: the two retracted claims are absent, AND the true statement
+    // is present, because deleting a claim is not the same fact as stating the truth and a
+    // negative-only ratchet is green over copy trimmed to silence.
+    seedMeasured(60, 21);
+    await sampleMeasured(21); // the refusing state, so there is a sentence to read
+    const cap = localAgentCapacity();
+    expect(cap.atCapacity).toBe(true); // precondition, not an assumption
+
+    const sentence = atCapacitySentence(cap, "I can't start another agent right now.");
+    // NEITHER retracted claim.
+    expect(sentence).not.toContain("already running,");
+    expect(sentence).not.toMatch(/most are already running/i);
+    expect(sentence).not.toMatch(/starts as soon as you do/i);
+    expect(sentence).not.toMatch(/haven't opened yet/i);
+    // …and the true statement, which is what `live` measures plus what the count is OF.
+    expect(sentence).toContain("21 of them showing in this window");
+    expect(sentence).toContain("aren't open here");
+    expect(sentence).toContain("can't tell which of those still hold a running process");
+    expect(sentence).toContain("the count is of slots, not of processes");
+    // THE CLASSIFIER COUPLING SURVIVES THE REWORD. `components/Concierge/refusalAudience` decides
+    // whether a capacity refusal is machinery the concierge routes around or red text the founder
+    // has to read, and it decides by matching `/\bagent slots?\b/i`. Rewording this sentence out of
+    // that lexicon would silently reclassify every capacity refusal as founder-facing, and nothing
+    // else in the tree would go red for it.
+    expect(refusalAudience(sentence)).toBe("internal");
+  });
+});
+
+describe("residentAdmissionCeiling — the residency counterpart to `limit`", () => {
+  it("is null when nothing has been sampled — an unmeasured machine holds nothing back", () => {
+    expect(residentAdmissionCeiling()).toBeNull();
+  });
+
+  it("is null when memory did NOT narrow, even though a reading arrived", async () => {
+    // The paired case, and the one that keeps the mount gate off healthy machines: a static ceiling
+    // is a PREDICTION, not a measurement of residency, and deferring panes on the strength of it
+    // would fire when nothing is wrong. Without this, the test below passes for a gate that treats
+    // every reading as a narrowing one.
+    await sample({ effective: STATIC_LIMIT, memory_admitted: STATIC_LIMIT, sampled: true });
+    expect(residentAdmissionCeiling()).toBeNull();
+  });
+
+  it("is the memory ceiling in RESIDENTS once memory narrows", async () => {
+    await sample({ effective: 3, memory_admitted: 3, sampled: true });
+    // 3 — the residents number verbatim, NOT the row-denominated `limit` beside it.
+    expect(residentAdmissionCeiling()).toBe(3);
+  });
+
+  it("never exceeds the enforced cap, whatever the payload claims", async () => {
+    // A backend bug, a version skew or a tampered payload. Same one-directional contract `limit`
+    // has: sampling may only ever LOWER a ceiling (sparkle-01xv / sparkle-asz5).
+    //
+    // THE FIXTURE HAS TO REACH THE CLAMP, and the first version of this test did not (roborev 81139,
+    // High). It passed `memory_admitted: 999, static_max: 999`, which satisfies the EARLIER
+    // `admitted >= static_max` guard and returns `null` — so a `ceiling === null || ceiling <= 12`
+    // assertion was carried entirely by the null disjunct, and deleting the `Math.min` left it
+    // green. The clamp is only reachable when the payload narrows RELATIVE TO ITS OWN `static_max`
+    // and still exceeds the frontend's enforced cap, so `static_max` must be strictly larger.
+    await sample({ effective: 999, memory_admitted: 999, static_max: 1000, sampled: true });
+    // Exactly the cap — no disjunction, so the assertion cannot be satisfied by a null.
+    expect(residentAdmissionCeiling()).toBe(STATIC_LIMIT);
+  });
+
+  it("is null for a reading that measured nothing — sampled:false is not a squeezed machine", async () => {
+    await sample({ effective: 3, memory_admitted: 3, sampled: false, sample: null });
+    expect(residentAdmissionCeiling()).toBeNull();
+  });
+
+  it("is null again once the reading goes stale", async () => {
+    await sample({ effective: 3, memory_admitted: 3, sampled: true });
+    expect(residentAdmissionCeiling()).toBe(3);
+    now += MEMORY_ADMISSION_TTL_MS;
+    expect(residentAdmissionCeiling()).toBeNull();
   });
 });

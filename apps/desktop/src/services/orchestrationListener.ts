@@ -22,7 +22,11 @@ import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { AgentTabStatus } from "../types";
 import { useSettingsStore, enforcedWorkerCap, concurrencyBasis } from "../stores/settingsStore";
-import { currentMemoryAdmission } from "./memoryAdmission";
+import {
+  ceilingInPopulationOf,
+  countWhenReadingArrived,
+  currentMemoryAdmissionReading,
+} from "./memoryAdmission";
 import { workersNeedingOpen, isNotYetLiveWorker } from "../engine/workerAttention";
 
 const EVENT = "orchestration:request";
@@ -265,7 +269,8 @@ function atCapacity(): boolean {
  *  That ambiguity is the defect this ratification closes; do not re-overload this one. */
 function globalGateBinds(): boolean {
   const staticCap = Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
-  const admission = currentMemoryAdmission();
+  const reading = currentMemoryAdmissionReading();
+  const admission = reading?.admission ?? null;
 
   // ── THE RUNTIME NARROWING REACHES WORKER SPAWNS TOO (roborev 68367, High) ────────────────────
   //
@@ -281,7 +286,52 @@ function globalGateBinds(): boolean {
   // skew or a tampered payload cannot RAISE a ceiling that exists to stop the machine being
   // jetsam-killed; and an absent, stale or unsampled reading leaves this expression byte-for-byte
   // what it was before. An unmeasured machine is not a squeezed one.
-  if (!admission || !admission.sampled) return globalUsedSlots() >= staticCap;
+  if (!reading || !admission || !admission.sampled) return globalUsedSlots() >= staticCap;
+
+  // ── AND THE MEMORY CEILING IS DENOMINATED IN RESIDENTS, NOT IN WORKER ROWS (bead
+  // `sparkle-ftapmp`, roborev 81139 High) ────────────────────────────────────────────────────────
+  //
+  // `memory_admitted` and `effective` are `in_use + available/per_agent`, where `in_use` is
+  // `agentCapacity`'s `live` — the count of agents actually holding a process. `globalUsedSlots()`
+  // counts WORKER ROWS, including rows in project tabs nobody has opened, which hold no process at
+  // all. Comparing the two directly is the same one-way ratchet the sibling gate was carrying:
+  // every dormant worker row inflates the left side and contributes nothing to the right, and
+  // retiring a RESIDENT worker lowers both sides at once, so the gap can never close.
+  //
+  // The paragraph below is right that `globalUsedSlots()` and `in_use` are different populations
+  // and must not be compared. The HEADROOM is not a population — `ceiling - inUse` is a pure "this
+  // many more agents fit" — so displacing this gate's own count by it is exactly the arithmetic the
+  // paragraph is protecting, not an exception to it. `ceilingInPopulationOf` is that displacement,
+  // shared with `agentCapacity` so the two gates cannot drift apart again; `reading.inUse` is the
+  // resident count THAT reading was measured from, never a count of this module's own.
+  //
+  // ANCHORED, NOT LIVE (roborev 81142, High). Displacing by `globalUsedSlots()` AT GATE TIME puts it
+  // on both sides of `globalUsedSlots() >= narrowed`, where it cancels — the comparison reduces to
+  // `headroom <= 0 || count >= staticCap`. Two regressions followed: a reading saying "room for
+  // exactly one more" admitted worker after worker up to the static ceiling, and the IN-FLIGHT
+  // reservations `globalUsedSlots()` adds — which exist so a burst of concurrent spawns cannot all
+  // pass before any of them land — were neutralised, because they raised both sides equally.
+  const workersAtReading = countWhenReadingArrived(
+    "workers",
+    reading.seq,
+    globalUsedSlots(),
+    // The allowance THIS BRANCH ENFORCES — see `countWhenReadingArrived`. It separates a worker
+    // count growing INTO its ceiling (hold the anchor) from one already past it (retake, because the
+    // anchor is then describing a fleet that no longer exists).
+    //
+    // The narrowest, not the widest (roborev 81181, High). On the throttle branch the enforced
+    // ceiling is `min(staticCap, workersAtReading + (memory_admitted - inUse))`; on the memory
+    // branch it is `workersAtReading + (effective - inUse)`. A term that is not anchor-relative —
+    // the bare `staticCap` a payload predating `memory_admitted` falls back to — constrains nothing
+    // the anchor can move, so it must not narrow the retake question either.
+    admission.bound === "load"
+      ? admission.memory_admitted === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.floor(admission.memory_admitted) - reading.inUse
+      : Math.floor(admission.effective) - reading.inUse,
+  );
+  const inWorkerRows = (ceilingResidents: number): number =>
+    ceilingInPopulationOf(ceilingResidents, workersAtReading, reading.inUse);
 
   // A SATURATED RUN QUEUE REFUSES OUTRIGHT rather than through the count, and the asymmetry with the
   // memory bounds is deliberate. The memory dimensions are QUANTITIES: `effective` is a genuine
@@ -320,11 +370,16 @@ function globalGateBinds(): boolean {
     // queue merely sits below it, and returning `>= staticCap` would let the fleet grow to the
     // static ceiling while available RAM said room for a handful. `?? staticCap` keeps a payload
     // that predates the field exactly as strict as it was, never stricter.
-    const byMemory = Math.max(1, Math.floor(admission.memory_admitted ?? staticCap));
+    // A payload predating `memory_admitted` contributes `staticCap` DIRECTLY rather than through the
+    // translation: "absent means memory had no opinion", and a no-opinion term must be inert.
+    const byMemory =
+      admission.memory_admitted === undefined
+        ? staticCap
+        : inWorkerRows(admission.memory_admitted);
     return globalUsedSlots() >= Math.max(1, Math.min(staticCap, byMemory));
   }
 
-  const narrowed = Math.max(1, Math.min(staticCap, Math.floor(admission.effective)));
+  const narrowed = Math.max(1, Math.min(staticCap, inWorkerRows(admission.effective)));
   return globalUsedSlots() >= narrowed;
 }
 
