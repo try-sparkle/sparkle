@@ -16,7 +16,7 @@
  * future edit cannot quietly drop one.
  */
 import { spawn } from 'node:child_process';
-import { describeThrown, redactSecrets } from './humaneTransport.ts';
+import { answered, describeThrown, redactSecrets } from './humaneTransport.ts';
 import type { JudgeReply, JudgeTransport, CredentialSource, JudgeUsage } from './humaneTransport.ts';
 
 /**
@@ -307,8 +307,39 @@ export function claudeCliTransport(opts: ClaudeCliTransportOptions): JudgeTransp
         const r = await runCli(cliArgs, env, prompt, timeoutMs);
         if (r.spawnError !== undefined) return { error: r.spawnError };
         if (r.code !== 0) {
-          const detail = oneLine(r.stderr || r.stdout, 400);
-          return { error: `the judge CLI exited ${r.code ?? 'on a signal'}${detail ? ` — ${detail}` : ''}` };
+          // ── THE REASON IS IN THE ENVELOPE, PAST THE 400-CHAR CUT ──────────────────────────
+          //
+          // `claude -p --output-format json` does not only print its envelope on a CLEAN run: it
+          // prints one and EXITS NON-ZERO when the call fails, with `result` — the single
+          // human-readable sentence — placed AFTER the long `usage`/`cache_creation` block. So
+          // quoting a 400-char prefix of stdout publishes the token counters and truncates the
+          // diagnosis. Measured on the HumaneBench gate (run 33821995583): all three judges
+          // failed, stderr was EMPTY, and every one reported the same unreadable prefix —
+          //
+          //   the judge CLI exited 1 — {"is_error":true,...,"cache_creation":{"ephemeral_1h_...
+          //
+          // — across three pull requests, with nothing anywhere saying WHY. `parseJudgeEnvelope`
+          // already extracts `result` and redacts it; it was simply unreachable from here,
+          // because this branch returns before it is ever called.
+          //
+          // ORDER MATTERS AND IS DELIBERATE. stderr wins when it has anything to say: a CLI that
+          // dies before it can print an envelope explains itself there, and that is the older,
+          // covered path. Only an EMPTY stderr falls through to the envelope.
+          //
+          // EVERY ARM REDACTS. This one used to be the single error path in this file that did
+          // not, while quoting up to 400 chars of arbitrary CLI output — and a failing auth call
+          // is exactly the one most likely to echo the credential it failed with.
+          const exited = `the judge CLI exited ${r.code ?? 'on a signal'}`;
+          const fromStderr = oneLine(r.stderr, 400);
+          if (fromStderr !== '') return { error: `${exited} — ${redactSecrets(fromStderr)}` };
+          if (r.stdout.trim() === '') return { error: exited };
+          const parsed = parseJudgeEnvelope(r.stdout);
+          // A non-zero exit is NEVER an answer, so a `text` reply here is a contradiction: the
+          // envelope claims success and the process died. Report the text as the detail rather
+          // than returning it as a verdict — a judgement that the CLI itself abandoned must not
+          // be counted toward the quorum.
+          const detail = answered(parsed) ? oneLine(redactSecrets(parsed.text), 400) : parsed.error;
+          return { error: `${exited} — ${detail}` };
         }
         return parseJudgeEnvelope(r.stdout);
       } catch (e) {

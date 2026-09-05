@@ -261,6 +261,95 @@ describe('the CLI transport', () => {
     expect((r as { error: string }).error).toContain('Credit balance is too low');
   });
 
+  // ── A NON-ZERO EXIT WITH AN EMPTY stderr IS THE SHAPE THAT ACTUALLY HAPPENS ────────────────
+  //
+  // Measured on the HumaneBench gate, run 33821995583: all three judges failed, stderr was
+  // EMPTY, and the CLI had printed its `--output-format json` envelope on STDOUT and exited 1.
+  // The envelope puts `result` — the one human-readable sentence — AFTER the long
+  // `usage`/`cache_creation` block, so quoting a 400-char prefix of stdout published the token
+  // counters and cut the diagnosis off mid-key:
+  //
+  //   the judge CLI exited 1 — {"is_error":true,...,"cache_creation":{"ephemeral_1h_input_tokens":0,"ep...
+  //
+  // Three PRs carried that string and nobody could tell WHY the judges failed. The test above
+  // could not catch it: it supplies stderr, which is the branch that already worked.
+  const errorEnvelope = (result: string): string =>
+    JSON.stringify({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      duration_api_ms: 0,
+      num_turns: 1,
+      session_id: '29ae277e-7795-4d3c-8e91-458949615451',
+      total_cost_usd: 0,
+      // Long enough on its own to run past the 400-char cut, exactly as the real envelope does.
+      usage: {
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+        server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+        service_tier: 'standard',
+        cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 0 },
+      },
+      permission_denials: [],
+      result,
+    });
+
+  it('a non-zero exit with an EMPTY stderr reports the ENVELOPE reason, not a truncated JSON dump', async () => {
+    const reason = 'OAuth access token is invalid. Please run /login';
+    const t = transport(async () => ({ code: 1, stdout: errorEnvelope(reason), stderr: '' }));
+    const r = await t.ask('p', 'm');
+    expect(answered(r)).toBe(false);
+    const err = (r as { error: string }).error;
+    // The sentence that says why must survive.
+    expect(err, 'the envelope result is the whole diagnosis and must be quoted').toContain(reason);
+    // And the counters that used to crowd it out must not be what we publish.
+    expect(err, 'the raw envelope must not be dumped in place of its reason').not.toContain(
+      'cache_creation_input_tokens',
+    );
+    // The exit code still travels — it is how a reader knows the process died rather than answered.
+    expect(err).toContain('exited 1');
+  });
+
+  it('REDACTS a credential echoed in the envelope of a non-zero exit', async () => {
+    const secret = 'sk-ant-oat01-AAAABBBBCCCCDDDD';
+    const t = transport(async () => ({
+      code: 1,
+      stdout: errorEnvelope(`bad token ${secret} — please re-login`),
+      stderr: '',
+    }));
+    const r = await t.ask('p', 'm');
+    const err = (r as { error: string }).error;
+    expect(err, 'a failing judge must never publish the credential it failed with').not.toContain(secret);
+    expect(err).toContain('[redacted]');
+    // Redaction removes the secret, not the diagnosis.
+    expect(err).toContain('please re-login');
+  });
+
+  it('REDACTS a credential echoed on stderr of a non-zero exit', async () => {
+    const secret = 'sk-ant-oat01-EEEEFFFFGGGGHHHH';
+    const t = transport(async () => ({ code: 1, stdout: '', stderr: `auth failed for ${secret}` }));
+    const r = await t.ask('p', 'm');
+    const err = (r as { error: string }).error;
+    expect(err, 'stderr is as capable of echoing a key as stdout is').not.toContain(secret);
+    expect(err).toContain('[redacted]');
+    expect(err).toContain('auth failed');
+  });
+
+  it('quotes NON-JSON stdout when stderr is empty — that sentence is usually the diagnosis', async () => {
+    const t = transport(async () => ({ code: 1, stdout: 'Not logged in \u00b7 Please run /login', stderr: '' }));
+    const r = await t.ask('p', 'm');
+    expect((r as { error: string }).error).toContain('Not logged in');
+  });
+
+  it('says only that it exited when the CLI printed nothing at all', async () => {
+    const t = transport(async () => ({ code: 1, stdout: '', stderr: '' }));
+    const r = await t.ask('p', 'm');
+    expect(answered(r)).toBe(false);
+    expect((r as { error: string }).error).toBe('the judge CLI exited 1');
+  });
+
   it('reports a spawn failure rather than throwing', async () => {
     const t = transport(async () => ({ code: null, stdout: '', stderr: '', spawnError: 'spawn claude ENOENT' }));
     await expect(t.ask('p', 'm')).resolves.toEqual({ error: 'spawn claude ENOENT' });
