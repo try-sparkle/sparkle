@@ -72,6 +72,7 @@ import {
   wasSubmitted,
   type ConciergeDispatchPath,
 } from "../conciergeDispatch";
+import { forceAgentRedraw, type RedrawOutcome } from "../forceRedraw";
 import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAuthority";
 import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
@@ -1097,8 +1098,19 @@ export function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // around this guard: it presses `q` only behind POSITIVE pager evidence, so on the screen this
     // refusal is actually about it either clears it or refuses `not-a-pager`. It cannot put a
     // keystroke into a dialog, which is the outcome this whole path exists to prevent.
+    // ── AND IT STOPPED CLAIMING A PAGER, FOR THE SECOND TIME (bead sparkle-4utugq) ──────────────
+    // This sentence read "What holds the screen there is a pager or an editor, not something
+    // waiting on an answer." That is the SAME guess-dressed-as-evidence the block above already
+    // corrected once, restored one routing change later, and it is now measured FALSE: the
+    // incident's screen was an ordinary idle Claude Code prompt, and a real 2.1.261 capture
+    // replayed at the pane's own geometry classifies TRUE. This path knows exactly one thing, and
+    // it is a NEGATIVE one: the frame it read did not resolve to Claude Code's prompt. A frame that
+    // was never fully drawn satisfies that as readily as a pager does, so the third possibility is
+    // NAMED rather than assumed away. The refusal's PREMISE is untouched; only the claim about why.
+    //
+    // NO EM-DASH, per the note above: ` — ` is the receipt line's own separator.
     case "alternate-screen":
-      return "Not sent: that terminal is in full-screen mode and I couldn't recognise it as Claude Code's own prompt, so typing there could have run as commands. What holds the screen there is a pager or an editor, not something waiting on an answer. quit_alternate_screen can clear it and presses q only where it can prove a pager is on screen; otherwise it is the human's to quit in that agent's own pane.";
+      return "Not sent: that terminal is in full-screen mode and I couldn't recognise it as Claude Code's own prompt, so typing there could have run as commands. I can't tell what holds the screen: a pager, an editor, or a frame that was never fully drawn all look the same from here, and I already tried making it repaint and read it again. quit_alternate_screen can clear it and presses q only where it can prove a pager is on screen; otherwise it is the human's to quit in that agent's own pane.";
     // Same shape as the line above and the same reason it offers no rephrasing: the screen is
     // waiting on a specific answer, and free text submitted into it would be answering the wrong
     // question — or, at a credential field, echoing nothing while it did so.
@@ -1128,6 +1140,90 @@ export function sendDetail(path: ConciergeSendPath, agentId: string): string {
       return "Not sent.";
     }
   }
+}
+
+/** ══ REPAIR THE FRAME BEFORE BELIEVING WHAT IS ON IT (bead sparkle-4utugq) ══════════════
+ *
+ * ══ THE CONTRADICTION THIS CLOSES ═══════════════════════════════════════════════════
+ * One agent, one instant, two ops disagreeing about the same terminal:
+ *
+ *   send_to_agent_terminal → refused `alternate-screen` ("a pager or an editor holds the screen")
+ *   read_agent_terminal    → ok, freshness `live`: a completed Claude Code turn, the composer box,
+ *                            an EMPTY `❯` line, and the `⏵⏵ bypass permissions on …` chrome bar.
+ *
+ * ══ THE CLASSIFIER IS NOT THE DEFECT, AND THAT WAS MEASURED, NOT ASSUMED ═══════════════════
+ * A real `claude` **2.1.261** was driven in a pty at 120x40, 48x30 and 30x30 by the recipe at the
+ * top of `engine/capturedScreens.fixture.ts`, taken to a COMPLETED TURN, and its byte log replayed
+ * through `@xterm/headless`. At every one of those geometries `isClaudeCodeScreen` answered TRUE on
+ * the rendered grid — including the row the incident report singled out as suspicious, the `/rc`
+ * remote-control indicator Claude Code paints at the far bottom-right. And `claudeCodeScreen.ts`,
+ * `screenClassifier.ts` and this file are BYTE-IDENTICAL between the build that produced the
+ * incident and `origin/main`, so the refusal cannot be a since-fixed classifier bug either.
+ *
+ * What DOES reproduce it is replaying that same byte log into a grid of a DIFFERENT SIZE than the
+ * child was drawing for: the composer’s closing rule is overwritten by absolutely-positioned
+ * chrome, the box stops being a box, `isClaudeCodeScreen` answers FALSE, and the refusal fires —
+ * correctly, on a frame that was never validly rendered. Two agents froze exactly that way on the
+ * day of the incident and a restart cleared both. `WEDGED_FRAME_SCREEN` is that render.
+ *
+ * ══ SO THE GATE IS UNTOUCHED AND THE FRAME IS REPAIRED, BEFORE ANYTHING IS DECIDED ══════════
+ * NOTHING HERE WIDENS `isClaudeCodeScreen`, and widening it is explicitly the wrong fix — typing
+ * into a real pager is the harm the refusal exists to prevent. `forceAgentRedraw` changes the PTY
+ * window size and changes it back; it writes NO BYTES to the child (see `services/forceRedraw` for
+ * the full safety argument), so it is safe on exactly the screens this path refuses to type into.
+ * The dispatcher then runs ONCE, over a frame the child has just repainted, and decides exactly as
+ * it always has.
+ *
+ * ══ WHY THIS RUNS BEFORE THE DISPATCH RATHER THAN AFTER A REFUSAL (roborev 81248, High) ═════
+ * The first cut dispatched, then repaired an `alternate-screen` refusal and re-dispatched. Nothing
+ * was written on that first attempt, so the retry could not double-send — but the ATTEMPT WAS NOT
+ * SILENT. `dispatchConciergeAnswer` reports every outcome to `engine/blockedPromptGrace`, where
+ * `alternate-screen` maps to `unreachable`; that is a GIVE-UP, and a give-up is a LATCH cleared
+ * only when the agent leaves the ask. So during the ~500ms repair window the founder was surfaced
+ * a "Needs you" for a prompt the concierge answered a beat later, and the successful retry could
+ * not retract it. That is this bead’s own read-versus-write contradiction, relocated one layer up.
+ * A preflight reports nothing, because there is no outcome until the one dispatch that happens.
+ *
+ * ══ IT IS A REPAIR, NOT A DECISION — WHICH IS WHY A COARSE PREDICATE IS SAFE HERE ══════════
+ * This asks a cheaper question than the dispatcher does, and deliberately does not try to
+ * reproduce it: the dispatcher owns the verdict and nothing here can change it. Being wrong is
+ * bounded in BOTH directions — a false yes costs one wasted repaint of a screen that was going to
+ * be accepted anyway, a false no leaves exactly today’s behaviour. That asymmetry is what licenses
+ * a second, simpler predicate; a copy of the dispatcher’s own conditions would be the drift this
+ * file warns about everywhere else.
+ *
+ * Two conjuncts narrow it, and each is load-bearing:
+ *
+ *   • `!hasClaudeCodeLiveTui` — a live Claude Code DIALOG is a screen we DID recognise. The
+ *     dispatcher routes it to `blocked-prompt`, whose remedy is a human answering it, and
+ *     repainting changes nothing about whose question it is.
+ *   • NO `pickerPress` — a fingerprinted option press carries its own evidence, re-derived by the
+ *     dispatcher from the CURRENT screen. Repainting underneath one moves the menu it is about, so
+ *     the fingerprint stops matching and a press the caller had already read is refused. Never
+ *     repaint under a press.
+ */
+export async function repairUnrecognisedFrameBeforeSending(
+  agentId: string,
+  /** True when this send carries a fingerprinted picker press. See the second conjunct above. */
+  isPickerPress: boolean,
+  /** The screen, read once. `null` (no mounted pane) is NOT a repair case: `forceAgentRedraw`
+   *  would answer `no-viewport` anyway, and the dispatcher cannot reach its alternate-screen arm
+   *  without a viewport either. */
+  screen: TerminalViewport | null,
+  /** The repaint. A DEFAULTED PARAMETER carrying the production wiring, for the reason
+   *  `services/forceRedraw` states about its own deps: a seam only tests supply, wired into
+   *  production at one untested line, is the hole this repo keeps rediscovering (bead
+   *  sparkle-lgbwf) — delete that line and the suite stays green over a dead feature. Here the
+   *  production wiring IS the default, so a test drives this same function. */
+  redraw: (id: string) => Promise<RedrawOutcome> = forceAgentRedraw,
+): Promise<RedrawOutcome | null> {
+  if (isPickerPress) return null;
+  if (!screen?.alternateBuffer) return null;
+  if (isClaudeCodeScreen(screen.text) || hasClaudeCodeLiveTui(screen.text)) return null;
+  log.info("concierge", "unrecognised full-screen frame — repainting before the send decides", {
+    agentId,
+  });
+  return redraw(agentId);
 }
 
 /**
@@ -1231,6 +1327,16 @@ export async function sendToAgentTerminal(
       return refuse("sparkle-busy", busy.detail);
     }
   }
+
+  // Gate 3. REPAIR THE FRAME BEFORE ANYTHING DECIDES FROM IT (bead sparkle-4utugq).
+  // See {@link repairUnrecognisedFrameBeforeSending} for the whole argument, including why this
+  // runs BEFORE the dispatch rather than after a refusal. It writes no bytes and returns no
+  // verdict; the dispatch below is still the one and only decision.
+  await repairUnrecognisedFrameBeforeSending(
+    agentId,
+    opts.pickerPress !== undefined,
+    getAgentViewport(agentId),
+  );
 
   const r = await dispatchConciergeAnswer(agentId, text, {
     authority,

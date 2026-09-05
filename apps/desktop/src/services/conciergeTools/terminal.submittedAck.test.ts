@@ -36,6 +36,10 @@ vi.mock("../knownAgents", async (orig) => ({
 }));
 vi.mock("../sparkleBusy", () => ({ sparkleBusyNow: vi.fn(() => null) }));
 vi.mock("../../pty", () => ({
+  // `resizePty` is reached through `services/forceRedraw`, which `conciergeTools/terminal`
+  // now imports for its pre-send frame repair. A factory mock REPLACES the module, so an
+  // omitted export is a hard load error for the whole suite, not a missing stub.
+  resizePty: vi.fn(async () => {}),
   writePtyChainedStrict: vi.fn(async () => {}),
   PtyGoneError: class extends Error {},
 }));

@@ -37,3 +37,63 @@ export const FOOTER_ONLY_SCREEN = [
   "  Called sparkle-control 2 times",
   " Esc to cancel · Tab to amend · ctrl+e to explain",
 ].join("\n");
+
+/**
+ * THE WEDGED FRAME — a live Claude Code session whose grid was painted for a geometry the pane no
+ * longer has, so the composer box is gone and the app reports a full-screen app where a human sees
+ * an idle prompt. This is the screen behind bead sparkle-4utugq, where, at one instant, on one
+ * agent:
+ *
+ *   send_to_agent_terminal -> refused `alternate-screen` ("a pager or an editor holds the screen")
+ *   read_agent_terminal    -> ok, freshness `live`: a completed turn and an idle `❯` prompt
+ *
+ * RECONSTRUCTED, NOT CAPTURED — but derived from a real byte log rather than assembled by hand,
+ * which is why it belongs here and not in `capturedScreens.fixture.ts`. Claude Code **2.1.261** was
+ * driven in a pty at 120x40 by that file's own recipe, taken to a completed turn, and its byte log
+ * replayed through `@xterm/headless`. Replayed into a grid of the SAME size the child drew for, the
+ * result is an ordinary idle prompt and `isClaudeCodeScreen` answers TRUE. Replayed into a grid of
+ * a DIFFERENT size — which is what a pane whose PTY winsize has drifted from its emulator is — the
+ * absolutely-positioned trailing chrome lands on top of the composer's closing rule, both rules are
+ * lost, and the same predicate answers FALSE. The rows below are that second render, verbatim.
+ *
+ * ── WHY THE PREDICATE IS RIGHT TO REFUSE THIS AND THE APP IS STILL WRONG ──────────────────────
+ * There is no composer box on this screen. `isClaudeCodeScreen` is a POSITIVE-evidence detector and
+ * it is answering honestly about the bytes it was given. What is broken is upstream: the bytes are
+ * a frame that was never validly rendered. So the fix is not to widen the predicate — typing into a
+ * real pager is the harm it prevents — it is to make the child REPAINT and ask the same predicate
+ * again. See `conciergeTools/terminal.repairAndRetryAlternateScreen`.
+ *
+ * Two things on this screen are ordinary 2.1.261 chrome and must not be "corrected" away, because
+ * they are what the incident report singled out as suspicious:
+ *   • `← for agents` is the agents indicator Claude Code draws at the end of its status bar.
+ *   • the trailing row is a MERGE of the composer prompt and status-bar fragments, not a prompt.
+ *     The U+00A0 after the caret is the non-breaking space Claude Code pads the prompt with,
+ *     and it is escaped in the row below rather than written literally so it cannot be mistaken
+ *     for an ordinary space.
+ */
+export const WEDGED_FRAME_SCREEN = [
+  "",
+  " ▐▛███▛█   Claude Code v2.1.261",
+  "▝▜██████▀  Opus 5 (1M context) · Claude Max",
+  "  ▝▝ ▝▝    ~/Projects/sparkle",
+  "",
+  "",
+  "❯ Reply with exactly: hello. Nothing else.                                                                              ",
+  "",
+  "⏺ hello",
+  "",
+  "✻ Sautéed for 27s · done 10:27 PM",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "❯\u00a0                                                ← for agents                   "
+].join("\n");

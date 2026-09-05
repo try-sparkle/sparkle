@@ -138,6 +138,23 @@ const REFUSED: readonly StateRow[] = [
     "a real less pager on a document that quotes Claude Code's chrome",
     LESS_ON_A_MARKDOWN_FILE,
   ],
+  // ── A REAL CLAUDE CODE, AND STILL CORRECTLY REFUSED (bead sparkle-4utugq) ──────────────────
+  // The odd one out in this list, and the reason it belongs here rather than in SERVED: the
+  // SESSION is an ordinary idle Claude Code, but the FRAME is not a frame Claude Code ever drew.
+  // It is a real 2.1.261 byte log replayed into a grid of the wrong size, so the composer's rules
+  // are overwritten by absolutely-positioned chrome and there is no box left to recognise. This
+  // predicate reads bytes, and about these bytes `false` is the honest answer — the fix is to
+  // REPAINT and ask again (`conciergeTools/terminal.repairUnrecognisedFrameBeforeSending`), never
+  // to widen anything here until this row goes green.
+  //
+  // ⚠️ IF A LATER WIDENING MAKES THIS ROW PASS, THAT IS THE ALARM, NOT THE FIX. A predicate that
+  // recognises a frame with no composer box in it recognises an arbitrary full-screen app, which
+  // is the one widening this module's header rules out outright.
+  [
+    "WEDGED_FRAME_SCREEN",
+    "a live Claude Code whose frame was painted for a geometry the pane no longer has",
+    incident.WEDGED_FRAME_SCREEN,
+  ],
 ];
 
 // ══ REAL CLAUDE CODE, DELIBERATELY NOT SERVED BY THIS PREDICATE ═════════════════════════════════
