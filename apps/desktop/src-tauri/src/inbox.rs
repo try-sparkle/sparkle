@@ -746,14 +746,122 @@ pub fn pending(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxMessage> {
 /// `scripts/inbox-capacity-tag-check.sh` fails CI if the two literals ever differ.
 pub const CAPACITY_TAG: &str = "[inbox-capacity]";
 
-/// Queue a message. Returns its id.
+/// How long the OLDEST STILL-PENDING message must have waited before this module will say a queue is
+/// STALLED rather than merely busy — the evidence the operator interlock in `enqueue_in_lane` turns
+/// on (bead `sparkle-eou3y0.1`).
 ///
-/// CAPACITY IS SEVERITY-AWARE (see `FYI_CEILING`). `Act` is judged against the full `MAX_PER_AGENT`
-/// and REFUSED when those slots are genuinely full of `act`. `Fyi` is judged against `FYI_CEILING`
-/// and is a RING BUFFER: at the ceiling it evicts the stalest pending `fyi` and admits the new one,
-/// so context traffic can neither lock out an action message (the reserve) nor turn a live one away
-/// (the eviction). An `fyi` never evicts an `act`; if the ceiling is reached with no `fyi` to evict
-/// — every slot is `act` — that lone case stays a refusal.
+/// MIRRORED IN TYPESCRIPT as `NOT_DRAINING_AFTER_MS` in
+/// `apps/desktop/src/services/conciergeTools/fleet.ts`, where the same age decides the
+/// `notDraining` flag on a send receipt. Two literals in two languages are two numbers that look
+/// like one, so `scripts/inbox-stall-threshold-check.sh` reads both and fails if they ever differ.
+/// Change one, change both.
+///
+/// THE DRIFT GUARD IS A SHELL SCRIPT, NOT A RUST TEST, and that is deliberate — the same shape
+/// `CAPACITY_TAG` already uses. A Rust test reading a `.ts` file is a CROSS-BOUNDARY READ, and
+/// `.github/workflows/ci.yml`'s `RUST_RE` has to name every such path or the Rust legs do not run
+/// on the change that breaks the guard. Adding `fleet.ts` there would make every edit to the
+/// concierge's hottest tool file compile the whole crate. A shell guard needs no entry: the shell
+/// suite runs on every change, so it fires on a `fleet.ts`-only edit for free.
+///
+/// WHY TWO HOURS. It has to sit above the longest plausible single turn, because a drain only runs
+/// at a turn boundary: the desktop unit stage alone is ~22 minutes, so anything on the order of
+/// minutes would call an ordinary long turn a stall. It also has to sit well below `MAX_AGE_MS`
+/// (12h), or a record would expire before it could ever be judged stalled.
+pub(crate) const NOT_DRAINING_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// WHICH LANE A SEND ARRIVES ON — the one thing that distinguishes a repair message from the
+/// traffic that filled the queue.
+///
+/// THE DEADLOCK THIS EXISTS FOR (bead `sparkle-eou3y0.1`, measured on this machine). The app-owned
+/// agent's inbox had never once drained; 42 `act` messages accumulated, all of them from ordinary
+/// senders. At that depth every `fyi` is refused (an `fyi` never evicts an `act`) and every further
+/// `act` is refused at `MAX_PER_AGENT` — so the ONLY channel that could carry "your drain hook is
+/// dead" was shut by the dead drain itself. THE FAULT SEALED ITS OWN REPAIR CHANNEL, and the only
+/// thing that reopened it for days was a human relaying by hand.
+///
+/// So a full queue must never be the reason a message ABOUT the full queue is refused. `Operator`
+/// is the lane the concierge sends on, and it is the ONLY lane allowed to displace an existing
+/// `act` — and even then only against evidence that the queue is stalled (see
+/// `operator_may_displace`).
+///
+/// NOT DERIVED FROM THE `from` LABEL, DELIBERATELY. `from` is caller-supplied and half of it is an
+/// agent's own display name, which `rename_agent` lets any agent choose — so `from == "concierge"`
+/// is forgeable by the very traffic this lane is meant to outrank. The lane is a separate,
+/// explicit argument that the ordinary `enqueue` cannot pass, which is also why the DEFAULT is the
+/// safe one: a caller that has never heard of this enum gets `Ordinary` and no eviction power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Lane {
+    /// Peers, the pipeline-health escalation, the mention watch — everything that can flood.
+    #[default]
+    Ordinary,
+    /// The concierge, and a human operator acting through it. May displace, under the interlock.
+    Operator,
+}
+
+/// How long the oldest still-pending message has waited, or `None` when nothing is pending.
+///
+/// THE ONE PIECE OF EVIDENCE HERE THAT RETENTION CANNOT RESET, and that is the whole reason this is
+/// the signal rather than the obvious one. The obvious way to ask "is this recipient draining?" is
+/// `delivered == 0 && acknowledged == 0`, and it is WRONG: both counters are derived by iterating
+/// the records still present in `<agent>.jsonl`, and `retention::reap_inbox` compacts that file at
+/// `2 x MAX_AGE_MS`. A healthy long-lived agent that delivered and acked yesterday reads zero on
+/// both today — so keying the interlock on the counters would let an operator evict live mail from
+/// a WORKING agent. An oldest-pending age cannot lie that way: the record it names is BY DEFINITION
+/// still in the file, because it is one of the records being measured.
+///
+/// Same definition as [`InboxStatus::oldest_pending_ms`], one step further on: that reports the
+/// timestamp, this reports the wait. Taken as a `min` over the records rather than assumed from
+/// their order — the file is append-only today, but "the first one is the oldest" is an ordering
+/// assumption and a `min` costs nothing.
+fn oldest_wait_ms(queued: &[InboxMessage], now: i64) -> Option<i64> {
+    queued.iter().map(|m| m.ts).min().map(|ts| now.saturating_sub(ts))
+}
+
+/// THE INTERLOCK. May an operator send displace an existing message to make room?
+///
+/// Two conjuncts, and BOTH are load-bearing:
+///
+/// 1. The send is on the [`Lane::Operator`] lane. Ordinary traffic can never displace anything, so
+///    the flood that fills a queue can never also be what empties it.
+/// 2. The queue is PROVABLY STALLED — the oldest still-pending message has waited longer than
+///    [`NOT_DRAINING_AFTER_MS`], which is longer than any turn. A full queue that is merely BUSY is
+///    still protected: its mail is going to be delivered at the recipient's next boundary, and it is
+///    not the operator's to displace. An interlock that always fired would be a ceiling with extra
+///    steps.
+///
+/// WRITTEN AS AN EXPLICIT `return`, against Rust idiom and with the clippy lint allowed, because
+/// that is the line shape `scripts/mutation-check.sh --bidirectional` can collapse in BOTH
+/// directions (`return true;` widens, `return false;` narrows). A predicate that both blocks and
+/// allows is only verified when a mutant in each direction reds a test — see `AGENTS.md` — and this
+/// one's widening direction is the dangerous one: it would quietly evict a healthy agent's mail.
+#[allow(clippy::needless_return)]
+fn operator_may_displace(lane: Lane, queued: &[InboxMessage], now: i64) -> bool {
+    let operator = matches!(lane, Lane::Operator);
+    let stalled = oldest_wait_ms(queued, now).unwrap_or(0) >= NOT_DRAINING_AFTER_MS;
+    return operator && stalled;
+}
+
+/// Render a wait as something a reader can act on. A refusal that says `11532000ms` has told the
+/// reader a number they must convert before they can judge it.
+fn format_wait(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    let mins = secs / 60;
+    let hours = mins / 60;
+    if hours > 0 {
+        format!("{}h {}m", hours, mins % 60)
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Queue a message on the ORDINARY lane. Returns its id.
+///
+/// The signature every existing caller already has, and the safe default: ordinary traffic can
+/// never displace anything. See [`enqueue_in_lane`] for the whole capacity contract, and [`Lane`]
+/// for why a caller that has never heard of the operator lane must not get its powers by accident.
 pub fn enqueue(
     app_data: &Path,
     agent_id: &str,
@@ -762,6 +870,35 @@ pub fn enqueue(
     from: &str,
     now: i64,
     id: String,
+) -> Result<String, String> {
+    enqueue_in_lane(app_data, agent_id, text, severity, from, now, id, Lane::Ordinary)
+}
+
+/// Queue a message on a named [`Lane`]. Returns its id.
+///
+/// CAPACITY IS SEVERITY-AWARE (see `FYI_CEILING`). `Act` is judged against the full `MAX_PER_AGENT`
+/// and REFUSED when those slots are genuinely full of `act`. `Fyi` is judged against `FYI_CEILING`
+/// and is a RING BUFFER: at the ceiling it evicts the stalest pending `fyi` and admits the new one,
+/// so context traffic can neither lock out an action message (the reserve) nor turn a live one away
+/// (the eviction). An `fyi` never evicts an `act`; if the ceiling is reached with no `fyi` to evict
+/// — every slot is `act` — that lone case stays a refusal.
+///
+/// AND CAPACITY IS NOW LANE-AWARE TOO (bead `sparkle-eou3y0.1`). An `act` on the [`Lane::Operator`]
+/// lane, arriving at a queue that `operator_may_displace` judges STALLED, evicts the stalest
+/// still-pending record and is admitted. That is the one thing standing between this queue and a
+/// deadlock in which the message reporting a dead drain is refused BY the dead drain. Every other
+/// combination is refused exactly as before — including an operator `act` at a full queue that is
+/// merely busy, because a healthy recipient's mail is not the operator's to displace.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_in_lane(
+    app_data: &Path,
+    agent_id: &str,
+    text: &str,
+    severity: Severity,
+    from: &str,
+    now: i64,
+    id: String,
+    lane: Lane,
 ) -> Result<String, String> {
     validate_agent_id(agent_id)?;
     // Sanitize BEFORE the emptiness check, not after: a body made entirely of control characters is
@@ -811,27 +948,115 @@ pub fn enqueue(
                     // and a bare "refused" cannot be acted on at all.
                     None => {
                         let depth = queued.len();
+                        let stall_threshold = format_wait(NOT_DRAINING_AFTER_MS);
                         return Err(format!(
                             "{CAPACITY_TAG} inbox: {agent_id} has {depth} message(s) pending against the \
                              {FYI_CEILING}-message `fyi` ceiling and EVERY ONE of them is an `act`, \
                              which an `fyi` never evicts — so there is nothing to make room and \
-                             nothing was queued. This clears only when that agent drains its queue: \
-                             do not re-send. A peer send is always `fyi` and cannot be escalated; if \
-                             it cannot wait, ask the concierge, whose `act` sends are judged against \
-                             the {MAX_PER_AGENT}-message ceiling instead"
+                             nothing was queued: do not re-send. A peer send is always `fyi` and \
+                             cannot be escalated; if it cannot wait, ask the concierge, whose `act` \
+                             sends are judged against the {MAX_PER_AGENT}-message ceiling instead — \
+                             and which, once this queue has been stalled longer than \
+                             {stall_threshold}, gets through it by displacing the stalest message \
+                             rather than waiting for a drain that is not coming"
                         ));
                     }
                 }
             }
-            // `Act` is consequential: never evicted, and it never evicts. When its slots are
-            // genuinely full of `act`, that send alone is refused, exactly as before.
+            // `Act` is consequential: never evicted, and it never evicts — with ONE narrow
+            // exception, which is the whole of bead `sparkle-eou3y0.1`.
+            //
+            // THE DEADLOCK. Below, this arm was an unconditional refusal, and its remedy text told
+            // the reader to wait for the recipient to drain its queue. On the measured inbox that
+            // was a DEAD INSTRUCTION: the drain hook had never been registered, so the queue could
+            // not drain, so the message saying "your drain hook is dead" was refused by the dead
+            // drain. `AGENTS.md`'s rule — a refusal is an instruction the user will follow, so the
+            // alternative it names must be safe and reachable under the SAME conditions that
+            // triggered the refusal — was broken twice over: unreachable, and there was no other
+            // way in.
+            //
+            // THE INTERLOCK. An `act` on the operator lane, arriving at a queue whose oldest
+            // still-pending message has waited longer than any turn, displaces THAT message — the
+            // very record the stall evidence names — and is admitted. Nothing else changes: an
+            // ordinary `act` still cannot displace anything, and an operator `act` at a queue that
+            // is merely BUSY is refused, because an interlock that always fired would be a ceiling
+            // with extra steps and would let an operator quietly evict a healthy agent's mail.
+            //
+            // WHY THE STALEST RECORD OVERALL, not the stalest `act` and not a `fyi` first. It is
+            // the one record the evidence actually speaks about: `operator_may_displace` is true
+            // BECAUSE that record has waited too long, so removing it is the one eviction the
+            // proof covers. A second selection policy would be a second thing to keep in step with
+            // the proof, for no gain — every record in this queue is past the same threshold.
             Severity::Act => {
                 let depth = queued.len();
-                return Err(format!(
-                    "{CAPACITY_TAG} inbox: {agent_id} already has {depth} undelivered messages, at the \
-                     {MAX_PER_AGENT}-message ceiling; it is not draining them — check its Level 0 \
-                     verdict before sending more"
-                ));
+                let waited = oldest_wait_ms(&queued, now).unwrap_or(0);
+                let waited_for = format_wait(waited);
+                let stall_threshold = format_wait(NOT_DRAINING_AFTER_MS);
+                if operator_may_displace(lane, &queued, now) {
+                    if let Some(victim) = queued.iter().min_by_key(|m| m.ts) {
+                        evict_message(&messages_path(app_data, agent_id), &victim.id)?;
+                    }
+                    // ...and fall through to the append. The eviction happens BEFORE it, so
+                    // `pending().len() <= MAX_PER_AGENT` still holds for every lane.
+                } else if matches!(lane, Lane::Operator) {
+                    // The operator lane, refused — and this is the arm that MUST stay reachable,
+                    // or the interlock is a ceiling with extra steps.
+                    //
+                    // IT MUST NOT CERTIFY THE RECIPIENT HEALTHY, and an earlier draft did (roborev
+                    // job 81327, a High, and it was right). The age proves ONE direction only: a
+                    // wait under the threshold says no record has been sitting longer than a turn,
+                    // NOT that anything drains. A queue whose drain hook is dead and which fills
+                    // all fifty `act` slots inside two hours — the pipeline-health escalation, the
+                    // mention watch and peer traffic all write here — is byte-identical from this
+                    // side to a healthy busy one. Saying "that queue is draining, retry after its
+                    // next turn boundary" in that window is both an unproven claim and a dead
+                    // instruction pointing at a boundary that will never come: precisely the two
+                    // shapes (`sparkle-6yrvqd`, `sparkle-8bvh`) this commit removed from the OLD
+                    // refusal, reinstated with the polarity flipped. So it states only what the age
+                    // proves, and names the second signal that settles the rest.
+                    return Err(format!(
+                        "{CAPACITY_TAG} inbox: {agent_id} already has {depth} undelivered messages, \
+                         at the {MAX_PER_AGENT}-message ceiling. The operator lane may displace a \
+                         message only once a queue is PROVABLY stalled, and this one is not yet \
+                         provable: its oldest still-pending message has waited {waited_for}, under \
+                         the {stall_threshold} that is longer than any turn. THAT IS NOT A CLEAN \
+                         BILL OF HEALTH — a queue that filled up inside {stall_threshold} looks \
+                         the same from here whether it drains or not, so the wait proves nothing \
+                         about the recipient's drain in either direction. Nothing was queued. If \
+                         you have INDEPENDENT evidence the drain is dead — `inbox_status` showing \
+                         `delivered` and `acknowledged` not advancing across turns, or no `Stop` \
+                         hook registered in the recipient's `.claude/settings.local.json` — repair \
+                         that drain, which is the actual fault; otherwise retry after the \
+                         recipient's next turn boundary"
+                    ));
+                } else if waited >= NOT_DRAINING_AFTER_MS {
+                    return Err(format!(
+                        "{CAPACITY_TAG} inbox: {agent_id} already has {depth} undelivered messages, \
+                         at the {MAX_PER_AGENT}-message ceiling, and its oldest still-pending \
+                         message has waited {waited_for} — longer than any turn, so that queue is \
+                         NOT draining and waiting will not clear it. Nothing was queued: do not \
+                         re-send. The concierge's operator lane is the one channel that reaches a \
+                         stalled queue — it displaces the stalest message to make room — so \
+                         escalate to the concierge rather than retrying this send"
+                    ));
+                } else {
+                    // Same honesty rule as the operator arm above: the age is one-directional
+                    // evidence, so this says what it proves and points at the signal that decides
+                    // the rest, rather than certifying a recipient it cannot see.
+                    return Err(format!(
+                        "{CAPACITY_TAG} inbox: {agent_id} already has {depth} undelivered messages, \
+                         at the {MAX_PER_AGENT}-message ceiling, and its oldest still-pending \
+                         message has waited {waited_for} — under the {stall_threshold} at which a \
+                         queue can be called stalled. THAT IS NOT PROOF THE RECIPIENT IS FINE: a \
+                         queue that filled up inside {stall_threshold} looks the same from here \
+                         whether it drains or not. Nothing was queued. Retry after the recipient's \
+                         next turn boundary; if that does not clear it, the drain itself is the \
+                         fault — `inbox_status`'s `delivered` and `acknowledged`, and whether a \
+                         `Stop` hook is registered in the recipient's `.claude/settings.local.json`, \
+                         are what say so — and the concierge's operator lane can displace once the \
+                         wait passes {stall_threshold}"
+                    ));
+                }
             }
         }
     }
@@ -1144,6 +1369,13 @@ fn resolve_from(from: Option<String>) -> String {
 /// exact previous behaviour without passing anything. An agent-to-agent peer send supplies the
 /// display label instead; see [`InboxMessage::from`]. The label is sanitized inside `enqueue` — this
 /// command does not trust it, and neither should any future caller.
+///
+/// `lane` names WHO is sending, and DEFAULTS TO [`Lane::Ordinary`] — the safe value — so every
+/// pre-existing caller keeps its exact previous behaviour without passing anything. Only the
+/// concierge's own tool surface (`conciergeTools/fleet.ts`'s `inboxSend`) passes
+/// `lane: "operator"`; `services/peerMessaging.ts` and the mention watch do not, so agent traffic
+/// cannot reach the eviction path. See [`Lane`] for why this is an explicit argument rather than
+/// something inferred from the `from` label, which an agent can choose for itself.
 #[tauri::command]
 pub async fn inbox_send(
     app: AppHandle,
@@ -1151,9 +1383,11 @@ pub async fn inbox_send(
     text: String,
     severity: Option<Severity>,
     from: Option<String>,
+    lane: Option<Lane>,
 ) -> Result<String, String> {
     let base = app_data(&app)?;
     let sev = severity.unwrap_or(Severity::Fyi);
+    let lane = lane.unwrap_or_default();
     let from = resolve_from(from);
     tauri::async_runtime::spawn_blocking(move || {
         // MAKE SURE SOMETHING CAN COLLECT THIS BEFORE WE PUT IT IN THE BOX (bead sparkle-6yrvqd).
@@ -1174,7 +1408,7 @@ pub async fn inbox_send(
         // filesystem work and this command exists on the blocking pool precisely so that work
         // cannot park the main thread in front of the concierge's control surface.
         crate::hooks::heal_app_owned_drain_hooks(&app, &agent_id);
-        enqueue(&base, &agent_id, &text, sev, &from, now_ms(), uuid_v4())
+        enqueue_in_lane(&base, &agent_id, &text, sev, &from, now_ms(), uuid_v4(), lane)
     })
     .await
     .map_err(|e| format!("inbox_send task failed: {e}"))?
@@ -1408,6 +1642,44 @@ mod tests {
     /// Same as [`send`] but at [`Severity::Act`] — the class judged against the full ceiling.
     fn send_act(base: &Path, agent: &str, text: &str, now: i64, id: &str) -> Result<String, String> {
         enqueue(base, agent, text, Severity::Act, "concierge", now, id.to_string())
+    }
+
+    /// An `act` on the OPERATOR lane — what the concierge's own tool surface sends.
+    ///
+    /// Goes through `enqueue_in_lane`, the real production entry point, rather than reaching past it
+    /// to the interlock predicate: a test that drove `operator_may_displace` directly would prove
+    /// the predicate and say nothing about whether `enqueue` consults it.
+    fn send_act_operator(
+        base: &Path,
+        agent: &str,
+        text: &str,
+        now: i64,
+        id: &str,
+    ) -> Result<String, String> {
+        enqueue_in_lane(
+            base,
+            agent,
+            text,
+            Severity::Act,
+            "concierge",
+            now,
+            id.to_string(),
+            Lane::Operator,
+        )
+    }
+
+    /// Fill an inbox to the full `act` ceiling, every message stamped `at`. Returns the ids, oldest
+    /// first, so a caller can name the one the interlock is supposed to displace.
+    fn fill_with_acts(base: &Path, agent: &str, at: i64) -> Vec<String> {
+        (0..MAX_PER_AGENT)
+            .map(|i| {
+                let id = format!("a{i}");
+                // Distinct `ts` per message so "the stalest" is unambiguous — the assertions below
+                // must not rest on the file-order tie-break.
+                send_act(base, agent, "queued work", at + i as i64, &id).unwrap();
+                id
+            })
+            .collect()
     }
 
     /// Same as [`send`] but names the sender — the peer-messaging path. A separate helper rather than
@@ -2197,7 +2469,15 @@ mod tests {
             send_act(&base, "a1", "msg", 1_000, &format!("m{i}")).unwrap();
         }
         let err = send_act(&base, "a1", "one too many", 1_000, "overflow").unwrap_err();
-        assert!(err.contains("not draining"), "got: {err}");
+        // The refusal names the ceiling it was judged against. It does NOT claim the recipient is
+        // failing to drain: every record here was stamped this instant, and accusing a queue of a
+        // dead drain on no evidence is the false accusation `oldest_pending_ms` exists to prevent
+        // (bead sparkle-6yrvqd). The stalled wording has its own test in the interlock block below.
+        assert!(err.contains(&format!("{MAX_PER_AGENT}-message ceiling")), "got: {err}");
+        assert!(
+            !err.contains("NOT draining"),
+            "a queue filled this instant must not be accused of a dead drain: {err}"
+        );
         // And the refusal did not corrupt what was already queued.
         assert_eq!(pending(&base, "a1", 1_000).len(), MAX_PER_AGENT);
         std::fs::remove_dir_all(&base).ok();
@@ -2238,7 +2518,7 @@ mod tests {
 
         // The reserve is a reserve, not a raise: `act` is still refused past the full ceiling.
         let err = send_act(&base, "a1", "one too many", 1_000, "a-overflow").unwrap_err();
-        assert!(err.contains("not draining"), "got: {err}");
+        assert!(err.contains(&format!("{MAX_PER_AGENT}-message ceiling")), "got: {err}");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2447,6 +2727,248 @@ mod tests {
             "the refusal must name the ceiling that depth is judged against: {err}"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ── THE CAPACITY INTERLOCK (bead sparkle-eou3y0.1) ────────────────────────────────────────
+    //
+    // A full queue must never be the reason a message ABOUT the full queue is refused. Measured:
+    // the app-owned agent's inbox had never once drained, 42 `act` messages accumulated, and every
+    // channel in was then shut by the same fault — so the only thing that reopened it for days was
+    // a human relaying by hand.
+    //
+    // The pair below is the whole contract, and NEITHER HALF IS SUFFICIENT ALONE. The first proves
+    // the operator lane reaches a stalled queue; the second proves it does NOT reach a busy one,
+    // because an interlock that always fires is a ceiling with extra steps that quietly evicts a
+    // healthy agent's mail. `scripts/mutation-check.sh --bidirectional` on
+    // `operator_may_displace`'s verdict line reds the first when narrowed and the second when
+    // widened.
+
+    /// THE SIDE EFFECT, not the absence of a refusal: the operator's `act` is READABLE BACK OUT of
+    /// the queue, the displaced record is the stalest one, and the queue did not grow past its
+    /// ceiling. Asserting only `is_ok()` would pass against an `enqueue` that returned an id for a
+    /// message it never persisted — the exact lie `sparkle-bbghz` was about.
+    ///
+    /// Non-vacuous by construction: before this change the same send was REFUSED, so the `expect`
+    /// below panics against the previous code.
+    #[test]
+    fn an_operator_act_reaches_a_full_queue_that_is_provably_stalled() {
+        let base = tmp("interlock-stalled");
+        let filled_at = 1_000_000_000_000i64;
+        let ids = fill_with_acts(&base, "a1", filled_at);
+        // Judged LONG after the fill: every record has waited past the stall threshold, which is
+        // the evidence `retention` cannot reset — unlike `delivered == 0`, which a healthy
+        // long-lived agent also reads a day after its last delivery.
+        let now = filled_at + NOT_DRAINING_AFTER_MS + 60_000;
+
+        send_act_operator(&base, "a1", "your Stop hook is not registered", now, "operator-1")
+            .expect("an operator `act` must reach a stalled queue — that is the repair channel");
+
+        let after = pending(&base, "a1", now);
+        assert_eq!(
+            after.len(),
+            MAX_PER_AGENT,
+            "the interlock displaces before it appends: the ceiling still holds"
+        );
+        assert!(
+            after.iter().any(|m| m.id == "operator-1"),
+            "the operator's message was not admitted — an id is not delivery"
+        );
+        assert!(
+            !after.iter().any(|m| m.id == ids[0]),
+            "the displaced record must be the STALEST one ({}), the record the stall evidence names",
+            ids[0]
+        );
+        assert!(
+            after.iter().any(|m| m.id == ids[1]),
+            "only ONE record may be displaced — the second-stalest is still queued"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE OTHER HALF, and the one that stops this becoming a new outage: a full queue whose
+    /// stall is NOT YET PROVABLE refuses the operator too, and loses nothing.
+    ///
+    /// Asserts on the QUEUE, not only on the refusal string. A test that checked `is_err()` alone
+    /// would pass against an implementation that evicted a healthy agent's message and THEN
+    /// refused — which is the worst outcome available here, since the mail is gone and the sender
+    /// was told nothing was queued.
+    #[test]
+    fn a_full_queue_not_yet_proved_stalled_refuses_the_operator_and_loses_nothing() {
+        let base = tmp("interlock-draining");
+        let filled_at = 1_000_000_000_000i64;
+        let ids = fill_with_acts(&base, "a1", filled_at);
+        // One minute UNDER the threshold: full, but every record is younger than a long turn, so
+        // this queue is going to drain at the recipient's next boundary.
+        let now = filled_at + NOT_DRAINING_AFTER_MS - 60_000;
+
+        let err = send_act_operator(&base, "a1", "operator traffic", now, "operator-1")
+            .expect_err("a full queue with no stall proof must still refuse the operator lane");
+
+        let after = pending(&base, "a1", now);
+        assert_eq!(after.len(), MAX_PER_AGENT, "a refusal must not change the queue's depth");
+        for id in &ids {
+            assert!(
+                after.iter().any(|m| &m.id == id),
+                "the refusal displaced {id} — a healthy recipient's mail was destroyed"
+            );
+        }
+        assert!(
+            !after.iter().any(|m| m.id == "operator-1"),
+            "nothing was queued, so the refused message must not be in the queue either"
+        );
+
+        // AND THE REFUSAL IS AN INSTRUCTION SOMEONE WILL FOLLOW, so it must be reachable and safe
+        // under the very condition that produced it: this queue drains on its own, so "wait" is
+        // both true and actionable.
+        assert!(err.contains(CAPACITY_TAG), "every capacity refusal carries the tag: {err}");
+        assert!(
+            err.contains("turn boundary"),
+            "the remedy must name the event that clears this state: {err}"
+        );
+        assert!(
+            !err.contains("NOT draining"),
+            "a queue one minute under the threshold must not be ACCUSED of a dead drain: {err}"
+        );
+        assert!(
+            !err.contains("is draining"),
+            "nor may it CERTIFY one — the age proves neither direction: {err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ORDINARY TRAFFIC CAN NEVER DISPLACE, stalled or not — the flood that fills a queue must
+    /// never be the traffic that empties it.
+    ///
+    /// This is the conjunct a lane-blind interlock would drop, and the suite could not see it
+    /// otherwise: every other test here sends on one lane or the other, so only a case that is
+    /// stalled AND ordinary separates "the queue is stalled" from "the operator is asking".
+    #[test]
+    fn ordinary_traffic_cannot_displace_even_a_stalled_queue() {
+        let base = tmp("interlock-ordinary");
+        let filled_at = 1_000_000_000_000i64;
+        let ids = fill_with_acts(&base, "a1", filled_at);
+        let now = filled_at + NOT_DRAINING_AFTER_MS + 60_000;
+
+        let err = send_act(&base, "a1", "ordinary act", now, "ordinary-1")
+            .expect_err("only the operator lane may displace");
+
+        let after = pending(&base, "a1", now);
+        assert_eq!(after.len(), MAX_PER_AGENT, "an ordinary refusal must not change the queue");
+        assert!(after.iter().any(|m| m.id == ids[0]), "ordinary traffic displaced the stalest record");
+
+        // THE REMEDY MUST BE ONE THIS SENDER CAN ACTUALLY FOLLOW. The old text told it to wait for
+        // a drain that, on a stalled queue, is exactly what is not happening — a dead instruction
+        // (`AGENTS.md`, "User-facing copy is code"). It now names the lane that does get through.
+        assert!(
+            err.contains("escalate to the concierge"),
+            "a stalled-queue refusal must name the channel that still reaches it: {err}"
+        );
+        assert!(
+            !err.contains("retry after"),
+            "it must not tell a sender to retry into a queue that is not draining: {err}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE FILL-FAST-THEN-DIE CASE — the one an under-threshold refusal must not lie about
+    /// (roborev job 81327, a High).
+    ///
+    /// The stall age is ONE-DIRECTIONAL evidence. A wait past the threshold proves a dead drain; a
+    /// wait under it proves NOTHING — a queue whose drain hook has never been registered and which
+    /// fills all fifty `act` slots in minutes (the pipeline-health escalation, the mention watch
+    /// and peer traffic all write here) is byte-identical, from inside `enqueue`, to a healthy busy
+    /// one. Both refusals in that window therefore have to say what the age proves and no more, and
+    /// name the second signal that settles the rest.
+    ///
+    /// PAIRED, NEVER NEGATIVE-ONLY (`AGENTS.md`, the copy-ratchet rule). Banning the false claim
+    /// alone passes over copy trimmed to silence, which leaves the reader with exactly the
+    /// inference that was wrong; demanding the true statement alone passes over copy that also
+    /// still carries the lie. Both halves, on both refusals, because they are two different texts.
+    #[test]
+    fn an_under_threshold_refusal_never_certifies_the_recipient_healthy() {
+        let base = tmp("interlock-fill-fast");
+        // A queue that filled THIS INSTANT — the shape a dead drain produces just as readily as a
+        // busy recipient, and the shape every wait-and-retry remedy is wrong about.
+        let filled_at = 1_000_000_000_000i64;
+        for i in 0..MAX_PER_AGENT {
+            send_act(&base, "a1", "doorbell", filled_at, &format!("a{i}")).unwrap();
+        }
+        let now = filled_at + 1_000;
+
+        for (label, err) in [
+            (
+                "operator",
+                send_act_operator(&base, "a1", "repair", now, "op-1")
+                    .expect_err("no stall proof yet, so even the operator is refused"),
+            ),
+            (
+                "ordinary",
+                send_act(&base, "a1", "ordinary", now, "ord-1")
+                    .expect_err("ordinary traffic is refused at the ceiling"),
+            ),
+        ] {
+            // NEGATIVE: it must not assert a fact the age cannot support.
+            for lie in ["is draining", "IS moving", "will drain"] {
+                assert!(
+                    !err.contains(lie),
+                    "the {label} refusal claims {lie:?} about a queue that may have a dead drain: {err}"
+                );
+            }
+            // POSITIVE: and it must state the true thing in its place, or a reader is left with the
+            // same wrong inference the lie produced.
+            assert!(
+                err.contains("filled up inside"),
+                "the {label} refusal must say WHY the wait proves nothing here: {err}"
+            );
+            // ...and name the evidence that does settle it, so the remedy is reachable even when
+            // the recipient really is dead.
+            assert!(
+                err.contains("`delivered`") && err.contains(".claude/settings.local.json"),
+                "the {label} refusal must name the second signal — counters and the Stop hook: {err}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE BOUNDARY, pinned from both sides. The threshold is the whole safety argument: a value
+    /// that drifted down would let an operator displace an ordinary long turn's mail, and one that
+    /// drifted up would re-seal the repair channel.
+    #[test]
+    fn the_interlock_opens_exactly_at_the_stall_threshold() {
+        let filled_at = 1_000_000_000_000i64;
+
+        let base = tmp("interlock-at");
+        fill_with_acts(&base, "a1", filled_at);
+        // The oldest record is stamped `filled_at`, so `now` here makes its wait exactly the
+        // threshold — `>=`, so it is admitted.
+        send_act_operator(&base, "a1", "at the bound", filled_at + NOT_DRAINING_AFTER_MS, "at")
+            .expect("exactly at the threshold the queue is stalled");
+        std::fs::remove_dir_all(&base).ok();
+
+        let base = tmp("interlock-under");
+        fill_with_acts(&base, "a1", filled_at);
+        send_act_operator(&base, "a1", "one under", filled_at + NOT_DRAINING_AFTER_MS - 1, "under")
+            .expect_err("one millisecond under the threshold the queue is not yet stalled");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The cross-language half of this threshold is guarded by
+    // `scripts/inbox-stall-threshold-check.sh`, not from here. A Rust test reading `fleet.ts` is a
+    // cross-boundary read that `ci.yml`'s `RUST_RE` would then have to name, which would make every
+    // edit to the concierge's hottest tool file compile the whole crate; the shell suite runs on
+    // every change and needs no such entry. See the note on `NOT_DRAINING_AFTER_MS`.
+
+    /// A refusal that prints `7200000ms` has handed the reader a number to convert before they can
+    /// judge it. Asserts the VALUES, not merely that a string comes back.
+    #[test]
+    fn a_wait_is_rendered_for_a_human() {
+        assert_eq!(format_wait(0), "0s");
+        assert_eq!(format_wait(45_000), "45s");
+        assert_eq!(format_wait(4 * 60_000), "4m");
+        assert_eq!(format_wait(NOT_DRAINING_AFTER_MS), "2h 0m");
+        assert_eq!(format_wait(3 * 60 * 60 * 1000 + 12 * 60_000), "3h 12m");
+        // Never a negative wait: a clock that went backwards must not turn a refusal into nonsense.
+        assert_eq!(format_wait(-5_000), "0s");
     }
 
     /// THE POINT OF THE WHOLE UNIT: depth is readable BEFORE a refusal, and it comes with the scale

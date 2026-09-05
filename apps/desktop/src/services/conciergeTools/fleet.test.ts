@@ -276,6 +276,32 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
    * headroom derived from it — 3 fyi and 13 act, neither of which is a constant appearing anywhere
    * in the fixture.
    */
+  /**
+   * BEAD sparkle-eou3y0.1 — THE CONCIERGE SENDS ON THE OPERATOR LANE, and this is the only place in
+   * the app that does.
+   *
+   * Rust's `Lane::Operator` is what lets a concierge `act` reach a queue that is full AND provably
+   * stalled, by displacing the stalest undelivered message. Without it the fault that fills such a
+   * queue also seals it: on the measured inbox, the message reporting a dead drain was refused BY
+   * the dead drain, and a human relayed by hand for days.
+   *
+   * PINNED BECAUSE THE FAILURE IS SILENT. `lane` is `Option<Lane>` in Rust and defaults to the safe
+   * `Ordinary`, which is right for every other caller and is exactly what makes its absence here
+   * invisible: delete the field and nothing errors, no type complains, the send still returns an
+   * id, and the deadlock is simply back. That is the defaulted-seam shape `AGENTS.md` names.
+   *
+   * Asserts the VALUE on the real `inbox_send` payload, not that some invoke happened.
+   */
+  it("sends on the OPERATOR lane, the one lane that reaches a stalled queue", async () => {
+    markLive("a1");
+    backend({ inbox_send: "m1", inbox_status: [countsRow("a1")] });
+    await inboxSend("a1", "your Stop hook is not registered", "act");
+
+    const send = invoke.mock.calls.find(([c]) => c === "inbox_send");
+    expect(send, "the send must have reached Rust at all").toBeTruthy();
+    expect((send?.[1] as Record<string, unknown>)?.lane).toBe("operator");
+  });
+
   it("carries the recipient's live queue depth on the SUCCESS receipt", async () => {
     markLive("a1");
     backend({

@@ -727,7 +727,26 @@ export async function inboxSend(
     return undeliverableRecipient("inbox_send", agentId);
   }
   try {
-    const messageId = await invoke<string>("inbox_send", { agentId, text, severity });
+    // `lane: "operator"` — THE ONE PLACE IN THE APP THAT SENDS IT (bead sparkle-eou3y0.1).
+    //
+    // Rust's `Lane::Operator` is what lets a concierge `act` reach a queue that is full AND
+    // provably stalled, by displacing the stalest undelivered message. It exists because the fault
+    // that fills such a queue also seals it: on the measured inbox, the message reporting a dead
+    // drain was refused BY the dead drain, and a human relayed by hand for days.
+    //
+    // It is safe to hardcode here and NOWHERE else. This function is reached only from
+    // `conciergeTools/registry.ts` — the concierge's own tool surface — while agent-to-agent peer
+    // traffic invokes `inbox_send` directly from `services/peerMessaging.ts`, and the mention
+    // watch from `beadMentions/beadMentionWatch.ts`; neither passes a lane, and Rust defaults the
+    // absent field to the safe `Lane::Ordinary`. So the flood that fills a queue can never be the
+    // traffic that displaces from it. Do not lift this to a parameter, and do not copy it into a
+    // path an agent can call.
+    const messageId = await invoke<string>("inbox_send", {
+      agentId,
+      text,
+      severity,
+      lane: "operator",
+    });
     // WILL ANYTHING EVER DRAIN THIS? Asked AFTER the write, of the same seam `fleetWatch` reads (plus
     // the pane-less arm above), so the receipt reports what the sweep would decide rather than a
     // second opinion about liveness.
