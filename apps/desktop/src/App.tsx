@@ -53,6 +53,7 @@ import { startEpicSweepRunner } from "./services/epicSweepRunner";
 import { startResurrectionRunner } from "./services/resurrectionRunner";
 import { startAutoApproveWatch } from "./services/suggestions/autoApproveWatch";
 import { startFleetWatch } from "./services/fleetWatch";
+import { startInboxStallWatch } from "./services/inboxStallEscalation";
 import { startBeadMentionWatch } from "./services/beadMentions/beadMentionWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPipelineHealthWatch } from "./stores/pipelineHealthStore";
@@ -128,6 +129,37 @@ function FleetWatch() {
     onIdle(() => {
       if (cancelled) return;
       stop = startFleetWatch();
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, [isMain]);
+  return null;
+}
+
+// THE RECURRENCE GUARD for a peer inbox that has stopped draining (beads sparkle-6yrvqd,
+// sparkle-eou3y0.1). `services/inboxStallEscalation` reads every ADDRESSABLE inbox on a five-minute
+// beat and pushes a diagnosis at the concierge when one has not drained in hours.
+//
+// A SEPARATE MOUNT FROM <FleetWatch/> ABOVE, DELIBERATELY. That watch reads inbox rows for its idle
+// DELIVERY CANDIDATES only, and the agent the measured outage happened to (`__sparkle_self__`) was
+// `working` throughout — never a candidate, never read, so a guard hosted there would have been
+// green for the whole eleven and a half hours. The module header carries the full comparison.
+//
+// MAIN WINDOW ONLY, like FleetWatch and for the same reason (cost, not correctness): the verdict is
+// the same in every window, and N windows reading every inbox is N times the work for one answer.
+// Deferred to idle with the rest of the boot burst — a two-hour threshold has nothing to gain from
+// being asked a second earlier. Paints no UI.
+function InboxStallWatch() {
+  const isMain = useIsMainWindow();
+  useEffect(() => {
+    if (!isMain) return;
+    let stop: (() => void) | undefined;
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      stop = startInboxStallWatch();
     });
     return () => {
       cancelled = true;
@@ -715,6 +747,7 @@ export function App() {
     <AppBoot>
       <RosterPublisher />
       <FleetWatch />
+      <InboxStallWatch />
       <InboxWatch />
       <BeadMentionWatch />
       <PipelineHealthWatch />
