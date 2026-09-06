@@ -1495,6 +1495,133 @@ describe("pr-conflicting could-not-ask", () => {
     evaluateFleetConditions([], T0, [], conflicts)!.find((c) => c.id === "pr-conflicting")!;
   const lineFor = (text: string, n: number) => text.split("\n").find((l) => l.includes(`#${n}`))!;
 
+  // ── A WHOLE REPO NOBODY ASKED ABOUT (bead sparkle-yu0h9a) ───────────────────────────────────
+  //
+  // THE MEASURED FALSE ALARM. The cross-repo sweep spent its whole 60s budget before reaching
+  // `plow-pbc/tkmx-client` and then rendered ALL 24 of its open PRs as attention rows, each
+  // annotated COULD NOT ASK GITHUB and each carrying `Blocked by: sweep-budget`. GitHub was never
+  // asked about any of them; a background task then read all 25 in ONE `gh pr list` call, inside
+  // the budget, and found 24 green and mergeable. Twenty-four items that looked like twenty-four
+  // problems were one fact about our own scheduler.
+  //
+  // 25 rows, matching the repo the bead measured.
+  const budgetSkippedRepo = (n: number): ConflictingPr[] =>
+    Array.from({ length: n }, (_, i) => ({
+      ...COULD_NOT_ASK,
+      pr: 3000 + i,
+      branch: `tkmx/feature-${i}`,
+      blockedBy: "sweep-budget",
+    }));
+
+  it("collapses a budget-skipped repo into ONE diagnostic line, not one line per PR", () => {
+    const c = report(...budgetSkippedRepo(25));
+    const bullets = c.text.split("\n").filter((l) => l.trimStart().startsWith("- "));
+    expect(
+      bullets.length,
+      "a sweep that never asked about 25 PRs must report ITSELF once, not produce 25 rows that " +
+        "each read as a PR problem",
+    ).toBe(1);
+    // ...and the one line is about the SWEEP: no PR number, no branch, nothing to act on.
+    expect(bullets[0]).toContain("never asked about on this sweep");
+    expect(bullets[0]).toContain("sweep-budget");
+    expect(bullets[0]).not.toMatch(/#\d/);
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // THE OTHER HALF OF "NOT PROMOTED": `members` drives the growth rule, so 25 unread rows each
+  // registering a member is what re-fired this report every time the round-robin cursor moved off
+  // that repo. Nothing there was read, so nothing there is growth.
+  //
+  // EXACTLY ONE, NEVER ZERO — and the zero case is the one that bites. `hasNewMember` fails OPEN on
+  // an empty fingerprint (`condition.members.length === 0` returns true), which BYPASSES the 4h
+  // cooldown and re-sends on every sweep: a worse repetition than the 25 flapping members this
+  // collapse exists to remove. An earlier cut of this test asserted `toEqual([])` and so pinned that
+  // defect AS INTENT — a mutation check cannot catch that, because it grips a wrong answer perfectly.
+  it("fingerprints a budget-skipped repo by REASON, so it neither scales nor empties", () => {
+    const c = report(...budgetSkippedRepo(25));
+    // BOUNDED BY THE REASON VOCABULARY, NOT BY PR COUNT — that is the property, not a literal count.
+    // One fixture reason plus the constant anchor, so 25 unread PRs contribute 2 members, and 250
+    // would contribute the same 2.
+    expect(c.members.length, "25 unread PRs must not contribute 25 members").toBeLessThan(3);
+    expect(c.members).toContain("unread-collapsed");
+    expect(c.members).toContain("unread-collapsed:sweep-budget");
+    expect(
+      c.members,
+      "an EMPTY fingerprint fails open in hasNewMember and defeats the 4h cooldown entirely",
+    ).not.toEqual([]);
+  });
+
+  // ...and it does not scale: the same members whatever the size of the unread repo, so the cursor
+  // moving on and off that repo cannot read as growth.
+  it("emits the SAME collapsed members whether the repo holds 5 unread PRs or 50", () => {
+    const five = report(...budgetSkippedRepo(5)).members;
+    const fifty = report(...budgetSkippedRepo(50)).members;
+    expect(five).toEqual(fifty);
+  });
+
+  // ── THE FINGERPRINT MUST BE MONOTONE, NOT MERELY NON-EMPTY ──────────────────────────────────
+  //
+  // `collapsedUnread` pools rows from the WHOLE snapshot, not one repo, so the reason set moves as
+  // the round-robin cursor and the per-project probe backoff do. Encoded as ONE JOINED STRING,
+  // `{sweep-budget}` → `{gh-failed, sweep-budget}` → `{sweep-budget}` yields three DIFFERENT single
+  // members, so the set SHRINKING looks like a member the stamp has never seen: `hasNewMember`
+  // fires and the 4h cooldown is bypassed — the same hole as an empty `members`, reached from the
+  // other side. Per-reason members make losing a reason a strict SUBSET, which is the growth-only
+  // invariant the `pr:N` / `pr:N:conflicting` pair twenty lines above exists to keep.
+  it("makes a SHRINKING reason set a strict subset, so it cannot read as growth", () => {
+    const twoReasons = report(
+      ...budgetSkippedRepo(12).map((c, i) => ({
+        ...c,
+        blockedBy: i % 2 === 0 ? "sweep-budget" : "gh-failed",
+      })),
+    ).members;
+    const oneReason = report(...budgetSkippedRepo(12)).members; // sweep-budget only
+
+    expect(twoReasons).toContain("unread-collapsed:gh-failed");
+    expect(twoReasons).toContain("unread-collapsed:sweep-budget");
+    expect(
+      oneReason.every((m) => twoReasons.includes(m)),
+      "dropping a reason must be a SUBSET of the previous sweep's members, never a new member",
+    ).toBe(true);
+  });
+
+  // A collapsed half with NO stated reason must still be fingerprintable: `blockedBy` is optional,
+  // and zero members re-opens the fail-open hole. The anchor is a CONSTANT rather than a sentinel
+  // so that gaining a reason later is growth-only rather than a swap.
+  it("still fingerprints a collapsed half whose rows state no reason", () => {
+    const noReason = report(
+      ...budgetSkippedRepo(12).map((c) => ({ ...c, blockedBy: undefined })),
+    ).members;
+    expect(noReason.length, "an empty fingerprint fails open and defeats the cooldown").toBeGreaterThan(0);
+    // ...and it is a subset of the reasoned case, so stating a reason later is growth, not a swap.
+    const withReason = report(...budgetSkippedRepo(12)).members;
+    expect(noReason.every((m) => withReason.includes(m))).toBe(true);
+  });
+
+  // THE PAIRED NEGATIVE, and it is what stops this becoming the opposite bug. An unread row whose
+  // last successful read said CONFLICTING carries a real, recent verdict; collapsing those is the
+  // over-correction roborev 75149 records, which suppressed a standing conflict for a whole
+  // outage. They keep their own rows however many of them there are.
+  it("never collapses unread rows that were last known to be CONFLICTING", () => {
+    const conflicting = budgetSkippedRepo(25).map((c) => ({ ...c, kind: "conflicting" as const }));
+    const c = report(...conflicting);
+    const bullets = c.text.split("\n").filter((l) => l.trimStart().startsWith("- "));
+    expect(
+      bullets.length,
+      "a real, recent conflict verdict is not noise just because we could not re-read it",
+    ).toBe(25);
+    expect(c.members.length).toBeGreaterThan(0);
+  });
+
+  // AND THE LOW END STAYS DETAILED. Below the threshold the per-row number, reading age and
+  // behind-count are what a reader acts on, and three existing tests in this file pin exactly that.
+  it("still lists a small number of unread rows individually", () => {
+    const c = report(...budgetSkippedRepo(2));
+    const bullets = c.text.split("\n").filter((l) => l.trimStart().startsWith("- "));
+    expect(bullets.length).toBe(2);
+    expect(lineFor(c.text, 3000)).toContain("COULD NOT ASK GITHUB");
+  });
+
   // THE CASE THE BEAD IS ABOUT. All three shapes in ONE report, and all three read differently.
   it("renders could-not-ask, genuinely-conflicting and genuinely-stale as three different things", () => {
     const c = report(REALLY_CONFLICTING, REALLY_STALE, COULD_NOT_ASK);

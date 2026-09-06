@@ -1407,8 +1407,75 @@ export function conflictCondition(
 
   const ages = ordered.map((c) => splitHoursMinutes(Math.max(0, c.unresolvedSecs) * 1000));
 
-  const lines = ordered.map((c, i) => {
-    const { h, m } = ages[i]!;
+  /**
+   * AN UNREAD PR IS NOT A FLAGGED PR (bead sparkle-yu0h9a).
+   *
+   * THE MEASURED FALSE ALARM. The sweep spent its whole 60s budget before reaching
+   * `plow-pbc/tkmx-client` and then rendered ALL 24 of its open PRs as attention rows, each
+   * annotated `COULD NOT ASK GITHUB` and each carrying `Blocked by: sweep-budget`. We never asked
+   * GitHub about any of them. A background task then read all 25 in ONE `gh pr list` call, inside
+   * the budget, and found 24 green and mergeable. So the reader was handed 24 items that looked
+   * like 24 problems and were one fact about our own scheduler.
+   *
+   * WHY ONLY THIS HALF COLLAPSES, and the other emphatically does not. The unread rows already
+   * split by the word their last SUCCESSFUL read left behind, and the two halves are opposite
+   * kinds of fact:
+   *
+   *   • LAST KNOWN TO MERGE (`unreadStale`) — nothing is known to be wrong with these, and nothing
+   *     about them can be acted on. Twenty-four of them is twenty-four restatements of one
+   *     scheduler fact. This is the half that collapses.
+   *   • LAST KNOWN TO BE CONFLICTING (`unreadConflicting`) — a REAL, RECENT verdict from a look
+   *     that did get an answer. Collapsing these is the failure roborev 75149 records: it
+   *     suppressed a standing conflict for the whole duration of an outage. Each keeps its own row,
+   *     its number, and its age, exactly as before.
+   *
+   * So the count the reader sees stops scaling with the size of an unread repo and starts scaling
+   * with the number of things actually known to be wrong — which is what an attention list is for.
+   * Nothing is DROPPED: the headline and `remedy` above already state `nU`, `nUC` and `nUS` by
+   * count, so the collapsed half is still spoken for, in the one place where saying it once is
+   * enough.
+   */
+  /**
+   * How many unread-but-last-known-mergeable rows it takes before listing them individually stops
+   * being information and starts being noise.
+   *
+   * NOT AN ARBITRARY CAP, and the existing suite is what set it. Three tests pin the per-row detail
+   * of a SINGLE unread row — its number, its `last read 5h 52m ago` stamp, its `40 commits behind
+   * main` — and they are right to: at one or two rows that detail is what a reader acts on, and the
+   * line costs nothing. What the bead measured is a REPO'S WORTH of them, where the twenty-fourth
+   * restatement of "we did not ask" tells the reader nothing the first did not.
+   *
+   * So the rule is about VOLUME, which is the thing that actually changed between the two cases,
+   * and the threshold is deliberately low: past a handful, none of these rows is individually
+   * actionable — every one of them is the same single fact about our own scheduler — so there is
+   * nothing for the extra lines to carry.
+   */
+  const COLLAPSE_UNREAD_MERGEABLE_AT = 3;
+
+  const collapsedUnread =
+    unreadStale.length >= COLLAPSE_UNREAD_MERGEABLE_AT ? unreadStale : [];
+  const collapsedIds = new Set(collapsedUnread.map((c) => c.pr));
+  const rowed = ordered.filter((c) => !collapsedIds.has(c.pr));
+
+  /**
+   * The distinct reasons behind the collapsed half, so one line still names WHAT stopped us.
+   *
+   * Deduplicated because the whole point is that N rows carrying one reason are one fact. Sorted so
+   * the sentence is stable across sweeps — an unstable ordering would read as new information to a
+   * growth rule that compares text.
+   */
+  const collapsedReasons = [
+    ...new Set(collapsedUnread.map((c) => c.blockedBy).filter((r): r is string => !!r)),
+  ].sort();
+
+  // Keyed by PR number rather than by position: `rowed` is a filtered view of `ordered`, so the two
+  // no longer share an index, and reading `ages[i]` here would silently pair a row with another
+  // row's age. `measured` is still built from the FULL `ages` (a whitelist tolerates spares, and a
+  // missing entry refuses the whole report as `fabricated-citation`).
+  const ageOf = new Map(ordered.map((c, i) => [c.pr, ages[i]!]));
+
+  const lines = rowed.map((c) => {
+    const { h, m } = ageOf.get(c.pr)!;
     // WHOSE HOLD IS THIS? `blockedBy` answers two different questions depending on the row, and one
     // wording for both is the same collapse one size down: on a first-hand row it is something
     // holding the PULL REQUEST, and on a row we could not re-read it is what stopped US. "Blocked
@@ -1581,12 +1648,60 @@ export function conflictCondition(
     // (rather than swapping one for the other) is what keeps the rule growth-only: the reverse trip
     // conflicting → stale is an IMPROVEMENT and is a strict subset of what was already said, so it
     // stays quiet, and a PR that flaps back finds the stamp already covering it.
+    // THE COLLAPSED HALF CONTRIBUTES EXACTLY ONE MEMBER — not none, and not one per PR.
+    //
+    // ONE PER PR was the original defect (bead sparkle-yu0h9a): a budget-skipped repo whose 24 PRs
+    // each registered a member made every sweep look like NEW attention, because the members
+    // appeared and disappeared as the round-robin cursor moved on and off that repo. Nothing there
+    // was ever read, so nothing there is growth.
+    //
+    // NONE IS WORSE, and that is the non-obvious half (caught by review before this shipped).
+    // `pusherFleetReport.hasNewMember` fails OPEN on an empty fingerprint — `if
+    // (condition.members.length === 0) return true` — and that is deliberate there: a condition
+    // that cannot name what it covers leaves "has this materially changed?" unanswerable, and the
+    // failure mode that file exists to eliminate is SILENCE. But it means an empty `members`
+    // BYPASSES the 4h `REPEAT_COOLDOWN_MS` entirely. In precisely the case this change targets —
+    // one budget-skipped repo whose unread-last-known-mergeable PRs are the ONLY rows in the sweep
+    // — every row collapses, `members` is `[]`, and the report re-fires on EVERY sweep. That is a
+    // worse repetition than the 24 flapping members, and `pusherFleetReport`'s own comment names
+    // it: "every class silently falls back to the fail-open branch … so the cooldown stops
+    // existing".
+    //
+    // So the collapsed half stays FINGERPRINTABLE while staying non-scaling: one member, derived
+    // from the sorted reasons rather than from the PRs, so it is STABLE across sweeps (an unstable
+    // one would read as growth to the very rule it is here to satisfy) and its cardinality is 1
+    // whether the repo holds 3 unread PRs or 300.
     members: [
-      ...new Set(
-        ordered.flatMap((c) =>
+      ...new Set([
+        ...rowed.flatMap((c) =>
           c.kind === "conflicting" ? [`pr:${c.pr}`, `pr:${c.pr}:conflicting`] : [`pr:${c.pr}`],
         ),
-      ),
+        // ONE MEMBER PER DISTINCT REASON, PLUS A BARE ANCHOR — never a joined string.
+        //
+        // A JOINED STRING IS NOT MONOTONE, which is the trap here and the reason this is not merely
+        // cosmetic. `collapsedUnread` pools rows from the WHOLE snapshot, not one repo, so the
+        // reason set moves as the round-robin cursor and the per-project probe backoff do:
+        // `{sweep-budget}` → `{gh-failed, sweep-budget}` → `{sweep-budget}`. Joined, each of those
+        // is a DIFFERENT single member, so the set SHRINKING registers as a member the stamp has
+        // never seen — `hasNewMember` fires, and the 4h cooldown is bypassed exactly as it is under
+        // the empty-`members` fail-open this encoding replaced.
+        //
+        // That is the same growth-only invariant stated twenty lines above: a conflicting PR emits
+        // BOTH `pr:N` and `pr:N:conflicting` rather than swapping one for the other, precisely so
+        // the reverse trip is a STRICT SUBSET and stays quiet. Per-reason members restore that —
+        // losing a reason is a subset, gaining one is growth — and cardinality stays bounded by the
+        // small `&'static str` reason vocabulary rather than by PR count.
+        //
+        // THE BARE ANCHOR IS LOAD-BEARING TWICE. `blockedBy` is optional, so a collapsed half with
+        // no stated reason would otherwise contribute ZERO members and re-open the empty-fingerprint
+        // hole. And it must be a CONSTANT rather than a sentinel like `unread-collapsed:unstated`:
+        // a sentinel would itself be swapped out when a reason later appears, which is the same
+        // non-monotonicity one level down. An always-present anchor is a subset of every richer
+        // set, so no transition into or out of "reasons stated" can register as growth.
+        ...(collapsedUnread.length > 0
+          ? ["unread-collapsed", ...collapsedReasons.map((r) => `unread-collapsed:${r}`)]
+          : []),
+      ]),
     ],
     measured: [
       String(nC),
@@ -1615,9 +1730,32 @@ export function conflictCondition(
       ...quotedNumbers(
         ...ordered.flatMap((c) => [c.branch, c.blockedBy]),
         ...ordered.map((c) => (c.ownerAgentId === null ? undefined : labels.get(c.ownerAgentId))),
+        // The collapsed line reproduces its reasons character-for-character, so any digits they
+        // carry are quoted rather than computed. They are already covered by the `c.blockedBy`
+        // spread above (this set is a subset of `ordered`), and are named again here so the
+        // dependency is visible: if that spread is ever narrowed, this line must not go silent.
+        ...collapsedReasons,
       ),
     ],
-    text: `${head}\n${lines.join("\n")}${remedy}`,
+    // ONE LINE FOR THE WHOLE COLLAPSED HALF, appended after the rows that were actually read.
+    //
+    // It states the SWEEP's failure, not a PR's: no PR number, no branch, no age, and no remedy
+    // that touches a branch — there is nothing here to act on, and offering an action would be the
+    // dead instruction this class already avoids elsewhere. Every number in it (`nUS`, and any
+    // digits inside a reason string) is quoted in `measured` below, because a number in the text
+    // that is not measured refuses the WHOLE report as `fabricated-citation` — and that refusal
+    // presents as SILENCE.
+    text:
+      `${head}\n${lines.join("\n")}` +
+      (collapsedUnread.length > 0
+        ? `${lines.length > 0 ? "\n" : ""}  - ${nUS} further open ${nUS === 1 ? "PR" : "PRs"} ` +
+          `${nUS === 1 ? "was" : "were"} never asked about on this sweep` +
+          (collapsedReasons.length > 0 ? ` (${collapsedReasons.join(", ")})` : "") +
+          `, and ${nUS === 1 ? "was" : "were"} last known to merge. ` +
+          `That is one fact about our own read, not ${nUS === 1 ? "a pull request" : `${nUS} pull requests`}, ` +
+          `so ${nUS === 1 ? "it is" : "they are"} not listed individually.`
+        : "") +
+      remedy,
   };
 }
 
