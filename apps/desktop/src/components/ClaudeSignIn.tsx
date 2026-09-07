@@ -23,6 +23,7 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
 import { buildClaudeLoginExec, claudeSignInPtyId, SHELL } from "../services/claudeSpawn";
 import { checkClaude, checkClaudeAuthStatus } from "../preflight";
+import { clearPastedToken } from "../services/accountStore";
 import { Terminal } from "./Terminal";
 
 /** How long the terminal is given, after it exits, before we stop re-probing for a completed login.
@@ -87,6 +88,15 @@ export function ClaudeSignIn({
   const onSignedInRef = useRef(onSignedIn);
   onSignedInRef.current = onSignedIn;
 
+  // Whether this account was ALREADY authenticated when the sign-in surface opened, read with a
+  // PASTE-FREE probe (see below) BEFORE the login PTY runs. The stale-paste clear fires only on a real
+  // not-authed -> authed TRANSITION, so a pre-existing paste that already answers the probe (the case
+  // on a platform where the CLI reads .credentials.json) does not trigger a delete on a cancel.
+  // Defaults to `true` (assume authed -> do NOT clear) until the baseline resolves, so any race
+  // fails safe toward keeping the credential; the accounts UI "Remove pasted token" control is the
+  // reliable backstop when the auto-clear does not fire (roborev findings, PR #3047).
+  const authedBeforeLoginRef = useRef(true);
+
   const phase: SignInPhase = done
     ? "done"
     : confirming
@@ -119,6 +129,24 @@ export function ClaudeSignIn({
     };
   }, []);
 
+  // Capture the pre-login auth baseline for this account with a PASTE-FREE probe (no stored-paste
+  // fallback), so a paste-only account reads signed-OUT on macOS and a genuine keychain login is what
+  // flips it. Re-runs if the account changes; a failed probe keeps the safe default (don't clear).
+  useEffect(() => {
+    let alive = true;
+    authedBeforeLoginRef.current = true;
+    void checkClaudeAuthStatus(configDir, undefined, true)
+      .then((s) => {
+        if (alive) authedBeforeLoginRef.current = s.loggedIn;
+      })
+      .catch(() => {
+        if (alive) authedBeforeLoginRef.current = true;
+      });
+    return () => {
+      alive = false;
+    };
+  }, [configDir]);
+
   const stopPolling = useCallback(() => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = null;
@@ -140,16 +168,30 @@ export function ClaudeSignIn({
       setUnconfirmed(true);
     };
     const probe = () => {
-      void checkClaudeAuthStatus(configDir)
+      // PASTE-FREE (third arg): a genuine keychain login must be observable here, not shadowed by the
+      // stored paste — otherwise a browser re-login of an account whose pasted token expired could
+      // never be confirmed (the fallback would re-answer with the dead paste).
+      void checkClaudeAuthStatus(configDir, undefined, true)
         .then((s) => {
-          // `loggedIn` only — NOT `source`. A `recorded` yes is good enough to dismiss a sign-in
-          // surface: it means an identity exists and the live probe couldn't speak, and refusing to
-          // proceed on that would strand a user whose login genuinely worked behind a broken probe.
+          // A `recorded` yes is good enough to DISMISS a sign-in surface: it means an identity exists
+          // and the live probe couldn't speak, and refusing to proceed on that would strand a user
+          // whose login genuinely worked behind a broken probe.
           if (s.loggedIn) {
             stopPolling();
             setConfirming(false);
             setUnconfirmed(false);
             setDone(true);
+            // Drop a now-stale pasted `setup-token` once a REAL login supersedes it, so agent spawns
+            // stop authenticating with the old token. GATED on a LIVE `cli` confirmation AND a
+            // not-authed -> authed TRANSITION: `loggedIn` alone accepts a fail-open `recorded` yes, and
+            // an existing paste can itself answer `cli`-yes where the CLI reads the file — either would
+            // delete a valid credential. The probes are paste-free, so on macOS a `cli`-yes here means a
+            // real keychain login. Deletion is only ever a no-refresh paste (`account_clear_pasted_token`
+            // is selective); dismissal above stays on `loggedIn` (reversible). If this does not fire, the
+            // accounts UI "Remove pasted token" control is the backstop (roborev findings, PR #3047).
+            if (s.source === "cli" && !authedBeforeLoginRef.current) {
+              void clearPastedToken(configDir ?? "").catch(() => {});
+            }
             onSignedInRef.current();
           } else if (Date.now() - startedAt > CONFIRM_WINDOW_MS) {
             giveUp();

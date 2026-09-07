@@ -1133,6 +1133,52 @@ fn apply_test_worker_cap(cmd: &mut CommandBuilder, user_already_set: bool, cap: 
     }
 }
 
+/// True iff this exec runs `claude auth login` (the interactive browser sign-in) rather than an agent.
+/// The login path must never be handed a token — with `CLAUDE_CODE_OAUTH_TOKEN` set, `claude` skips
+/// the browser OAuth flow and authenticates with the token, trapping a user re-authenticating an
+/// account whose pasted token expired. An agent exec is distinguished by carrying
+/// `--dangerously-skip-permissions`, which a login exec never has (roborev finding, PR #3047).
+fn is_login_exec(args: &[String]) -> bool {
+    // Classify on the login exec's STRUCTURE, not a substring of the whole argv. `buildClaudeLoginExec`
+    // emits `... exec '<claude>' auth login` with NOTHING after CLAUDE_LOGIN_ARGV, so the exec string
+    // ends with the unquoted `auth login`. An agent exec (`buildClaudeExec`) ends with a flag
+    // (`--continue`) or a shell-quoted prompt (`... -- '<prompt>'`), i.e. with `'` or a flag char --
+    // never the bare phrase. Keying on the tail is what stops an agent whose PROMPT or persona merely
+    // mentions "auth login" (routine in this repo) from being misread as a login and spawning without
+    // its token (roborev findings, PR #3047).
+    args.iter().any(|a| a.trim_end().ends_with("auth login"))
+}
+
+/// Deliver a pasted `setup-token` account's credential to a PTY AGENT child so it authenticates as
+/// that account. On macOS the `claude` CLI reads the login keychain or `CLAUDE_CODE_OAUTH_TOKEN`, NOT
+/// the `<config_dir>/.credentials.json` Sparkle writes; the account is decoded from the exec script's
+/// `export CLAUDE_CONFIG_DIR=` by [`config_dir_from_args`], and `spawn_oauth_token_at` returns a token
+/// ONLY for a non-refreshable paste (a real OAuth session, or the default account, yields `None`).
+/// This is the PTY (worker / build / orchestrator agent) counterpart of
+/// `claude::apply_spawn_config_dir`, which covers only the Rust `Command` spawns.
+///
+/// The token is handed in under the CARRIER name `SPARKLE_CLAUDE_OAUTH_TOKEN`, NOT as
+/// `CLAUDE_CODE_OAUTH_TOKEN` directly: the PTY runs `zsh -l -c`, whose profile (~/.zprofile,
+/// ~/.zshenv) is sourced AFTER this `CommandBuilder` env is applied and would CLOBBER a directly-set
+/// var (the same reason `PAGER_ENV_EXPORT` / `ANTHROPIC_ENV_UNSET` are done in-script). `buildClaudeExec`
+/// re-exports the carrier as `CLAUDE_CODE_OAUTH_TOKEN` in the exec string, after the profile, and
+/// unsets any ambient token for a non-paste account there (roborev finding, PR #3047). Injection is
+/// SKIPPED entirely on the login path. `CommandBuilder` is `portable_pty`'s type, so this cannot share
+/// the `&mut Command` helper — same reason as [`apply_heap_cap`] / [`apply_test_worker_cap`].
+fn apply_pty_oauth_token(cmd: &mut CommandBuilder, args: &[String]) {
+    // Scrub any ambient carrier UNCONDITIONALLY, before the login check, so neither an agent nor a
+    // login child inherits a SPARKLE_CLAUDE_OAUTH_TOKEN from Sparkle's own environment.
+    cmd.env_remove("SPARKLE_CLAUDE_OAUTH_TOKEN");
+    if is_login_exec(args) {
+        return;
+    }
+    if let Some(dir) = config_dir_from_args(args) {
+        if let Some(tok) = crate::account_usage::spawn_oauth_token_at(std::path::Path::new(&dir)) {
+            cmd.env("SPARKLE_CLAUDE_OAUTH_TOKEN", tok);
+        }
+    }
+}
+
 /// Force a NON-INTERACTIVE PAGER on an agent's PTY child.
 ///
 /// THE INCIDENT (bead `sparkle-w11lll`). This is the ONE spawn in the app that hands its child a
@@ -1313,6 +1359,17 @@ pub async fn pty_spawn(
             for name in crate::claude_oneshot::secret_env_names_now() {
                 cmd.env_remove(&name);
             }
+            // Deliver a pasted setup-token account's credential the way the macOS CLI actually reads it:
+            // as CLAUDE_CODE_OAUTH_TOKEN on the CHILD env — never as an `export` in the exec string,
+            // which is quoted into `sh -l -c` and echoed/persisted in debug surfaces. The account's
+            // config dir was exported into the exec script by buildClaudeExec; decode it and, for a
+            // non-refreshable PASTE only, inject the token. This is the PTY (worker / build / orchestrator
+            // agent) counterpart of `claude::apply_spawn_config_dir`, which covers only the Rust
+            // `Command` spawns (concierge/oneshot/mention/improve) — the PTY path is the LARGEST spawn
+            // class and was the gap (roborev finding, PR #3047). The env_remove first scrubs any ambient
+            // token so a non-paste account cannot inherit one and misroute; the inject sets it only for a
+            // paste. `spawn_oauth_token_at` returns None for a real session or the default account.
+            apply_pty_oauth_token(&mut cmd, &args);
             // NOTHING THIS AGENT RUNS MAY OPEN A PAGER (bead `sparkle-w11lll`). This is the only
             // child in the app with a real TTY, so it is the only one whose `git log` would page —
             // and a paged agent is unreachable by every automated path Sparkle has. See
@@ -2180,7 +2237,7 @@ mod epoch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, apply_heap_cap, apply_noninteractive_pager, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, write_watched, SpawnAccount,
+        acquire_writer, apply_heap_cap, apply_noninteractive_pager, apply_pty_oauth_token, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, write_watched, SpawnAccount,
         guard_resize_size, guard_spawn_size,
         insert_or_cancel,
         next_pty_epoch,
@@ -2739,6 +2796,125 @@ mod tests {
             "the account path must come back WITHOUT its shell quoting — it is compared against \
              on-disk config dirs, not re-fed to a shell"
         );
+    }
+
+    /// The PTY spawn's token delivery (roborev finding, PR #3047). A pasted-token AGENT account gets
+    /// its token handed in under the CARRIER `SPARKLE_CLAUDE_OAUTH_TOKEN` (`buildClaudeExec` re-exports
+    /// it as `CLAUDE_CODE_OAUTH_TOKEN` in-script, AFTER the login-shell profile that would clobber a
+    /// directly-set var); a real session and the default account carry NONE and an ambient carrier is
+    /// scrubbed; and the LOGIN path (`auth login`) is never handed a token, so a user can browser-
+    /// re-login an account whose pasted token expired.
+    #[test]
+    fn pty_oauth_token_is_injected_for_a_paste_and_scrubbed_otherwise() {
+        let ambient = "test-oauth-AMBIENT-DO-NOT-INHERIT";
+        let base = std::env::temp_dir().join(format!(
+            "sparkle-ptytok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // An AGENT exec always carries --dangerously-skip-permissions (that is how is_login_exec tells
+        // it apart from a login exec).
+        let agent_exec = |dir: &std::path::Path| {
+            vec![
+                "-l".to_string(),
+                "-c".to_string(),
+                format!(
+                    "export CLAUDE_CONFIG_DIR='{}'; exec claude --dangerously-skip-permissions",
+                    dir.display()
+                ),
+            ]
+        };
+
+        // A pasted-token AGENT account → the carrier holds its token (overriding an ambient carrier).
+        let paste_dir = base.join("paste");
+        std::fs::create_dir_all(&paste_dir).unwrap();
+        std::fs::write(
+            paste_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"test-oauth-PTY","refreshToken":null,"expiresAt":0}}"#,
+        )
+        .unwrap();
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.env("SPARKLE_CLAUDE_OAUTH_TOKEN", ambient);
+        apply_pty_oauth_token(&mut cmd, &agent_exec(&paste_dir));
+        assert_eq!(
+            cmd.get_env("SPARKLE_CLAUDE_OAUTH_TOKEN").and_then(|v| v.to_str()),
+            Some("test-oauth-PTY"),
+            "a pasted-token agent account must carry its own token to the child",
+        );
+
+        // A real session → nothing carried, ambient carrier scrubbed.
+        let session_dir = base.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"acc","refreshToken":"keep-me","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.env("SPARKLE_CLAUDE_OAUTH_TOKEN", ambient);
+        apply_pty_oauth_token(&mut cmd, &agent_exec(&session_dir));
+        let got = cmd
+            .get_env("SPARKLE_CLAUDE_OAUTH_TOKEN")
+            .and_then(|v| v.to_str())
+            .map(str::to_owned);
+        assert_ne!(got.as_deref(), Some(ambient), "a real session must not carry the ambient token");
+        assert_ne!(got.as_deref(), Some("acc"), "a real session's own token must not be force-carried");
+
+        // The default account (no export) → carrier scrubbed.
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.env("SPARKLE_CLAUDE_OAUTH_TOKEN", ambient);
+        apply_pty_oauth_token(
+            &mut cmd,
+            &vec![
+                "-l".to_string(),
+                "-c".to_string(),
+                "exec claude --dangerously-skip-permissions".to_string(),
+            ],
+        );
+        assert_ne!(
+            cmd.get_env("SPARKLE_CLAUDE_OAUTH_TOKEN").and_then(|v| v.to_str()),
+            Some(ambient),
+            "the default account must not carry the ambient token",
+        );
+
+        // THE LOGIN PATH → NEVER handed a token, even for a paste dir, so browser OAuth can replace an
+        // expired paste (an agent exec would inject; this one carries `auth login` and no skip-perms).
+        let login_args = vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            format!("export CLAUDE_CONFIG_DIR='{}'; exec claude auth login", paste_dir.display()),
+        ];
+        let mut cmd = CommandBuilder::new("claude");
+        apply_pty_oauth_token(&mut cmd, &login_args);
+        assert_eq!(
+            cmd.get_env("SPARKLE_CLAUDE_OAUTH_TOKEN").and_then(|v| v.to_str()),
+            None,
+            "the sign-in (auth login) path must never be handed a token",
+        );
+
+        // AN AGENT whose PROMPT merely mentions "auth login" (routine in this repo) must NOT be
+        // misclassified as a login: the exec ends with the shell-quoted prompt, not the bare phrase, so
+        // the carrier IS set. Guards the substring-sniff regression (roborev findings, PR #3047).
+        let prompt_args = vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            format!(
+                "export CLAUDE_CONFIG_DIR='{}'; exec claude -- 'fix the claude auth login flow'",
+                paste_dir.display()
+            ),
+        ];
+        let mut cmd = CommandBuilder::new("claude");
+        apply_pty_oauth_token(&mut cmd, &prompt_args);
+        assert_eq!(
+            cmd.get_env("SPARKLE_CLAUDE_OAUTH_TOKEN").and_then(|v| v.to_str()),
+            Some("test-oauth-PTY"),
+            "an agent whose prompt mentions 'auth login' must still receive its token",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A path with an apostrophe, written exactly the way `shellQuote` writes it: `'\''` is

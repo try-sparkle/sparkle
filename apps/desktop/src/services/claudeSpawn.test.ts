@@ -27,6 +27,15 @@ const PATH_PREFIX = `export PATH="$HOME/.local/bin:$PATH"; `;
 const UNSET_PREFIX =
   "unset ANTHROPIC_API_KEY ANTHROPIC_API ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL " +
   "ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; ";
+/** Mirrors CLAUDE_OAUTH_TOKEN_FROM_CARRIER in claudeSpawn.ts: buildClaudeExec re-exports the
+ *  pasted token (handed in from Rust under SPARKLE_CLAUDE_OAUTH_TOKEN) as CLAUDE_CODE_OAUTH_TOKEN
+ *  IN-SCRIPT, so it survives the `zsh -l` profile that would clobber a CommandBuilder env. */
+const CARRIER_PREFIX =
+  'if [ -n "${SPARKLE_CLAUDE_OAUTH_TOKEN:-}" ]; then ' +
+  'export CLAUDE_CODE_OAUTH_TOKEN="$SPARKLE_CLAUDE_OAUTH_TOKEN"; ' +
+  "else unset CLAUDE_CODE_OAUTH_TOKEN; fi; unset SPARKLE_CLAUDE_OAUTH_TOKEN; ";
+/** Mirrors CLAUDE_OAUTH_TOKEN_UNSET: the login path unsets any token so browser OAuth runs. */
+const TOKEN_UNSET_PREFIX = "unset CLAUDE_CODE_OAUTH_TOKEN SPARKLE_CLAUDE_OAUTH_TOKEN; ";
 
 describe("buildClaudeLoginExec (first-run setup)", () => {
   // THE BUG THIS PINS. This built `claude login`, which is NOT a subcommand — `claude --help` lists
@@ -52,19 +61,19 @@ describe("buildClaudeLoginExec (first-run setup)", () => {
 
   it("runs `claude auth login` — NOT `claude login`, which is a prompt, not a command", () => {
     expect(buildClaudeLoginExec("/usr/local/bin/claude")).toBe(
-      `${UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' auth login`,
+      `${UNSET_PREFIX}${TOKEN_UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' auth login`,
     );
   });
 
   it("single-quotes a claude path containing a space", () => {
     expect(buildClaudeLoginExec("/path with space/claude")).toBe(
-      `${UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/path with space/claude' auth login`,
+      `${UNSET_PREFIX}${TOKEN_UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/path with space/claude' auth login`,
     );
   });
 
   it("exports CLAUDE_CONFIG_DIR before login when a config dir is given", () => {
     expect(buildClaudeLoginExec("/bin/claude", { configDir: "/acc/dir" })).toBe(
-      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' auth login`,
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${UNSET_PREFIX}${TOKEN_UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' auth login`,
     );
   });
 
@@ -93,19 +102,38 @@ describe("buildClaudeLoginExec (first-run setup)", () => {
     // And it must happen BEFORE the exec, or it accomplishes nothing.
     expect(exec.indexOf(name)).toBeLessThan(exec.indexOf("exec "));
   });
+
+  // The login path must NEVER be handed a token, or `claude auth login` would authenticate with it
+  // instead of running the browser flow — trapping a user re-authenticating an expired-paste account.
+  it("unsets any oauth token before login, and never exports one, so browser OAuth runs", () => {
+    const exec = buildClaudeLoginExec("/bin/claude", { configDir: "/acc/dir" });
+    expect(exec).toContain("unset CLAUDE_CODE_OAUTH_TOKEN SPARKLE_CLAUDE_OAUTH_TOKEN;");
+    expect(exec).not.toContain('export CLAUDE_CODE_OAUTH_TOKEN=');
+    expect(exec.indexOf("CLAUDE_CODE_OAUTH_TOKEN")).toBeLessThan(exec.indexOf("exec "));
+  });
 });
 
 describe("buildClaudeExec ()", () => {
   it("appends --continue when a prior session exists", () => {
     expect(buildClaudeExec("/usr/local/bin/claude", true)).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' --continue`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' --continue`,
     );
   });
 
   it("spawns plain claude when there is no session", () => {
     expect(buildClaudeExec("/usr/local/bin/claude", false)).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude'`,
     );
+  });
+
+  // An AGENT gets its pasted token re-exported IN-SCRIPT from the Rust-set carrier, after the profile
+  // (a CommandBuilder env would be clobbered by ~/.zprofile). Position matters, so assert it precedes
+  // the exec (roborev finding, PR #3047).
+  it("re-exports the pasted token from the SPARKLE_CLAUDE_OAUTH_TOKEN carrier, before the exec", () => {
+    const exec = buildClaudeExec("/bin/claude", false);
+    expect(exec).toContain('export CLAUDE_CODE_OAUTH_TOKEN="$SPARKLE_CLAUDE_OAUTH_TOKEN"');
+    expect(exec).toContain("unset SPARKLE_CLAUDE_OAUTH_TOKEN;");
+    expect(exec.indexOf("SPARKLE_CLAUDE_OAUTH_TOKEN")).toBeLessThan(exec.indexOf("exec "));
   });
 
   it("prepends ~/.local/bin to PATH so agents find user-local tools like roborev ()", () => {
@@ -117,7 +145,7 @@ describe("buildClaudeExec ()", () => {
 
   it("single-quotes paths with awkward characters", () => {
     expect(buildClaudeExec("/path with space/claude", false)).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/path with space/claude'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/path with space/claude'`,
     );
     // An embedded single quote is escaped, not left to break the shell string.
     expect(shellQuote("/a'b")).toBe("'/a'\\''b'");
@@ -133,7 +161,7 @@ describe("buildClaudeExec ()", () => {
     // `--` terminates the variadic `--add-dir` so the positional prompt isn't swallowed as a
     // directory (which made `claude` stat the prompt as a path → ENAMETOOLONG; bead ).
     expect(cmd).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --append-system-prompt 'be helpful' --add-dir '/logs' -- 'start now'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --append-system-prompt 'be helpful' --add-dir '/logs' -- 'start now'`,
     );
   });
 
@@ -148,13 +176,13 @@ describe("buildClaudeExec ()", () => {
 
   it("still emits `--` before a prompt even with no --add-dir, guarding prompts that start with '-'", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { initialPrompt: "-oops looks like a flag" });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' -- '-oops looks like a flag'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' -- '-oops looks like a flag'`);
   });
 
   // Unattended workers auto-approve tool calls so an approval prompt can't silently deadlock them.
   it("emits --dangerously-skip-permissions when dangerouslySkipPermissions is set (worker auto-approve)", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { dangerouslySkipPermissions: true });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions`);
   });
 
   it("omits --dangerously-skip-permissions by default (Think/Build agents keep permission prompts)", () => {
@@ -166,7 +194,7 @@ describe("buildClaudeExec ()", () => {
 
   it("keeps auto-approve on a resumed worker (after --continue, before the prompt)", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { dangerouslySkipPermissions: true });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --dangerously-skip-permissions`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --dangerously-skip-permissions`);
   });
 
   // suppressResumePrompt (restart-wedge, second half). On `--continue`/`--resume` of an OLD, LARGE
@@ -206,14 +234,14 @@ describe("buildClaudeExec ()", () => {
   it("exports CLAUDE_CONFIG_DIR before PATH when a configDir is given", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { configDir: "/data/accounts/ab12" });
     expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/data/accounts/ab12'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`,
+      `export CLAUDE_CONFIG_DIR='/data/accounts/ab12'; ${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`,
     );
   });
 
   it("omits the CLAUDE_CONFIG_DIR export entirely when no configDir is given (default behavior)", () => {
     const cmd = buildClaudeExec("/bin/claude", false);
     expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("treats an empty-string configDir as no account (omits the export)", () => {
@@ -221,7 +249,7 @@ describe("buildClaudeExec ()", () => {
     // against a later refactor to `!== undefined` that would export an empty (relative) config dir.
     const cmd = buildClaudeExec("/bin/claude", false, { configDir: "" });
     expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("single-quotes a configDir with awkward characters and combines with other opts", () => {
@@ -230,7 +258,7 @@ describe("buildClaudeExec ()", () => {
       appendSystemPrompt: "persona",
     });
     expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/path with space/.claude'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`,
+      `export CLAUDE_CONFIG_DIR='/path with space/.claude'; ${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`,
     );
   });
 
@@ -240,7 +268,7 @@ describe("buildClaudeExec ()", () => {
       initialPrompt: "start now",
     });
     // --continue + persona, but NO trailing positional prompt.
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`);
     expect(cmd).not.toContain("start now");
   });
 
@@ -250,17 +278,17 @@ describe("buildClaudeExec ()", () => {
       resumeSessionId: "4b2a247c-ed39-4abc-9f01-deadbeef0000",
     });
     expect(cmd).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume '4b2a247c-ed39-4abc-9f01-deadbeef0000'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume '4b2a247c-ed39-4abc-9f01-deadbeef0000'`,
     );
     expect(cmd).not.toContain("--continue");
   });
 
   it("falls back to --continue when resume is true but no session id is available", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: undefined });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue`);
     // An empty-string id is treated as absent (falsy) → still --continue, never `--resume ''`.
     expect(buildClaudeExec("/bin/claude", true, { resumeSessionId: "" })).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue`,
     );
   });
 
@@ -269,7 +297,7 @@ describe("buildClaudeExec ()", () => {
       resumeSessionId: "should-be-ignored",
       initialPrompt: "start now",
     });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' -- 'start now'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' -- 'start now'`);
     expect(cmd).not.toContain("--resume");
   });
 
@@ -280,20 +308,20 @@ describe("buildClaudeExec ()", () => {
       initialPrompt: "start now",
     });
     expect(cmd).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume 'sess-123' --append-system-prompt 'persona'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume 'sess-123' --append-system-prompt 'persona'`,
     );
     expect(cmd).not.toContain("start now");
   });
 
   it("shell-quotes a session id (defense in depth, though ids are uuids)", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: "a'b" });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume 'a'\\''b'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume 'a'\\''b'`);
   });
 
   // Per-agent model selection (bead sparkle-i6rw).
   it("emits --model <id>, shell-quoted, when a model is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { model: "claude-opus-4-8" });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --model 'claude-opus-4-8'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --model 'claude-opus-4-8'`);
   });
 
   it("omits --model when the model is undefined or the 'default' sentinel", () => {
@@ -310,7 +338,7 @@ describe("buildClaudeExec ()", () => {
       appendSystemPrompt: "persona",
     });
     expect(cmd).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --model 'claude-haiku-4-5' --append-system-prompt 'persona'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --model 'claude-haiku-4-5' --append-system-prompt 'persona'`,
     );
   });
 
@@ -319,7 +347,7 @@ describe("buildClaudeExec ()", () => {
       model: "claude-sonnet-5",
       initialPrompt: "go",
     });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
   });
 
   // BD_READONLY makes a child's `bd` read-only: bd refuses close/update/create/label (exit 1) while
@@ -333,7 +361,7 @@ describe("buildClaudeExec ()", () => {
   // re-enabling it.
   it("exports BD_READONLY=1 before PATH when beadsReadonly is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { beadsReadonly: true });
-    expect(cmd).toBe(`export BD_READONLY=1; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`export BD_READONLY=1; ${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("omits the BD_READONLY export by default (every agent keeps beads write access today)", () => {
@@ -353,7 +381,7 @@ describe("buildClaudeExec ()", () => {
       initialPrompt: "do the task",
     });
     expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; ${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
     );
   });
 });
@@ -367,7 +395,7 @@ describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-
 
   it("exports SPARKLE_INBOX_AGENT when inboxAgentId is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { inboxAgentId: "3ab86d6b-9ff7" });
-    expect(cmd).toBe(`export SPARKLE_INBOX_AGENT='3ab86d6b-9ff7'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`export SPARKLE_INBOX_AGENT='3ab86d6b-9ff7'; ${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("omits the export entirely when no inboxAgentId is given", () => {
@@ -414,7 +442,7 @@ describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-
       configDir: "/accounts/B",
     });
     expect(a).toBe(
-      `export CLAUDE_CONFIG_DIR='/accounts/A'; export SPARKLE_INBOX_AGENT='agent-1'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`,
+      `export CLAUDE_CONFIG_DIR='/accounts/A'; export SPARKLE_INBOX_AGENT='agent-1'; ${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`,
     );
     // The SAME agent id under a different account — the id is not re-keyed by the account.
     expect(b).toContain("export SPARKLE_INBOX_AGENT='agent-1'; ");
@@ -431,7 +459,7 @@ describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-
     });
     expect(cmd).toBe(
       `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; export SPARKLE_INBOX_AGENT='agent-1'; ` +
-        `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
+        `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
     );
   });
 });
@@ -444,7 +472,7 @@ describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
       appendSystemPrompt: "be an orchestrator",
     });
     expect(cmd).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{"mcpServers":{}}' --strict-mcp-config --append-system-prompt 'be an orchestrator'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{"mcpServers":{}}' --strict-mcp-config --append-system-prompt 'be an orchestrator'`,
     );
   });
 
@@ -455,13 +483,13 @@ describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
       appendSystemPrompt: "persona",
     });
     expect(cmd).toBe(
-      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --mcp-config '{}' --strict-mcp-config --append-system-prompt 'persona'`,
+      `${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --mcp-config '{}' --strict-mcp-config --append-system-prompt 'persona'`,
     );
   });
 
   it("omits --strict-mcp-config when not requested", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { mcpConfig: "{}" });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}'`);
   });
 
   it("initialPrompt is separated by `--` even when mcpConfig is present, so it isn't swallowed", () => {
@@ -469,7 +497,7 @@ describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
     // initialPrompt path) terminates option parsing entirely so the prompt is never swallowed as
     // another MCP config file or `--add-dir` path.
     const cmd = buildClaudeExec("/bin/claude", false, { mcpConfig: "{}", initialPrompt: "go" });
-    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}' -- 'go'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${CARRIER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}' -- 'go'`);
   });
 });
 

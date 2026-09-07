@@ -15,6 +15,7 @@ import {
   addAccount,
   setNickname,
   removeAccount,
+  clearPastedToken,
   accountDisplay,
   forkNotice,
   duplicateAccountGroups,
@@ -149,6 +150,11 @@ const DEPS = {
   addAccount,
   setNickname,
   removeAccount,
+  // Move a pasted-setup-token account back toward a browser login: deletes the config dir's
+  // credential file ONLY when it holds a non-refreshable pasted token, leaving a real OAuth
+  // session untouched (the Rust command decides, not this screen). Injectable like every other
+  // IO so the ⋮ item can be exercised without a Tauri bridge.
+  clearPastedToken,
   // The spawn ledger read. Injectable like every other IO on this screen — without it the panel
   // fell back to the real `invoke("accounts_spawn_log")` inside a component suite that mocks no
   // Tauri bridge, so the call rejected, resolved to [] outside `act()` after the assertions had
@@ -2033,6 +2039,24 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     }
   }
 
+  // Move a PASTED-setup-token account back toward a browser OAuth login. `clearPastedToken` deletes
+  // the config dir's credential file ONLY when it holds a non-refreshable pasted token — the Rust
+  // command leaves a real OAuth session (one carrying a refresh token) untouched — so this is safe to
+  // offer and is reversible: the user can re-paste a token or sign in through the browser afterwards.
+  // No confirm step: the action removes only a stale pasted credential, not the account or its data,
+  // and the label already says what it does. After it, re-read (the credential is gone, so Rust no
+  // longer classifies the login as a pasted token) and re-drive the live auth probe, so the row's
+  // method badge and health update rather than keeping the old "Token login".
+  async function handleClearPastedToken(a: Account) {
+    try {
+      await io.clearPastedToken(a.configDir);
+      await refresh();
+      setLiveNonce((n) => n + 1);
+    } catch (e) {
+      setError(errText(e, "Failed to remove pasted token"));
+    }
+  }
+
   async function handleRemove(id: string) {
     setConfirmRemove(null);
     // ── OPTIMISTIC: THE ROW LEAVES NOW, NOT WHEN THE BACKEND ANSWERS ────────────────────────────
@@ -2612,6 +2636,26 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                           }}
                         >
                           Switch login
+                        </button>
+                      )}
+                      {/* REMOVE PASTED TOKEN — only for an account whose login is a pasted
+                          `setup-token` (`loginMethod` === "token"); an OAuth account has no pasted
+                          credential to remove, so the item is absent there. Clears the stale token so
+                          the account can be re-pointed at a browser login. Reversible by re-pasting or
+                          signing in, so no confirm step. */}
+                      {method === "token" && (
+                        <button
+                          role="menuitem"
+                          type="button"
+                          data-testid={`account-remove-token-${a.id}`}
+                          style={menuItem}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setOpenMenuId(null);
+                            void handleClearPastedToken(a);
+                          }}
+                        >
+                          Remove pasted token
                         </button>
                       )}
                       {signedIn && (

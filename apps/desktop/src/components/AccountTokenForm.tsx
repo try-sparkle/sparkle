@@ -6,6 +6,7 @@ import { copyToClipboard } from "../clipboard";
 import {
   setOauthToken as realSetOauthToken,
   recordOauthIdentity as realRecordOauthIdentity,
+  clearPastedToken as realClearPastedToken,
 } from "../services/accountStore";
 import { checkClaudeAuthStatus as realCheckAuthStatus, type ClaudeAuthStatus } from "../preflight";
 
@@ -31,17 +32,22 @@ const SETUP_TOKEN_CMD = "claude setup-token";
 export interface AccountTokenFormDeps {
   /** Store the pasted token as the account's credential (Rust `account_set_oauth_token`). */
   setOauthToken: (configDir: string, token: string) => Promise<void>;
-  /** Re-probe Claude's own auth status for this config dir, to confirm the token authenticates. */
-  checkAuthStatus: (configDir?: string) => Promise<ClaudeAuthStatus>;
+  /** Re-probe Claude's own auth status for this config dir, delivering the pasted token as
+   *  `CLAUDE_CODE_OAUTH_TOKEN` so the CLI reads THIS token (not a keychain it never touched). */
+  checkAuthStatus: (configDir?: string, oauthToken?: string) => Promise<ClaudeAuthStatus>;
   /** Record the confirmed identity so the token account is routable (Rust
    *  `account_record_oauth_identity`). */
   recordOauthIdentity: (configDir: string, email: string) => Promise<void>;
+  /** Delete a stale pasted-token `.credentials.json` after the CLI rejects the token, so it can't
+   *  linger and later mislabel the account as "Token login" (Rust `account_clear_pasted_token`). */
+  clearPastedToken: (configDir: string) => Promise<boolean>;
 }
 
 const DEFAULT_DEPS: AccountTokenFormDeps = {
   setOauthToken: realSetOauthToken,
   checkAuthStatus: realCheckAuthStatus,
   recordOauthIdentity: realRecordOauthIdentity,
+  clearPastedToken: realClearPastedToken,
 };
 
 export interface AccountTokenFormProps {
@@ -57,6 +63,7 @@ export function AccountTokenForm({ configDir, onSaved, deps }: AccountTokenFormP
   const setToken = deps?.setOauthToken ?? DEFAULT_DEPS.setOauthToken;
   const checkAuth = deps?.checkAuthStatus ?? DEFAULT_DEPS.checkAuthStatus;
   const recordIdentity = deps?.recordOauthIdentity ?? DEFAULT_DEPS.recordOauthIdentity;
+  const clearToken = deps?.clearPastedToken ?? DEFAULT_DEPS.clearPastedToken;
 
   const [token, setTokenValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -86,9 +93,24 @@ export function AccountTokenForm({ configDir, onSaved, deps }: AccountTokenFormP
       //    NOT `loggedIn` alone: `claude auth status` FAILS OPEN to `{loggedIn:true, source:"recorded"}`
       //    when the probe can't run (no `claude` binary, timeout) for any dir with an `oauthAccount`,
       //    which is exactly the renew case, so a garbage token would otherwise report a false success.
-      const status = await checkAuth(configDir);
+      //    Deliver the pasted token as `CLAUDE_CODE_OAUTH_TOKEN` on the probe: on macOS the CLI reads
+      //    the login keychain, not the `.credentials.json` step 1 wrote, so probing with only the
+      //    config dir asked about a credential the CLI never saw and a VALID token verified as
+      //    `loggedIn:false`. Passing the token makes the probe test the token itself.
+      const status = await checkAuth(configDir, trimmed);
       const live = status.loggedIn && status.source === "cli";
       if (!live) {
+        // Claude REJECTED the token (a live `loggedIn:false`): the `.credentials.json` step 1 wrote
+        // holds a dead no-refresh token. Delete it so it can't linger and later be read as this
+        // account's login type ("Token login") after a real OAuth sign-in lands in the keychain.
+        // Best-effort — a failed cleanup must not mask the real "did not accept it" error.
+        if (status.loggedIn === false && status.source === "cli") {
+          try {
+            await clearToken(configDir);
+          } catch {
+            /* leave the file; the token error below is what the user needs to see */
+          }
+        }
         setError(
           status.loggedIn
             ? "Saved the token, but couldn't verify it with Claude (is `claude` installed and on your PATH?). Try again."

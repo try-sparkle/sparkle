@@ -182,8 +182,30 @@ pub(crate) fn spawn_env_config_dir(config_dir: Option<&str>) -> Option<&str> {
 /// `$HOME/.claude` — the `isDefault` account — no matter which account the user had selected, so
 /// neither could be rotated off an exhausted login (PRD/sparkle/account-rotation.md §2).
 pub(crate) fn apply_spawn_config_dir(cmd: &mut std::process::Command, config_dir: Option<&str>) {
+    // Never let a child INHERIT an ambient `CLAUDE_CODE_OAUTH_TOKEN` from Sparkle's own process env
+    // (a developer `.env` / `.zprofile` / launch environment). Claude Code prefers that env var over
+    // the credential under `CLAUDE_CONFIG_DIR`, so an inherited one would silently authenticate every
+    // non-paste spawn against the wrong subscription regardless of the account selected — the same
+    // misroute class the ANTHROPIC_* scrub exists for (roborev finding, PR #3047). Removed
+    // unconditionally here, then set below ONLY for a pasted-token account.
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     if let Some(dir) = spawn_env_config_dir(config_dir) {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
+        // A pasted `setup-token` account's credential lives ONLY in `<dir>/.credentials.json`, which
+        // the macOS `claude` CLI does not read (it reads the login keychain or `CLAUDE_CODE_OAUTH_TOKEN`).
+        // So also hand the child the token as `CLAUDE_CODE_OAUTH_TOKEN`, mirroring the paste-verify
+        // probe in `accounts.rs` — otherwise the account verifies green and becomes routable while
+        // every agent spawned for it fails to authenticate (roborev finding, PR #3047). Selective:
+        // `spawn_oauth_token_at` returns a token ONLY for a non-refreshable paste, so a real OAuth
+        // session is left to its own keychain/refresh. Reached only for an explicit (non-empty) account
+        // dir, so the default account's native auth is untouched.
+        //
+        // SCOPE: this covers the four Rust `std::process::Command` spawns (concierge, claude_oneshot,
+        // mention, sparkle_improve). The PTY-based worker/build/orchestrator agents do NOT route through
+        // here — they are covered by the identical `pty.rs::apply_pty_oauth_token`.
+        if let Some(tok) = crate::account_usage::spawn_oauth_token_at(std::path::Path::new(dir)) {
+            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
+        }
     }
 }
 
@@ -1404,6 +1426,93 @@ mod tests {
         assert_eq!(claude_projects_root(Some(&empty), None), None);
         assert!(!claude_has_session_in(Some(&empty), None, worktree));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `apply_spawn_config_dir` hands the child `CLAUDE_CODE_OAUTH_TOKEN` for a PASTED-token account
+    /// (whose credential the macOS CLI cannot otherwise see) and NOT for a real session or the default
+    /// account — the spawn-side half of PR #3047. Widening either way — never injecting (a token
+    /// account routes but cannot authenticate) or always injecting (a session's stale file token
+    /// shadows its keychain) — reddens this.
+    #[test]
+    fn apply_spawn_config_dir_injects_a_pasted_token_only() {
+        fn envs(cmd: &std::process::Command) -> std::collections::HashMap<String, Option<String>> {
+            cmd.get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|s| s.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        }
+        let base = std::env::temp_dir().join(format!(
+            "sparkle-applyspawn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        // Each cmd starts carrying an AMBIENT token, as Sparkle's own env might; the scrub must clear it
+        // for a non-paste account and a paste must override it.
+        let ambient = "test-oauth-AMBIENT-DO-NOT-INHERIT";
+
+        // A pasted-token account dir → CLAUDE_CONFIG_DIR set AND the PASTE token delivered (over ambient).
+        let paste_dir = base.join("paste");
+        std::fs::create_dir_all(&paste_dir).unwrap();
+        std::fs::write(
+            paste_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"test-oauth-APPLY","refreshToken":null,"expiresAt":0}}"#,
+        )
+        .unwrap();
+        let mut cmd = std::process::Command::new("claude");
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", ambient);
+        apply_spawn_config_dir(&mut cmd, Some(paste_dir.to_str().unwrap()));
+        let e = envs(&cmd);
+        assert_eq!(
+            e.get("CLAUDE_CONFIG_DIR").and_then(|v| v.clone()).as_deref(),
+            paste_dir.to_str(),
+        );
+        assert_eq!(
+            e.get("CLAUDE_CODE_OAUTH_TOKEN").and_then(|v| v.clone()).as_deref(),
+            Some("test-oauth-APPLY"),
+            "a pasted-token account must have its OWN token injected, overriding any ambient one",
+        );
+
+        // A real-session account dir → CLAUDE_CONFIG_DIR set, and the ambient token SCRUBBED (no override).
+        let session_dir = base.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"acc","refreshToken":"keep-me","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+        let mut cmd = std::process::Command::new("claude");
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", ambient);
+        apply_spawn_config_dir(&mut cmd, Some(session_dir.to_str().unwrap()));
+        let e = envs(&cmd);
+        assert_eq!(
+            e.get("CLAUDE_CONFIG_DIR").and_then(|v| v.clone()).as_deref(),
+            session_dir.to_str(),
+        );
+        assert!(
+            e.get("CLAUDE_CODE_OAUTH_TOKEN").and_then(|v| v.clone()).is_none(),
+            "a real OAuth session must NOT inherit an ambient token nor get its own forced in",
+        );
+
+        // The default account (empty config_dir) → no CLAUDE_CONFIG_DIR, and the ambient token scrubbed.
+        let mut cmd = std::process::Command::new("claude");
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", ambient);
+        apply_spawn_config_dir(&mut cmd, Some(""));
+        let e = envs(&cmd);
+        assert!(!e.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(
+            e.get("CLAUDE_CODE_OAUTH_TOKEN").and_then(|v| v.clone()).is_none(),
+            "the default account must not inherit an ambient token from apply_spawn_config_dir",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── THE CONVERSATION-LESS STUB ──────────────────────────────────────────────────────────────

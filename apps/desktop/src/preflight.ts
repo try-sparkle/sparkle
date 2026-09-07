@@ -83,8 +83,20 @@ export interface ClaudeAuthStatus {
  *  falling back to the recorded identity when the probe can't run. This is the reading behind the
  *  auth gate — unlike {@link checkClaudeSignedIn} it can come back false for a machine that signed
  *  in successfully in the past, which is the entire point. */
-export function checkClaudeAuthStatus(configDir?: string): Promise<ClaudeAuthStatus> {
-  return invoke<ClaudeAuthStatus>("claude_auth_status", { configDir });
+export function checkClaudeAuthStatus(
+  configDir?: string,
+  oauthToken?: string,
+  pasteFree?: boolean,
+): Promise<ClaudeAuthStatus> {
+  // `oauthToken` is the just-pasted `claude setup-token` value, passed ONLY by the token-paste verify
+  // flow so the probe exports it as CLAUDE_CODE_OAUTH_TOKEN — the credential Claude Code actually reads
+  // for a subscription token (the login keychain never received the pasted value). Every other caller
+  // omits it and probes the stored credential.
+  //
+  // `pasteFree` (the sign-in surface) asks for a probe with NO stored-paste fallback, so a genuine
+  // keychain login is OBSERVABLE rather than shadowed by the paste — which is what lets a browser
+  // re-login of an account whose pasted token expired be confirmed (roborev finding, PR #3047).
+  return invoke<ClaudeAuthStatus>("claude_auth_status", { configDir, oauthToken, pasteFree });
 }
 
 /** The session was signed in and is now DEAD — a live CLI `no`, not an absence.

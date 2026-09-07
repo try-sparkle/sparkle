@@ -87,6 +87,7 @@ function makeDeps(
     addAccount: vi.fn(async (nickname: string) => acct("new", { nickname })),
     setNickname: vi.fn(async () => {}),
     removeAccount: vi.fn(async () => {}),
+    clearPastedToken: vi.fn(async () => false),
     // Without this the panel falls back to the real invoke("accounts_spawn_log") inside a suite
     // that mocks no Tauri bridge: it rejects, resolves to [] outside act() after the assertions
     // have run, and the mount cannot be asserted at all.

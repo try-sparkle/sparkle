@@ -40,6 +40,7 @@ function makeDeps(over: Partial<AccountTokenFormDeps> = {}): AccountTokenFormDep
     setOauthToken: vi.fn(async () => {}),
     checkAuthStatus: vi.fn(async () => authStatus()),
     recordOauthIdentity: vi.fn(async () => {}),
+    clearPastedToken: vi.fn(async () => false),
     ...over,
   };
 }
@@ -58,8 +59,9 @@ describe("AccountTokenForm", () => {
 
     // SIDE EFFECT 1: the token was written to the RIGHT account's dir, trimmed.
     await waitFor(() => expect(deps.setOauthToken).toHaveBeenCalledWith("/cfg/acct-7", "sk-ant-oat01-PASTED"));
-    // It verified against the SAME dir before trusting the token.
-    expect(deps.checkAuthStatus).toHaveBeenCalledWith("/cfg/acct-7");
+    // It verified against the SAME dir AND delivered the pasted token to the probe (so the CLI reads
+    // THIS token via CLAUDE_CODE_OAUTH_TOKEN, not a keychain the pasted value never reached).
+    expect(deps.checkAuthStatus).toHaveBeenCalledWith("/cfg/acct-7", "sk-ant-oat01-PASTED");
     // SIDE EFFECT 2: on a confirmed live login it records the identity so the account is routable.
     await waitFor(() =>
       expect(deps.recordOauthIdentity).toHaveBeenCalledWith("/cfg/acct-7", "placeholder@example.com"),
@@ -85,9 +87,12 @@ describe("AccountTokenForm", () => {
     await screen.findByTestId("account-token-error");
     expect(onSaved).not.toHaveBeenCalled();
     expect(deps.recordOauthIdentity).not.toHaveBeenCalled();
+    // A fail-open 'recorded' reading is NOT a rejection — the token may be valid but unverifiable, so
+    // the just-written file must be LEFT for a retry, never cleared.
+    expect(deps.clearPastedToken).not.toHaveBeenCalled();
   });
 
-  it("does NOT report success when the CLI says the token is not logged in", async () => {
+  it("clears the stale credential and reports failure when the CLI REJECTS the token", async () => {
     const deps = makeDeps({
       checkAuthStatus: vi.fn(async () => authStatus({ loggedIn: false, source: "cli" })),
     });
@@ -102,6 +107,9 @@ describe("AccountTokenForm", () => {
     await screen.findByTestId("account-token-error");
     expect(onSaved).not.toHaveBeenCalled();
     expect(deps.recordOauthIdentity).not.toHaveBeenCalled();
+    // SIDE EFFECT: a live `loggedIn:false` means the file we wrote holds a dead token — delete it so
+    // it can't linger and later mislabel this account as "Token login" after a real OAuth sign-in.
+    await waitFor(() => expect(deps.clearPastedToken).toHaveBeenCalledWith("/cfg/acct-9"));
   });
 
   it("writes nothing for an empty / whitespace-only paste", async () => {

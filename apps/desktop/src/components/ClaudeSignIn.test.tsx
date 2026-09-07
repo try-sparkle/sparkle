@@ -13,8 +13,18 @@ const checkClaude = vi.fn();
 const checkClaudeAuthStatus = vi.fn();
 vi.mock("../preflight", () => ({
   checkClaude: () => checkClaude(),
-  checkClaudeAuthStatus: (d?: string) => checkClaudeAuthStatus(d),
+  checkClaudeAuthStatus: (d?: string, _t?: string, _pf?: boolean) => checkClaudeAuthStatus(d),
 }));
+
+// clearPastedToken is an IRREVERSIBLE deletion; spy on it to pin WHEN the sign-in clears a stale
+// paste - on a real not-authed -> authed cli TRANSITION, never on a fail-open recorded yes and never
+// when the account was already authenticated (roborev findings, PR #3047).
+const clearPastedToken = vi.fn();
+vi.mock("../services/accountStore", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  clearPastedToken: (d: string) => clearPastedToken(d),
+}));
+
 
 // The PTY is the one thing we cannot run here. Expose its onExit so a test can fire the exact edge
 // the confirm window hangs off, and record the argv so the `auth login` fix is pinned end to end.
@@ -63,6 +73,10 @@ beforeEach(() => {
   spawns = [];
   fireExit = null;
   checkClaude.mockResolvedValue({ installed: true, path: "/bin/claude", version: null });
+  clearPastedToken.mockResolvedValue(true);
+  // The paste-free baseline probe runs at MOUNT and consumes the first call; default it to
+  // signed-out so every call returns a promise and the baseline is "not yet authenticated".
+  checkClaudeAuthStatus.mockResolvedValue(auth(false));
 });
 afterEach(() => {
   cleanup();
@@ -249,5 +263,45 @@ describe("ClaudeSignIn", () => {
     expect(lastSpawn?.args.at(-1)).toContain("CLAUDE_CONFIG_DIR='/acc/dir'");
     // …and NOT by a cwd the spawn guard will reject.
     expect(lastSpawn?.cwd).toBeUndefined();
+  });
+
+  // A stale paste is dropped once a REAL login supersedes it - a not-authed -> authed cli TRANSITION.
+  // Baseline signed-out (paste-free), then a cli yes -> the clear fires.
+  it("clears a stale pasted token on a real cli sign-in transition", async () => {
+    checkClaudeAuthStatus.mockResolvedValueOnce(auth(false)).mockResolvedValue(auth(true, "cli"));
+    const onSignedIn = await mount();
+    await act(async () => {});
+    await act(async () => {
+      fireExit?.();
+    });
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
+    expect(clearPastedToken).toHaveBeenCalled();
+  });
+
+  // A fail-open `recorded` yes must NEVER delete a credential (the original data-loss bug). Baseline
+  // signed-out so the transition gate would allow - only the `cli` requirement stops the delete.
+  it("never clears a credential on a fail-open recorded yes", async () => {
+    checkClaudeAuthStatus.mockResolvedValueOnce(auth(false)).mockResolvedValue(auth(true, "recorded"));
+    const onSignedIn = await mount();
+    await act(async () => {});
+    await act(async () => {
+      fireExit?.();
+    });
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
+    expect(clearPastedToken).not.toHaveBeenCalled();
+  });
+
+  // An account already authenticated at baseline (a paste the CLI can read answers cli-yes) is NOT a
+  // new login - clearing on that would delete a valid credential on a cancel. The transition gate and
+  // the useRef(true) fail-safe default must both hold: this pins them (roborev finding, PR #3047).
+  it("never clears when the account was already authenticated (no new login)", async () => {
+    checkClaudeAuthStatus.mockResolvedValue(auth(true, "cli"));
+    const onSignedIn = await mount();
+    await act(async () => {});
+    await act(async () => {
+      fireExit?.();
+    });
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
+    expect(clearPastedToken).not.toHaveBeenCalled();
   });
 });

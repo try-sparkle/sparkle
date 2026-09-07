@@ -4759,7 +4759,29 @@ fn recorded_auth_status(config_dir: Option<&Path>, home: Option<&Path>) -> Claud
 /// Build the `claude auth status --json` command, fully configured. Split from the run so a test can
 /// assert the ENVIRONMENT without spawning anything — the scrub below is invisible at runtime when
 /// it regresses, so it needs a pinned contract rather than a comment (roborev 57985).
-fn claude_auth_status_command(claude_path: &str, config_dir: Option<&Path>) -> std::process::Command {
+///
+/// `oauth_token` is the JUST-PASTED `claude setup-token` value, present ONLY on the token-paste verify
+/// path and `None` everywhere else (the auth gate, the poll, the concierge re-auth prompt). When it is
+/// present it is exported as `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code PREFERS over any credential
+/// stored under `CLAUDE_CONFIG_DIR` (keychain OR `.credentials.json`) — see
+/// `packages/core/humaneTransportClaudeCli.ts` and `apps/orchestration/src/lib/credVault.ts`, which
+/// deliver a subscription token exactly this way. This is why a valid pasted setup-token used to verify
+/// as `loggedIn:false`: on macOS the CLI reads its credential store (the login keychain), not the
+/// `.credentials.json` Sparkle writes, so probing with only `CLAUDE_CONFIG_DIR` set asked about a
+/// credential the CLI never saw. Exporting the token makes the probe test the token itself, and the
+/// delivery is monotonic — it also works on any platform where the CLI would have read the file.
+/// The token never enters a log or an argv (env only); `claude auth status --json` prints identity, not
+/// the bearer.
+fn claude_auth_status_command(
+    claude_path: &str,
+    config_dir: Option<&Path>,
+    oauth_token: Option<&str>,
+    // When true (the routine callers), an absent explicit token falls back to the stored paste for the
+    // config dir so a working paste account reads back correctly. When false (the sign-in probe), NO
+    // fallback — the probe must be able to observe a real keychain login, not the paste that would
+    // shadow it, so a browser re-login of an expired-paste account is confirmable (roborev, PR #3047).
+    paste_fallback: bool,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(claude_path);
     cmd.args(["auth", "status", "--json"]);
 
@@ -4779,8 +4801,31 @@ fn claude_auth_status_command(claude_path: &str, config_dir: Option<&Path>) -> s
     // added there cannot be silently missing here.
     crate::claude_oneshot::scrub_anthropic_env_for(&mut cmd);
 
-    if let Some(dir) = config_dir.filter(|d| !d.as_os_str().is_empty()) {
+    let config_dir = config_dir.filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    // Deliver the subscription credential the way Claude Code reads it, and ask about the SAME one a
+    // spawn will use. `scrub_anthropic_env_for` strips only ANTHROPIC_*, so an ambient
+    // `CLAUDE_CODE_OAUTH_TOKEN` would survive and misdirect the probe — remove it first. Then prefer an
+    // explicitly-passed token (the paste-verify path), else fall back to the pasted token stored for
+    // this account's config dir. Without that fallback a routine poll (which passes `oauth_token: None`)
+    // of a WORKING pasted-token account reads back `loggedIn: false` on macOS — the CLI cannot see the
+    // `.credentials.json` — and drives spurious re-auth prompts and wall/rotation decisions against an
+    // account that actually authenticates (roborev finding, PR #3047).
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    let token = oauth_token
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            if paste_fallback {
+                config_dir.and_then(crate::account_usage::spawn_oauth_token_at)
+            } else {
+                None
+            }
+        });
+    if let Some(tok) = token {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
     }
     // `claude` is a `#!/usr/bin/env node` shebang on a normal install, so node has to be findable.
     // A GUI app's PATH does not include ~/.local/bin; prepend it the same way every spawn path does.
@@ -4806,8 +4851,13 @@ fn claude_auth_status_command(claude_path: &str, config_dir: Option<&Path>) -> s
 /// would quietly degrade the live reading to the old broken answer, on a path polled per window
 /// focus. `output_with_timeout` drains both streams on reader threads and kills the whole process
 /// group on expiry (roborev 57985).
-fn run_claude_auth_status(claude_path: &str, config_dir: Option<&Path>) -> Option<String> {
-    let cmd = claude_auth_status_command(claude_path, config_dir);
+fn run_claude_auth_status(
+    claude_path: &str,
+    config_dir: Option<&Path>,
+    oauth_token: Option<&str>,
+    paste_fallback: bool,
+) -> Option<String> {
+    let cmd = claude_auth_status_command(claude_path, config_dir, oauth_token, paste_fallback);
     let out = crate::worktree::output_with_timeout(cmd, AUTH_STATUS_TIMEOUT).ok()?;
     // Not gated on `status.success()`: a CLI that exits non-zero while still printing a valid
     // `{"loggedIn":false}` is telling us exactly what we asked. `parse_claude_auth_status` is the
@@ -4843,13 +4893,22 @@ fn claude_auth_status_with(
 /// event loop. On a JoinError we report the fail-open `Recorded`/`Absent` answer rather than
 /// inventing a `false` that could gate the app.
 #[tauri::command]
-pub async fn claude_auth_status(config_dir: Option<String>) -> ClaudeAuthStatus {
+pub async fn claude_auth_status(
+    config_dir: Option<String>,
+    oauth_token: Option<String>,
+    // `Some(true)` from the sign-in surface asks for a PASTE-FREE probe (no stored-paste fallback), so
+    // a genuine keychain login is observable. Absent / `Some(false)` keeps the routine fallback.
+    paste_free: Option<bool>,
+) -> ClaudeAuthStatus {
     tauri::async_runtime::spawn_blocking(move || {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let dir = config_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
+        // Empty is not a token — treat it as absent so the probe stays keychain/file-backed.
+        let token = oauth_token.filter(|s| !s.is_empty());
+        let paste_fallback = !paste_free.unwrap_or(false);
         let claude = crate::preflight::cached_claude_path();
         claude_auth_status_with(dir.as_deref(), home.as_deref(), || {
-            run_claude_auth_status(claude.as_deref()?, dir.as_deref())
+            run_claude_auth_status(claude.as_deref()?, dir.as_deref(), token.as_deref(), paste_fallback)
         })
     })
     .await
@@ -4938,6 +4997,10 @@ mod tests {
 
     fn assert_async_command<A, Fut: std::future::Future>(_f: fn(A) -> Fut) {}
 
+    /// Same coercion for a two-argument command. `claude_auth_status` gained a second arg (the pasted
+    /// token to deliver as CLAUDE_CODE_OAUTH_TOKEN on the verify path) and must stay `async`.
+    fn assert_async_command2<A, B, Fut: std::future::Future>(_f: fn(A, B) -> Fut) {}
+
     /// Same coercion for a three-argument command. Needed because the commands guarded here used to
     /// be uniformly one-argument, and `accounts_mark_exhausted` — the one this module's main-thread
     /// hang was captured in (`sparkle-dkxuf6`) — takes three.
@@ -4960,7 +5023,7 @@ mod tests {
         // Spawns `claude auth status` and waits on it — the only command here that blocks on a
         // SUBPROCESS rather than a file, so reverting it to `pub fn` would freeze the UI for up to
         // AUTH_STATUS_TIMEOUT on every window focus.
-        assert_async_command(claude_auth_status);
+        assert_async_command3(claude_auth_status);
         // Also transcript-tree scanners.
         assert_async_command(accounts_spend);
         assert_async_command(accounts_limit_events);
@@ -6758,7 +6821,7 @@ mod tests {
     // "you're signed in" this command was added to end (roborev 57985).
     #[test]
     fn the_auth_probe_scrubs_every_anthropic_env_override() {
-        let cmd = claude_auth_status_command("/bin/claude", None);
+        let cmd = claude_auth_status_command("/bin/claude", None, None, true);
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, v)| v.is_none())
@@ -6785,7 +6848,7 @@ mod tests {
         // Pins the argv. `auth status --json` is three separate facts (the `auth` prefix that the
         // login bug was missing, the `status` subcommand, and the JSON the parser expects), and
         // getting any of them wrong degrades silently to the recorded fallback.
-        let cmd = claude_auth_status_command("/bin/claude", None);
+        let cmd = claude_auth_status_command("/bin/claude", None, None, true);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -6795,7 +6858,7 @@ mod tests {
 
     #[test]
     fn the_auth_probe_targets_an_explicit_account_config_dir() {
-        let cmd = claude_auth_status_command("/bin/claude", Some(Path::new("/acc/dir")));
+        let cmd = claude_auth_status_command("/bin/claude", Some(Path::new("/acc/dir")), None, true);
         let set: Vec<(String, String)> = cmd
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
@@ -6805,13 +6868,103 @@ mod tests {
             "an explicit account dir must be probed in its own config dir; got {set:?}"
         );
         // And with no dir given, nothing is set — the machine-wide login is the target.
-        let plain = claude_auth_status_command("/bin/claude", None);
+        let plain = claude_auth_status_command("/bin/claude", None, None, true);
         assert!(
             !plain
                 .get_envs()
                 .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v.is_some()),
             "no config dir given must mean the machine-wide login, not an empty override"
         );
+    }
+
+    #[test]
+    fn a_pasted_token_is_delivered_as_the_oauth_env_var_the_cli_reads() {
+        // Bug 2, as a DELIVERY-MECHANISM test (never a fabricated auth result): when the token-paste
+        // verify path hands the just-pasted value, the probe must export it as CLAUDE_CODE_OAUTH_TOKEN
+        // — the env Claude Code prefers over the credential stored under CLAUDE_CONFIG_DIR — so the
+        // probe tests the token itself rather than a keychain the pasted token never reached.
+        let cmd = claude_auth_status_command(
+            "/bin/claude",
+            Some(Path::new("/acc/dir")),
+            Some("test-oauth-EXAMPLE"),
+            true,
+        );
+        let set: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))
+            })
+            .collect();
+        assert!(
+            set.contains(&(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "test-oauth-EXAMPLE".to_string()
+            )),
+            "a pasted token must be exported as CLAUDE_CODE_OAUTH_TOKEN so the CLI reads it; got {set:?}"
+        );
+        // The config dir is still targeted alongside it — the token names the credential, the dir names
+        // the account whose identity we then record.
+        assert!(
+            set.contains(&("CLAUDE_CONFIG_DIR".to_string(), "/acc/dir".to_string())),
+            "the account's config dir must still be exported; got {set:?}"
+        );
+    }
+
+    #[test]
+    fn the_routine_probe_uses_the_stored_paste_and_pins_nothing_without_one() {
+        // Every OTHER caller (the auth gate, the poll, the concierge re-auth prompt) passes None. The
+        // probe must ask about the SAME credential a spawn will use (roborev finding, PR #3047): for a
+        // dir holding a pasted token it exports it, so a working paste account no longer reads back
+        // logged-out on macOS; for a dir with no paste it pins nothing. `is_some()` matters because the
+        // ambient scrub leaves a (key, None) removal marker, which is NOT an exported value.
+        for tok in [None, Some("")] {
+            let cmd =
+                claude_auth_status_command("/bin/claude", Some(Path::new("/no/such/acc/dir")), tok, true);
+            assert!(
+                !cmd.get_envs()
+                    .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.is_some()),
+                "no stored paste + no explicit token must not export CLAUDE_CODE_OAUTH_TOKEN (tok={tok:?})"
+            );
+        }
+
+        // A dir WITH a pasted token → the routine probe (None) exports the stored token.
+        let base = unique_dir("probe-paste");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"test-oauth-PROBE","refreshToken":null,"expiresAt":0}}"#,
+        )
+        .unwrap();
+        let cmd = claude_auth_status_command("/bin/claude", Some(&base), None, true);
+        let set: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|vv| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        vv.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            set.contains(&(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "test-oauth-PROBE".to_string()
+            )),
+            "a routine probe of a pasted-token dir must export the stored token; got {set:?}"
+        );
+
+        // The PASTE-FREE variant (paste_fallback = false, the sign-in probe) must NOT export the stored
+        // paste, so a real keychain login is observable rather than shadowed by it (roborev, PR #3047).
+        let pf = claude_auth_status_command("/bin/claude", Some(&base), None, false);
+        assert!(
+            !pf.get_envs()
+                .any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.is_some()),
+            "the paste-free probe must not export the stored paste, even for a dir that holds one"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -7946,7 +8099,7 @@ mod tests {
         // NOT count as a completed login.
         std::fs::write(
             dir.join(".credentials.json"),
-            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-BOGUS","refreshToken":null,"expiresAt":0}}"#,
+            r#"{"claudeAiOauth":{"accessToken":"test-oauth-BOGUS","refreshToken":null,"expiresAt":0}}"#,
         )
         .unwrap();
         // Sanity on the seeded shape: onboarding + userID + trust entry + a rejected credential
@@ -8011,7 +8164,7 @@ mod tests {
         std::fs::write(bad_cred.join(".claude.json"), r#"{"machineID":"m"}"#).unwrap();
         std::fs::write(
             bad_cred.join(".credentials.json"),
-            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-BOGUS","refreshToken":null,"expiresAt":0}}"#,
+            r#"{"claudeAiOauth":{"accessToken":"test-oauth-BOGUS","refreshToken":null,"expiresAt":0}}"#,
         )
         .unwrap();
         assert!(

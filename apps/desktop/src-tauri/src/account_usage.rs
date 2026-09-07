@@ -1551,6 +1551,88 @@ pub async fn account_set_oauth_token(config_dir: String, token: String) -> Resul
     .map_err(|e| format!("set token task failed: {e}"))?
 }
 
+/// Is this `.credentials.json` blob a PASTED long-lived token (as opposed to a real OAuth session)?
+/// A `claude setup-token` value carries no refresh token — [`credentials_blob`] writes
+/// `refreshToken: null` — while an interactive `claude auth login` that lands a file (e.g. on Linux)
+/// stores the refresh token it needs to renew. So a usable access token with NO refresh token is a
+/// pasted token, and one WITH a refresh token is a session we must never delete. Pure; never logs the
+/// token. Mirrors `accounts::classify_credential_blob`, kept here because that one is private.
+fn credential_blob_is_pasted_token(blob: &str) -> bool {
+    extract_credentials(blob).is_some_and(|c| c.refresh_token.is_none())
+}
+
+/// Remove a STALE pasted-token credential for an account: delete `<config_dir>/.credentials.json`
+/// ONLY when it holds a non-refreshable (pasted `setup-token`) credential, and leave a real
+/// OAuth-session file (one carrying a refresh token) untouched. Returns `true` when a file was
+/// deleted, `false` when there was nothing to delete or the file was a genuine session.
+///
+/// Two callers, one shape:
+///  * the token-paste flow calls it after the CLI REJECTS a pasted token, so the dead no-refresh file
+///    it just wrote cannot linger and later be read as the account's login type
+///    (`accounts::auth_kind_for_account` reads `.credentials.json` first and would report "Token");
+///  * the interactive OAuth flow can call it after a login SUCCEEDS, so an OLDER stale paste no longer
+///    wins that label over the fresh keychain session.
+///
+/// The selectivity is load-bearing: the macOS interactive login writes NO file (keychain only), but a
+/// Linux one writes a `.credentials.json` WITH a refresh token — deleting that would destroy the
+/// credential the CLI just created. Never logs the token.
+#[tauri::command]
+pub async fn account_clear_pasted_token(config_dir: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        let home = std::env::var("HOME").ok();
+        let dir = resolve_config_dir_with(&config_dir, home.as_deref())?;
+        let deleted = clear_pasted_token_at(Path::new(&dir))?;
+        if deleted {
+            // Drop any cached copy of the now-deleted token so a later read can't resurrect it.
+            invalidate_cache(&config_dir);
+        }
+        Ok(deleted)
+    })
+    .await
+    .map_err(|e| format!("clear token task failed: {e}"))?
+}
+
+/// The synchronous, filesystem-only core of [`account_clear_pasted_token`], split out so the
+/// keep-a-session / delete-a-paste SIDE EFFECT is unit-testable with no async runtime and no HOME:
+/// delete `<dir>/.credentials.json` iff it holds a pasted (non-refreshable) token, and report whether
+/// it did. A missing or unreadable file is the benign no-op case (`false`). Never logs the token.
+fn clear_pasted_token_at(dir: &Path) -> Result<bool, String> {
+    let path = dir.join(".credentials.json");
+    let blob = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        // No file (or unreadable) is the common, benign case: nothing stale to clear.
+        Err(_) => return Ok(false),
+    };
+    if !credential_blob_is_pasted_token(&blob) {
+        // A real OAuth session (has a refresh token), or not a credential at all — leave it.
+        return Ok(false);
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// The `CLAUDE_CODE_OAUTH_TOKEN` a spawn must hand its child so a PASTED `setup-token` account
+/// actually authenticates. On macOS `claude` reads the login KEYCHAIN (or this env var), NOT the
+/// `<config_dir>/.credentials.json` Sparkle writes — so without this a pasted-token account verifies
+/// green (the paste-verify probe delivers the token) and becomes ROUTABLE, then every agent spawned
+/// for it authenticates against a credential the CLI cannot see and fails far from its cause
+/// (roborev finding, PR #3047). This is the spawn-side counterpart of the verify probe's
+/// `CLAUDE_CODE_OAUTH_TOKEN` delivery.
+///
+/// Returns `Some(token)` ONLY for a non-refreshable pasted token — the SAME selectivity as
+/// [`clear_pasted_token_at`], and for the same reason: a real OAuth session (one carrying a refresh
+/// token) authenticates via its own keychain/refresh and must NOT be overridden by a stale file, and
+/// a dir with no credential file is the normal keychain/OAuth account (`None`). Reads the file at
+/// spawn time so a token added or renewed mid-session is picked up without a restart. Never logs the
+/// token.
+pub(crate) fn spawn_oauth_token_at(dir: &Path) -> Option<String> {
+    let blob = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
+    if !credential_blob_is_pasted_token(&blob) {
+        return None;
+    }
+    extract_access_token(&blob)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1560,15 +1642,15 @@ mod tests {
     /// field in `credentials_blob` and `extract_access_token` returns None, reddening this.
     #[test]
     fn a_pasted_token_is_stored_where_the_spawn_reads_it() {
-        let blob = credentials_blob("sk-ant-oat01-EXAMPLE");
+        let blob = credentials_blob("test-oauth-EXAMPLE");
         let creds = extract_credentials(&blob).expect("must parse as a credential");
-        assert_eq!(creds.access_token, "sk-ant-oat01-EXAMPLE");
+        assert_eq!(creds.access_token, "test-oauth-EXAMPLE");
         assert_eq!(creds.refresh_token, None, "a setup-token carries no refresh token");
         assert_eq!(creds.expires_at, 0, "unknown expiry is stored as 0, not fabricated");
         // The bearer read the agent authenticates with returns exactly the pasted token.
         assert_eq!(
             extract_access_token(&blob).as_deref(),
-            Some("sk-ant-oat01-EXAMPLE"),
+            Some("test-oauth-EXAMPLE"),
         );
     }
 
@@ -1599,6 +1681,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The discriminator behind the stale-credential cleanup: a pasted `setup-token` (no refresh
+    /// token) is a pasted token; a real OAuth session (has one) is NOT. Both directions, so widening
+    /// EITHER — deleting a live session, or refusing to clear a dead paste — reddens this.
+    #[test]
+    fn only_a_no_refresh_credential_counts_as_a_pasted_token() {
+        // What the paste flow writes — a bare access token, refreshToken null.
+        assert!(
+            credential_blob_is_pasted_token(&credentials_blob("test-oauth-EXAMPLE")),
+            "a no-refresh token is a pasted token and may be cleared"
+        );
+        // A real OAuth session file (Linux `claude auth login`): has a refresh token → NOT clearable.
+        let session = r#"{"claudeAiOauth":{"accessToken":"acc","refreshToken":"refresh-me","expiresAt":9999999999999}}"#;
+        assert!(
+            !credential_blob_is_pasted_token(session),
+            "a session carrying a refresh token must never be treated as a clearable paste"
+        );
+        // Not a credential at all → nothing to clear.
+        assert!(!credential_blob_is_pasted_token("{}"));
+        assert!(!credential_blob_is_pasted_token("not json"));
+    }
+
+    /// `clear_pasted_token_at`'s on-disk SIDE EFFECT: it DELETES a pasted-token file and LEAVES a real
+    /// session file. Explicit dirs, so no async runtime and no HOME dependency. The keep-half is what
+    /// makes this safe on Linux, where the CLI's own login writes a `.credentials.json`.
+    #[test]
+    fn clear_pasted_token_deletes_a_paste_but_keeps_a_session() {
+        let base = std::env::temp_dir().join(format!(
+            "sparkle-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        // A pasted-token dir → the file is deleted, and the helper reports it did so.
+        let paste_dir = base.join("paste");
+        std::fs::create_dir_all(&paste_dir).unwrap();
+        let paste_path = paste_dir.join(".credentials.json");
+        write_secret_file(&paste_path, credentials_blob("test-oauth-DEAD").as_bytes()).unwrap();
+        assert!(
+            clear_pasted_token_at(&paste_dir).unwrap(),
+            "a pasted-token file must be reported deleted"
+        );
+        assert!(!paste_path.exists(), "the stale pasted-token file must be gone");
+
+        // A real-session dir → left exactly as it was, and the helper reports no deletion.
+        let session_dir = base.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join(".credentials.json");
+        let session = r#"{"claudeAiOauth":{"accessToken":"acc","refreshToken":"keep-me","expiresAt":9999999999999}}"#;
+        write_secret_file(&session_path, session.as_bytes()).unwrap();
+        assert!(
+            !clear_pasted_token_at(&session_dir).unwrap(),
+            "a real OAuth session must not be reported deleted"
+        );
+        assert!(session_path.exists(), "a real OAuth session file must be preserved");
+
+        // A dir with no credential file → benign no-op.
+        let empty_dir = base.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        assert!(
+            !clear_pasted_token_at(&empty_dir).unwrap(),
+            "no file means nothing to clear"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The spawn-side counterpart of the clear test: `spawn_oauth_token_at` yields the pasted token
+    /// (so the spawn can inject `CLAUDE_CODE_OAUTH_TOKEN`) for a PASTE, and yields NOTHING for a real
+    /// session or an absent file. Both directions, so widening EITHER — handing the CLI a stale
+    /// session token, or failing to deliver a valid paste (the account then routes but cannot
+    /// authenticate) — reddens this.
+    #[test]
+    fn spawn_oauth_token_is_delivered_only_for_a_paste() {
+        let base = std::env::temp_dir().join(format!(
+            "sparkle-spawntok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        // A pasted-token dir → the token is delivered, exactly the value the CLI must authenticate with.
+        let paste_dir = base.join("paste");
+        std::fs::create_dir_all(&paste_dir).unwrap();
+        write_secret_file(
+            &paste_dir.join(".credentials.json"),
+            credentials_blob("test-oauth-SPAWN").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            spawn_oauth_token_at(&paste_dir).as_deref(),
+            Some("test-oauth-SPAWN"),
+            "a pasted setup-token must be delivered to the spawn as CLAUDE_CODE_OAUTH_TOKEN",
+        );
+
+        // A real-session dir → NOTHING injected; the CLI authenticates via its own keychain/refresh.
+        let session_dir = base.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let session = r#"{"claudeAiOauth":{"accessToken":"acc","refreshToken":"keep-me","expiresAt":9999999999999}}"#;
+        write_secret_file(&session_dir.join(".credentials.json"), session.as_bytes()).unwrap();
+        assert_eq!(
+            spawn_oauth_token_at(&session_dir),
+            None,
+            "a real OAuth session token must never be forced into CLAUDE_CODE_OAUTH_TOKEN",
+        );
+
+        // A dir with no credential file → nothing to deliver (the normal keychain/OAuth account).
+        let empty_dir = base.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        assert_eq!(spawn_oauth_token_at(&empty_dir), None, "no file means no token to deliver");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The empty-token guard the command rides on — asserted on the REAL helper, both branches, so
     /// deleting `if t.is_empty()` reddens this (a blank paste would otherwise write `{"accessToken":""}`
     /// over a working credential).
@@ -1607,8 +1807,8 @@ mod tests {
         assert!(validated_token("   \n\t  ").is_err(), "whitespace must be rejected");
         assert!(validated_token("").is_err(), "empty must be rejected");
         assert_eq!(
-            validated_token("  sk-ant-oat01-REAL  ").unwrap(),
-            "sk-ant-oat01-REAL",
+            validated_token("  test-oauth-REAL  ").unwrap(),
+            "test-oauth-REAL",
             "a real token is trimmed and accepted",
         );
     }

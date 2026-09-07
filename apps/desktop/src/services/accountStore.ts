@@ -208,6 +208,16 @@ export function recordOauthIdentity(configDir: string, email: string): Promise<v
   return invoke("account_record_oauth_identity", { configDir, email });
 }
 
+/** Remove a STALE pasted-token credential — deletes `<configDir>/.credentials.json` ONLY when it
+ *  holds a non-refreshable (pasted `setup-token`) credential, and leaves a real OAuth-session file
+ *  (one carrying a refresh token, e.g. a Linux `claude auth login`) untouched. Two call sites: after a
+ *  pasted token is REJECTED (so the bad file isn't left to mislabel the account as "Token login"), and
+ *  after an interactive OAuth login SUCCEEDS (so an older stale paste no longer wins the label over the
+ *  fresh keychain session). Returns whether a file was deleted. */
+export function clearPastedToken(configDir: string): Promise<boolean> {
+  return invoke<boolean>("account_clear_pasted_token", { configDir });
+}
+
 // NO TypeScript binding for the Rust `accounts_spend` command lives here any more. It backed the
 // concierge SPEND pill — a trailing-24h estimate of cross-project token value at Anthropic LIST
 // price, in dollars, that only ever counted UP and was never billed. It sat 8px from the remaining

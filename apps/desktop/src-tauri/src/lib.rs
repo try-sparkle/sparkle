@@ -1860,6 +1860,7 @@ pub fn run() {
             account_ledger::accounts_spawn_log,
             account_usage::account_usage_live,
             account_usage::account_set_oauth_token,
+            account_usage::account_clear_pasted_token,
             accounts::account_record_oauth_identity,
             trial::trial_status,
             trial::trial_start,

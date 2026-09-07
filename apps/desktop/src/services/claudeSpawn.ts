@@ -252,7 +252,7 @@ export function buildClaudeExec(
       ? `export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${RESUME_PROMPT_SUPPRESS_MINUTES}; ` +
         `export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${RESUME_PROMPT_SUPPRESS_TOKENS}; `
       : "";
-  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}${resumeThresholdExport}${PAGER_ENV_EXPORT}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}${resumeThresholdExport}${PAGER_ENV_EXPORT}${CLAUDE_OAUTH_TOKEN_FROM_CARRIER}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
 /**
@@ -298,7 +298,7 @@ export function buildClaudeLoginExec(claudePath: string, opts: { configDir?: str
   // ANTHROPIC_ENV_UNSET is load-bearing and came from the parallel auth-gate fix: with an API-key
   // env var set, `claude` authenticates with THAT instead of running the OAuth browser flow, so the
   // sign-in silently does nothing. Both halves of this bug had to be fixed for a login to work.
-  return `${configExport}${ANTHROPIC_ENV_UNSET}${PAGER_ENV_EXPORT}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} ${CLAUDE_LOGIN_ARGV}`;
+  return `${configExport}${ANTHROPIC_ENV_UNSET}${CLAUDE_OAUTH_TOKEN_UNSET}${PAGER_ENV_EXPORT}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} ${CLAUDE_LOGIN_ARGV}`;
 }
 
 /** FNV-1a 32-bit, hex. Not a security hash — just a short, stable, collision-resistant token for a
@@ -397,6 +397,26 @@ const ANTHROPIC_ENV_UNSET =
  */
 const PAGER_ENV_EXPORT =
   "export PAGER=cat GIT_PAGER=cat GH_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; ";
+
+// Deliver a pasted setup-token to an AGENT child as CLAUDE_CODE_OAUTH_TOKEN (the credential the macOS
+// `claude` CLI reads — it does not read the <config_dir>/.credentials.json Sparkle writes). This MUST
+// run in the exec string, i.e. AFTER the `zsh -l` login shell sources ~/.zprofile / ~/.zshenv, because
+// a CommandBuilder env is clobbered by the profile — exactly the reason PAGER_ENV_EXPORT and
+// ANTHROPIC_ENV_UNSET are in-script rather than set on the Rust command (roborev finding, PR #3047).
+// The secret is handed in from Rust (pty.rs apply_pty_oauth_token) under the carrier name
+// SPARKLE_CLAUDE_OAUTH_TOKEN, never in this string or in argv; export it as the real var for a paste
+// account, else unset any ambient one, then drop the carrier.
+const CLAUDE_OAUTH_TOKEN_FROM_CARRIER =
+  'if [ -n "${SPARKLE_CLAUDE_OAUTH_TOKEN:-}" ]; then ' +
+  'export CLAUDE_CODE_OAUTH_TOKEN="$SPARKLE_CLAUDE_OAUTH_TOKEN"; ' +
+  "else unset CLAUDE_CODE_OAUTH_TOKEN; fi; unset SPARKLE_CLAUDE_OAUTH_TOKEN; ";
+
+// The login path must NEVER be handed a token: with CLAUDE_CODE_OAUTH_TOKEN set, `claude auth login`
+// authenticates with THAT instead of running the browser OAuth flow (the same failure
+// ANTHROPIC_ENV_UNSET prevents), which would trap a user re-authenticating an account whose pasted
+// token expired. Unset both the delivered var and the carrier, in-script, after the profile
+// (roborev finding, PR #3047).
+const CLAUDE_OAUTH_TOKEN_UNSET = "unset CLAUDE_CODE_OAUTH_TOKEN SPARKLE_CLAUDE_OAUTH_TOKEN; ";
 
 /** Build the inline JSON for `claude --mcp-config` that launches the Sparkle orchestrator MCP
  *  server (a stdio child) wired to this build agent's bridge. The bridge socket + token ride in
