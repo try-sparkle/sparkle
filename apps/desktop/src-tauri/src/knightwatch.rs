@@ -90,7 +90,7 @@ use std::time::Duration;
 
 /// The ONLY discriminator for a knightwatch review. See rule 1 in the module header: the bot posts
 /// under a human account, so `login` proves nothing in either direction.
-const REVIEW_MARKER: &str = "<!-- knightwatch-reviewer:auto-post -->";
+pub(crate) const REVIEW_MARKER: &str = "<!-- knightwatch-reviewer:auto-post -->";
 
 /// Sparkle's OWN PR-scoped reviewer (`scripts/pr-review.sh`), which replaced the upstream one after
 /// its access was withdrawn. A DISTINCT marker on purpose — posting under the upstream bot's would
@@ -106,7 +106,7 @@ const REVIEW_MARKER: &str = "<!-- knightwatch-reviewer:auto-post -->";
 /// module header states ("a later knightwatch comment can NEVER answer a probe, or the bot clears
 /// its own gate"), defeated by a bot this gate could not see was one. Adding a producer without
 /// teaching the consumer its marker is a gate bypass, not a missing feature.
-const SPARKLE_REVIEW_MARKER: &str = "<!-- sparkle-reviewer:auto-post -->";
+pub(crate) const SPARKLE_REVIEW_MARKER: &str = "<!-- sparkle-reviewer:auto-post -->";
 
 /// The upstream bot's own name, as `[review].pr_reviewer` spells it. It is also the value the
 /// config defaults to when the key is absent, so this is "today's behaviour" rather than a special
@@ -423,7 +423,7 @@ fn backticked_after(s: &str, marker: &str) -> Option<String> {
 /// together), so a pure quote-reply no longer reaches this function as a review at all. The nesting
 /// rule is not thereby retired: the shape it still guards is a GENUINE review — leading marker, so a
 /// review whatever the anchor says — that quotes an older round underneath its own status.
-fn first_level_quote(line: &str) -> Option<&str> {
+pub(crate) fn first_level_quote(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix('>')?;
     let rest = rest.strip_prefix(' ').unwrap_or(rest);
     (!rest.trim_start().starts_with('>')).then_some(rest)

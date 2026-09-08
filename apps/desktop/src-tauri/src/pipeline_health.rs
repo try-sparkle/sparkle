@@ -2119,9 +2119,85 @@ fn held_clause(held: &[Version]) -> String {
 // recently; one that has stopped leaves open PRs sitting unreviewed. That is the freshness signal
 // [`classify_knightwatch`] classifies, replacing the flat "liveness is not yet monitored" Unknown.
 
-/// Marker every sparkle-reviewer review comment carries (stamped by `scripts/pr-review.sh`). It is
-/// how both merge gates already recognise a review, so it is the right liveness fingerprint too.
-const REVIEWER_COMMENT_MARKER: &str = "sparkle-reviewer:auto-post";
+/// The marker every review comment carries, keyed to the CONFIGURED reviewer. It is how both merge
+/// gates already recognise a review, so it is the right liveness fingerprint too.
+///
+/// KEYED TO THE NAME, NOT HARDCODED (bead `sparkle-9hs48d`). This probe used to hardcode the
+/// sparkle marker, so after `[review].pr_reviewer` flipped to `knightwatch` on 2026-09-03 the
+/// in-app health chip matched a marker the configured reviewer never posts, read
+/// `last_review_age_secs = None`, and classified the LIVE reviewer as stale/never — the founder's
+/// false knightwatch warnings. Mirrors `marker_for_reviewer()` in `scripts/pipeline-health-scan.sh`
+/// and `ReviewTrigger::from_reviewer` in `knightwatch.rs`: `knightwatch` → its own marker, every
+/// other name (and empty/unknown) → the legacy sparkle marker. Keying to the name is the point — a
+/// knightwatch repo whose only reviews carry the sparkle marker is exactly the "configured producer
+/// posts nothing" case this probe must surface, so it is not widened to match both markers.
+// Referenced from `knightwatch.rs`'s canonical consts, not re-declared, so the two cannot drift by
+// construction (bead sparkle-9hs48d). knightwatch.rs's markers are pinned to `scripts/probe-gate.sh`
+// cross-language by `scripts/tests/probe-gate.test.sh`.
+const KNIGHTWATCH_REVIEWER_MARKER: &str = crate::knightwatch::REVIEW_MARKER;
+const SPARKLE_REVIEWER_MARKER: &str = crate::knightwatch::SPARKLE_REVIEW_MARKER;
+
+fn marker_for_reviewer(pr_reviewer: &str) -> &'static str {
+    if pr_reviewer.trim().eq_ignore_ascii_case("knightwatch") {
+        KNIGHTWATCH_REVIEWER_MARKER
+    } else {
+        SPARKLE_REVIEWER_MARKER
+    }
+}
+
+/// THE MARKER ALONE DOES NOT IDENTIFY A REVIEW (bead `sparkle-9hs48d`). knightwatch stamps the SAME
+/// `<!-- knightwatch-reviewer:auto-post -->` on lifecycle STATUS posts, and the paused one re-posts
+/// every ~2 min during a quota block (`.claude/skills/babysit-pr/SKILL.md`). Counting those as the
+/// newest "review" holds `last_review_age_secs` fresh and renders HEALTHY while the reviewer is
+/// quota-blocked and reviewing nothing — a false green that silently hides an outage on the
+/// founder's chip, strictly worse than the false Warning this fix started from.
+const KNIGHTWATCH_STATUS_PREFIXES: [&str; 3] =
+    ["👀 reviewing", "⏸ knightwatch paused", "⏭ review superseded"];
+
+/// True when a marker-bearing body is a lifecycle STATUS post, not a review. The FIRST content line
+/// is normalised the way the babysit skill and the merge gate read these (`.claude/skills/babysit-pr/SKILL.md`
+/// § knightwatch STATUS posts): drop ALL leading `<!-- … -->` comment spans (the auto-post marker
+/// AND any `ai-author` line — plural), strip a FIRST-LEVEL blockquote marker via the canonical
+/// [`crate::knightwatch::first_level_quote`] (real status posts are blockquoted, e.g.
+/// `> ⏸ knightwatch paused`), trim, THEN match the three lifecycle prefixes.
+///
+/// An UNRECOGNISED marker-bearing form returns `false` (i.e. it still counts) — wrong in the cheap
+/// direction (one stale reading) rather than the expensive one (silently dropping a real review),
+/// matching the same rule the babysit skill states.
+fn is_knightwatch_status_post(body: &str) -> bool {
+    for raw in body.lines() {
+        let no_comments = strip_html_comments(raw);
+        // Depth-1 blockquote only; a bare (unquoted) line comes back unchanged.
+        let content = crate::knightwatch::first_level_quote(&no_comments)
+            .unwrap_or(no_comments.as_str())
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+        return KNIGHTWATCH_STATUS_PREFIXES.iter().any(|p| content.starts_with(p));
+    }
+    false
+}
+
+/// Remove every `<!-- … -->` HTML-comment span from one line, keeping the surrounding text — so an
+/// inline `<!-- …auto-post --> ⏸ knightwatch paused` reduces to its content and a standalone comment
+/// line reduces to empty. Mirrors the shell `gsub("<!--.*?-->"; "")` in the scan's liveness read.
+fn strip_html_comments(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// How fresh the newest review must be for the reviewer to read as live. Reviews are dispatched per
 /// push by the app's babysit sweep, so a couple of days without one — WHILE PRs wait — is the signal
@@ -2210,11 +2286,11 @@ fn github_ts_age_secs(ts: &str, now_epoch: i64) -> Option<u64> {
     Some((now_epoch - then).max(0) as u64)
 }
 
-/// The newest sparkle-reviewer review timestamp in a `gh api .../issues/comments` payload, or `None`
-/// if no comment in the page carries the marker. Takes the MAX `updated_at` (RFC3339 sorts
+/// The newest review timestamp in a `gh api .../issues/comments` payload, or `None` if no comment
+/// in the page carries the CONFIGURED reviewer's `marker`. Takes the MAX `updated_at` (RFC3339 sorts
 /// chronologically as text) rather than trusting the request's sort order.
-fn newest_reviewer_comment_ts(json: &str) -> Option<String> {
-    newest_reviewer_comment_scan(json).and_then(|(ts, _)| ts)
+fn newest_reviewer_comment_ts(json: &str, marker: &str) -> Option<String> {
+    newest_reviewer_comment_scan(json, marker).and_then(|(ts, _)| ts)
 }
 
 /// The scan behind [`newest_reviewer_comment_ts`], returning BOTH halves: the newest reviewer
@@ -2226,7 +2302,10 @@ fn newest_reviewer_comment_ts(json: &str) -> Option<String> {
 ///
 /// `None` means the payload was not the comments shape at all — an error body, truncated JSON — and
 /// is the caller's UNREADABLE case, distinct from a well-formed page holding nothing of interest.
-fn newest_reviewer_comment_scan(json: &str) -> Option<(Option<String>, (usize, Option<String>))> {
+fn newest_reviewer_comment_scan(
+    json: &str,
+    marker: &str,
+) -> Option<(Option<String>, (usize, Option<String>))> {
     let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
     let items = value.as_array()?;
     let mut oldest_any: Option<String> = None;
@@ -2243,15 +2322,20 @@ fn newest_reviewer_comment_scan(json: &str) -> Option<(Option<String>, (usize, O
             }
         }
     }
-    let newest = newest_reviewer_ts_in(items);
+    let newest = newest_reviewer_ts_in(items, marker);
     Some((newest, (items.len(), oldest_any)))
 }
 
-fn newest_reviewer_ts_in(items: &[serde_json::Value]) -> Option<String> {
+fn newest_reviewer_ts_in(items: &[serde_json::Value], marker: &str) -> Option<String> {
     let mut newest: Option<String> = None;
     for c in items {
         let body = c.get("body").and_then(|b| b.as_str()).unwrap_or("");
-        if !body.contains(REVIEWER_COMMENT_MARKER) {
+        if !body.contains(marker) {
+            continue;
+        }
+        // The marker matches lifecycle STATUS posts too; those are not reviews (bead
+        // `sparkle-9hs48d`). Skip them, or a quota-paused reviewer reads as HEALTHY.
+        if is_knightwatch_status_post(body) {
             continue;
         }
         let ts = c
@@ -2299,6 +2383,22 @@ fn humanize_age(secs: u64) -> String {
 ///     manual-restart command in the detail.
 ///   * no fresh review and NO open PRs → `Healthy` (idle): nothing to review, and the reviewer runs
 ///     on demand, so silence is expected and not a fault.
+/// The manual-restart remedy, keyed to the CONFIGURED reviewer exactly as [`marker_for_reviewer`]
+/// is (bead `sparkle-9hs48d`). Both strings are kept BYTE-IDENTICAL to `restart` in
+/// `scripts/lib/pipeline-health.sh` — move the two halves together.
+const SPARKLE_RESTART: &str =
+    "Reviews are dispatched by the app's babysit sweep; run `scripts/pr-review.sh <PR#> --post` to review manually.";
+const KNIGHTWATCH_RESTART: &str =
+    "Reviews are posted by knightwatch on another machine; trigger one by commenting `/srosro-update-review` on a waiting PR and confirm the review lands.";
+
+fn restart_remedy(reviewer_name: &str) -> &'static str {
+    if reviewer_name.trim().eq_ignore_ascii_case("knightwatch") {
+        KNIGHTWATCH_RESTART
+    } else {
+        SPARKLE_RESTART
+    }
+}
+
 fn classify_knightwatch(
     has_no_reviewer: bool,
     reviewer_name: &str,
@@ -2319,8 +2419,12 @@ fn classify_knightwatch(
             ),
         );
     };
-    const RESTART: &str = "Reviews are dispatched by the app's babysit sweep; run \
-                           `scripts/pr-review.sh <PR#> --post` to review manually.";
+    // The remedy is DERIVED FROM THE CONFIGURED REVIEWER (bead `sparkle-9hs48d`), the same way the
+    // marker is. `scripts/pr-review.sh` posts the SPARKLE marker, which this probe now refuses to
+    // count on a knightwatch repo — so telling a knightwatch operator to run it leaves the chip
+    // Warning forever. knightwatch is triggered on another machine (mirrors `ReviewTrigger::clear_it`
+    // in `knightwatch.rs`). Kept byte-identical to `restart` in `scripts/lib/pipeline-health.sh`.
+    let restart = restart_remedy(reviewer_name);
     match l.last_review_age_secs {
         Some(age) if age <= KNIGHTWATCH_FRESH_SECS => (
             HealthState::Healthy,
@@ -2332,7 +2436,7 @@ fn classify_knightwatch(
                 "'{reviewer_name}' last posted a review {} ago and open PR(s) are waiting — the \
                  reviewer may not be running. {}",
                 humanize_age(age),
-                RESTART
+                restart
             ),
         ),
         // A STALE REVIEW WITH AN UNREADABLE PR LIST (bead `sparkle-gazo4a`). We know when the
@@ -2386,7 +2490,7 @@ fn classify_knightwatch(
             format!(
                 "no recent '{reviewer_name}' review was found and open PR(s) are waiting — the \
                  reviewer may not be running. {}",
-                RESTART
+                restart
             ),
         ),
         None => (
@@ -2400,7 +2504,11 @@ fn classify_knightwatch(
 /// repo's recent issue comments) could not be performed — an auth lapse or a 503, the same fail-safe
 /// as every other component. A successful read with no reviewer comment in it is a real answer
 /// ("no recent review"), not an unreadable one.
-fn read_knightwatch_liveness(gh_program: Option<&str>, root: &str) -> Option<KnightwatchLiveness> {
+fn read_knightwatch_liveness(
+    gh_program: Option<&str>,
+    root: &str,
+    marker: &str,
+) -> Option<KnightwatchLiveness> {
     let program = gh_program?;
     let comments = gh_api_text(
         program,
@@ -2409,8 +2517,9 @@ fn read_knightwatch_liveness(gh_program: Option<&str>, root: &str) -> Option<Kni
     )?;
     let now = now_epoch_secs();
     // ONE SCAN, TWO FACTS (bead `sparkle-gazo4a`): what we found, and how far we could see. The
-    // second is what makes "we found nothing" interpretable at all.
-    let (newest, (page_len, oldest_any)) = newest_reviewer_comment_scan(&comments)?;
+    // second is what makes "we found nothing" interpretable at all. The marker we look for is the
+    // CONFIGURED reviewer's own, never a hardcoded string (bead `sparkle-9hs48d`).
+    let (newest, (page_len, oldest_any)) = newest_reviewer_comment_scan(&comments, marker)?;
     let last_review_age_secs = newest.and_then(|ts| github_ts_age_secs(&ts, now));
     let horizon = crate::probe_outcome::ReadHorizon {
         // A FULL page is a truncated view by definition: the read asked for `per_page` and got
@@ -3008,7 +3117,10 @@ fn knightwatch_component(gh_program: Option<&str>, root: &str) -> ComponentHealt
     let liveness = if review.has_no_pr_reviewer() {
         None
     } else {
-        read_knightwatch_liveness(gh_program, root)
+        // The marker is keyed to the CONFIGURED reviewer name (bead `sparkle-9hs48d`), so a
+        // knightwatch-configured repo reads knightwatch reviews as live rather than looking for a
+        // sparkle marker the reviewer never posts.
+        read_knightwatch_liveness(gh_program, root, marker_for_reviewer(review.pr_reviewer.trim()))
     };
     let (state, detail) =
         classify_knightwatch(review.has_no_pr_reviewer(), review.pr_reviewer.trim(), liveness.as_ref());
@@ -6170,6 +6282,18 @@ mod tests {
         }
     }
 
+    /// Read a SHARED knightwatch fixture by name, from `CARGO_MANIFEST_DIR` (the same locator
+    /// `knightwatch.rs`'s own tests use), so this twin and the shell twin assert the SAME bytes.
+    /// `scripts/tests/fixtures/knightwatch/` is a wholesale RUST_RE entry, so this runtime read is
+    /// sanctioned by `scripts/tests/ci-change-filter.test.sh` and is NOT a boundary violation.
+    fn read_knightwatch_fixture(name: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/tests/fixtures/knightwatch")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("the shared fixture {} must exist: {e}", path.display()))
+    }
+
     /// A reading assembled by hand, for the false-absence cases that vary the two facts the ladder
     /// tests hold fixed.
     fn liveness_with(
@@ -6226,6 +6350,182 @@ mod tests {
         assert_eq!(state, HealthState::Healthy, "no open PRs to review → an old last-review is fine");
     }
 
+    /// The liveness marker is keyed to the CONFIGURED reviewer (bead `sparkle-9hs48d`).
+    ///
+    /// The `[review].pr_reviewer` config flipped from `sparkle-reviewer` to `knightwatch` on
+    /// 2026-09-03, and the reviewer stamps `<!-- knightwatch-reviewer:auto-post -->` on its posts —
+    /// NOT the sparkle marker. This probe used to hardcode the sparkle marker, so on a
+    /// knightwatch-configured repo a demonstrably fresh knightwatch review matched NOTHING,
+    /// `last_review_age_secs` came back `None`, and the LIVE reviewer classified as down — the
+    /// founder's false in-app health warnings.
+    ///
+    /// ASSERTED ON THE SIDE EFFECT (the classified state), and PAIRED so it cannot be satisfied by
+    /// widening the marker to match both:
+    ///   * knightwatch repo + a fresh KNIGHTWATCH-marked review          → Healthy (counted as live)
+    ///   * knightwatch repo + a fresh SPARKLE-only marker, nothing else  → NOT Healthy (the
+    ///     configured producer posted nothing while open PRs wait — the exact false-warning input,
+    ///     which the OLD hardcode produced for the knightwatch page above too).
+    #[test]
+    fn knightwatch_liveness_marker_is_keyed_to_the_configured_reviewer() {
+        // A knightwatch-configured repo resolves to the knightwatch marker.
+        let kw_marker = marker_for_reviewer("knightwatch");
+        assert_eq!(kw_marker, "<!-- knightwatch-reviewer:auto-post -->", "knightwatch → its own marker");
+        assert_eq!(
+            marker_for_reviewer("sparkle-reviewer"),
+            "<!-- sparkle-reviewer:auto-post -->",
+            "every other name → the legacy sparkle marker"
+        );
+
+        // A FIXED clock, so "fresh" is deterministic rather than wall-clock dependent.
+        let now = github_ts_to_epoch("2026-09-03T12:00:00Z").unwrap();
+        let fresh_ts = "2026-09-03T00:00:00Z"; // 12h before `now`, well inside the 48h window
+
+        // Assemble a liveness the way `read_knightwatch_liveness` does — but scanning for the
+        // configured (knightwatch) marker, with open PRs waiting.
+        let assemble = |json: &str| -> KnightwatchLiveness {
+            let (newest, (page_len, oldest_any)) =
+                newest_reviewer_comment_scan(json, kw_marker).expect("comments-shaped payload");
+            liveness_with(
+                newest.and_then(|ts| github_ts_age_secs(&ts, now)),
+                Some(true),
+                crate::probe_outcome::ReadHorizon {
+                    truncated: page_len >= KNIGHTWATCH_COMMENT_PAGE,
+                    oldest_seen_secs: oldest_any.as_deref().and_then(|ts| github_ts_age_secs(ts, now)),
+                },
+            )
+        };
+
+        // A page carrying the KNIGHTWATCH marker → the review is COUNTED, fresh → Healthy.
+        let kw_page =
+            format!(r#"[{{"body":"review {kw_marker}\n> ok","updated_at":"{fresh_ts}"}}]"#);
+        let live = assemble(&kw_page);
+        assert_eq!(live.last_review_age_secs, Some(12 * 3600), "the knightwatch review is COUNTED");
+        let (state, detail) = classify_knightwatch(false, "knightwatch", Some(&live));
+        assert_eq!(state, HealthState::Healthy, "a fresh knightwatch review reads live: {detail}");
+
+        // The CONVERSE, so the marker is really keyed to the name and not widened to match both: a
+        // page carrying ONLY the legacy sparkle marker, on a knightwatch repo, is the configured
+        // producer posting nothing — it must NOT read as live.
+        let sparkle_only =
+            format!(r#"[{{"body":"review {SPARKLE_REVIEWER_MARKER}\n> ok","updated_at":"{fresh_ts}"}}]"#);
+        let dark = assemble(&sparkle_only);
+        assert_eq!(dark.last_review_age_secs, None, "a sparkle-only marker is NOT the knightwatch reviewer posting");
+        let (state, detail) = classify_knightwatch(false, "knightwatch", Some(&dark));
+        assert_eq!(state, HealthState::Warning, "the configured producer posted nothing while PRs wait → down: {detail}");
+        assert_ne!(state, HealthState::Healthy, "and it is certainly not read as live");
+        // FINDING 3 (dead remedy): the knightwatch Warning must NOT prescribe pr-review.sh, which
+        // posts the SPARKLE marker this probe refuses to count on a knightwatch repo — following it
+        // would leave the chip Warning forever.
+        assert!(!detail.contains("pr-review.sh"), "knightwatch remedy must not name pr-review.sh: {detail}");
+        assert!(detail.contains("/srosro-update-review"), "it names the knightwatch remedy: {detail}");
+    }
+
+    /// FINDING 1 (bead `sparkle-9hs48d`, CRITICAL — false HEALTHY). The marker ALONE is not a
+    /// review: knightwatch stamps it on lifecycle STATUS posts, and the `⏸ paused` one re-posts
+    /// every ~2 min during a quota block. Counting those held the age fresh → HEALTHY while the
+    /// reviewer was blocked. Asserted on the SIDE EFFECT and PAIRED against a real review, with the
+    /// UNRECOGNISED form still counting (wrong in the cheap direction).
+    #[test]
+    fn knightwatch_lifecycle_status_posts_are_not_reviews() {
+        let kw = marker_for_reviewer("knightwatch");
+
+        // ── DRIVEN OFF THE REPO'S OWN FIXTURE BYTES, read at runtime through CARGO_MANIFEST_DIR
+        // (the SANCTIONED cross-boundary form — `scripts/tests/fixtures/knightwatch/` is a wholesale
+        // RUST_RE entry, so this is NOT a boundary violation; `scripts/tests/ci-change-filter.test.sh`
+        // sanctions exactly this). Reading the REAL bytes is what gives the shared-bytes property the
+        // round-3 filter needs: this Rust twin and the shell twin assert against the SAME files.
+        // status-posts.json — three lifecycle forms → NONE counts as a review.
+        assert_eq!(
+            newest_reviewer_comment_scan(&read_knightwatch_fixture("status-posts.json"), kw)
+                .expect("comments-shaped").0,
+            None,
+            "every lifecycle status post must be skipped (status-posts.json)"
+        );
+        // paused-over-a-real-review.json — the NEWEST comment is a BLOCKQUOTED `> ⏸ knightwatch
+        // paused`; it must be skipped so the real review UNDERNEATH (id 1) is the liveness reading.
+        assert_eq!(
+            newest_reviewer_comment_scan(&read_knightwatch_fixture("paused-over-a-real-review.json"), kw)
+                .expect("comments-shaped").0.as_deref(),
+            Some("2026-08-06T09:00:00Z"),
+            "the blockquoted paused repost must NOT mask the real review under it"
+        );
+        // trailing-content-on-the-marker-line-cannot-answer.json — real reviews with INLINE content
+        // on the marker line (`<!-- …auto-post --> 📋 Re-review at …`) still count.
+        assert_eq!(
+            newest_reviewer_comment_scan(
+                &read_knightwatch_fixture("trailing-content-on-the-marker-line-cannot-answer.json"),
+                kw,
+            )
+            .expect("comments-shaped").0.as_deref(),
+            Some("2026-08-31T11:00:00Z"),
+            "a real review with inline content on the marker line still counts"
+        );
+
+        // ── FRESH-STAMPED SHAPES, so a marker-only match WOULD read Healthy: the assertion of a
+        // filtered-out (None) reading is what pins the shape normaliser. ──────────────────────────
+        let now = github_ts_to_epoch("2026-09-03T12:00:00Z").unwrap();
+        let fresh_ts = "2026-09-03T00:00:00Z"; // 12h ago — fresh.
+        let scan_newest = |body: &str| -> Option<String> {
+            let page = serde_json::json!([{ "body": body, "updated_at": fresh_ts }]).to_string();
+            newest_reviewer_comment_scan(&page, kw).expect("comments-shaped").0
+        };
+        // BLOCKQUOTED (the mutation target), INLINE on the marker line, and a second ai-author
+        // COMMENT line between marker and content — each freshly stamped, each must be filtered out.
+        for body in [
+            format!("{kw}\n> ⏸ knightwatch paused — out of quota."),
+            format!("{kw} ⏸ knightwatch paused — quota exhausted."),
+            format!("{kw}\n<!-- knightwatch-reviewer:ai-author sonnet -->\n> ⏸ knightwatch paused — out of quota."),
+            format!("{kw}\n> 👀 reviewing"),
+            format!("{kw}\n> ⏭ review superseded by a newer run."),
+        ] {
+            assert_eq!(scan_newest(&body), None, "a fresh lifecycle post must be skipped: {body:?}");
+        }
+
+        // The blockquoted paused, freshly stamped, drives the SIDE EFFECT: Warning, NOT Healthy.
+        let live = liveness_with(
+            scan_newest(&format!("{kw}\n> ⏸ knightwatch paused — out of quota.")).and_then(|ts| github_ts_age_secs(&ts, now)),
+            Some(true),
+            crate::probe_outcome::ReadHorizon { truncated: false, oldest_seen_secs: github_ts_age_secs(fresh_ts, now) },
+        );
+        assert_eq!(live.last_review_age_secs, None, "a fresh BLOCKQUOTED paused post is still not a review");
+        let (state, detail) = classify_knightwatch(false, "knightwatch", Some(&live));
+        assert_eq!(state, HealthState::Warning, "a quota-paused reviewer must read Warning, NOT Healthy: {detail}");
+        assert_ne!(state, HealthState::Healthy, "the false-HEALTHY regression must not return");
+
+        // A REAL review still counts; an UNRECOGNISED marker-bearing form still counts (cheap dir).
+        let real = format!("{kw}\n> 📋 First review of this PR — reviewed `abc1234`.\n\n**Probes**\n\nNone.");
+        assert_eq!(scan_newest(&real).as_deref(), Some(fresh_ts), "a real review still counts");
+        let unknown = format!("{kw}\n🤖 some status form we have never seen");
+        assert_eq!(scan_newest(&unknown).as_deref(), Some(fresh_ts), "an unrecognised form still counts (cheap direction)");
+    }
+
+    /// FINDING 2 (bead `sparkle-9hs48d`, vacuous coverage). The call-site WIRING is covered by
+    /// nothing else — the closures above rebuild the body, and the no-gh constructor returns before
+    /// the marker is read — so mutating the call site back to a hardcoded marker stays green. Pin it
+    /// in source (house precedent: the `include_str!("pipeline_health.rs")` corpus guard).
+    ///
+    /// The MARKER consts are pinned STRUCTURALLY, not here: `KNIGHTWATCH_REVIEWER_MARKER` /
+    /// `SPARKLE_REVIEWER_MARKER` are defined AS `crate::knightwatch::REVIEW_MARKER` /
+    /// `SPARKLE_REVIEW_MARKER`, so they cannot drift from the crate's canonical markers by
+    /// construction (an assertion here would be `assert_eq!(X, X)`). Cross-LANGUAGE parity to
+    /// `scripts/probe-gate.sh` is owned by the SHELL side — `scripts/tests/probe-gate.test.sh` pins
+    /// knightwatch.rs's `REVIEW_MARKER`/`SPARKLE_REVIEW_MARKER` against probe-gate.sh's
+    /// `MARKER`/`SPARKLE_MARKER`, and reading probe-gate.sh from the crate would make CI's `RUST_RE`
+    /// path filter incomplete (`scripts/tests/ci-change-filter.test.sh` guards that).
+    #[test]
+    fn the_liveness_read_is_wired_to_the_configured_reviewer_marker() {
+        let src = include_str!("pipeline_health.rs");
+        // Slice ABOVE the test module: this assertion's own text is a second copy of the pattern
+        // (grep-count 2, always green), so search only PRODUCTION source — mutating the real call
+        // site back to a hardcoded marker must red this (bead sparkle-9hs48d).
+        let prod = &src[..src.find("mod tests").expect("tests module")];
+        assert!(
+            prod.contains("read_knightwatch_liveness(gh_program, root, marker_for_reviewer(review.pr_reviewer"),
+            "bead sparkle-9hs48d: the liveness read must be keyed to the CONFIGURED reviewer's \
+             marker at the call site; a hardcoded marker there would otherwise stay green"
+        );
+    }
+
     /// The liveness PARSERS, so the reads feeding the ladder above are covered too.
     #[test]
     fn knightwatch_liveness_parsers() {
@@ -6246,11 +6546,11 @@ mod tests {
             {"body":"review <!-- sparkle-reviewer:auto-post -->","updated_at":"2026-01-02T00:00:00Z"},
             {"body":"newer review <!-- sparkle-reviewer:auto-post -->","updated_at":"2026-01-04T00:00:00Z"}
         ]"#;
-        assert_eq!(newest_reviewer_comment_ts(comments).as_deref(), Some("2026-01-04T00:00:00Z"));
+        assert_eq!(newest_reviewer_comment_ts(comments, SPARKLE_REVIEWER_MARKER).as_deref(), Some("2026-01-04T00:00:00Z"));
         // No marker anywhere → None (real "no review", distinct from an unreadable read).
-        assert_eq!(newest_reviewer_comment_ts(r#"[{"body":"hi","updated_at":"2026-01-01T00:00:00Z"}]"#), None);
+        assert_eq!(newest_reviewer_comment_ts(r#"[{"body":"hi","updated_at":"2026-01-01T00:00:00Z"}]"#, SPARKLE_REVIEWER_MARKER), None);
         // An error body (not an array) → None.
-        assert_eq!(newest_reviewer_comment_ts(r#"{"message":"Bad credentials"}"#), None);
+        assert_eq!(newest_reviewer_comment_ts(r#"{"message":"Bad credentials"}"#, SPARKLE_REVIEWER_MARKER), None);
 
         // has_open_prs_from_json: non-empty array true, empty false, error body false.
         assert!(has_open_prs_from_json(r#"[{"number":1}]"#));
