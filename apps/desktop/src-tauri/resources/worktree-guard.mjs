@@ -2124,6 +2124,40 @@ const GH_SHORT_VALUE_FLAGS = new Set(["t", "b", "F", "A"]);
  *  `gh pr merge 41 -mR <foreign>` and `-sR<foreign>` named a repo the guard never saw, while
  *  `-st '-Rebase before merging'` had its commit SUBJECT read as a repo name and was refused —
  *  prose, with no approval path. Walking the cluster answers both with one rule. */
+/** Percent-decode a URL path the way gh tolerates it, WITHOUT throwing. decodeURIComponent throws
+ *  on a byte JS rejects as invalid UTF-8 (%80/%C0/%FF — which Go's url.Parse keeps as a raw byte) and
+ *  on a malformed escape (%zz). Neither must abandon the decode of the REST: gh discards everything
+ *  past OWNER/REPO, so a poison byte in a trailing segment must not stop the owner/repo from decoding
+ *  (roborev 82013). Try a whole-string decode first (correct for valid multi-byte sequences); on
+ *  failure fall back to a per-escape best-effort that leaves the un-decodable bytes literal. */
+function percentDecodeLoose(x) {
+  try {
+    return decodeURIComponent(x);
+  } catch {
+    return x.replace(/%[0-9a-fA-F]{2}/g, (m) => {
+      try {
+        return decodeURIComponent(m);
+      } catch {
+        return m;
+      }
+    });
+  }
+}
+
+/** OWNER/REPO named by a `gh pr merge` URL operand, else null. gh accepts the PR as a URL
+ *  (`[<number> | <url> | <branch>]`), and a URL names the target repo in the command string —
+ *  `[scheme://][host/]OWNER/REPO/pull/<n>` — which the -R/--repo/GH_REPO reads never see. A bare
+ *  number or a branch names no repo (roborev 81888). */
+function prUrlRepo(operand) {
+  if (typeof operand !== "string") return null;
+  // gh matches its pullURLRE against the DECODED u.Path, so decode the operand BEFORE the match — an
+  // escaped `/pull/` separator (`%2Fpull%2F`) is a segment boundary for gh but would miss the raw
+  // regex entirely (roborev 82043, 81981/81982). normalizeSlug sees this scheme-less result and does
+  // not re-decode it.
+  const m = /(?:^|\/)([^/]+)\/([^/]+)\/pull\/\d+/.exec(percentDecodeLoose(operand));
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
 function ghRepoOverrides(assignments, args) {
   const out = [];
   for (const t of assignments) {
@@ -2132,7 +2166,16 @@ function ghRepoOverrides(assignments, args) {
   }
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (!a.startsWith("-") || a === "-" || a === "--") continue;
+    if (!a.startsWith("-") || a === "-" || a === "--") {
+      // A bare operand. Options that take a value have already consumed theirs via `i++` below
+      // (--body/--subject/--body-file, -b/-F, …), so a `--body <url>` value never reaches here —
+      // only a true positional does. gh's PR-URL operand names the target repo, so extract it; it
+      // then flows through normalizeSlug -> targets -> the pinned floor and the target-scoped rules
+      // like any explicit -R target (roborev 81888).
+      const urlRepo = prUrlRepo(a);
+      if (urlRepo !== null) out.push(urlRepo);
+      continue;
+    }
     if (a.startsWith("--")) {
       if (a === "--repo") {
         if (args[i + 1] !== undefined) out.push(args[i + 1]);
@@ -2260,9 +2303,17 @@ function scanMergeTokens(tokens, depth, acc, inherited = []) {
   const merge = mergeSegment(tokens, assignments);
   if (merge) {
     acc.merges = true;
-    for (const t of merge.targetRepos) {
-      if (typeof t === "string" && t.length > 0) acc.targets.push(t);
-    }
+    // PER-SEGMENT target accounting. A merge that names NO target repo (`-R`/`--repo`/`GH_REPO`)
+    // merges the repo of the directory it runs in, so its verdict comes from a candidate directory's
+    // OWN policy — never from the target-scoped resolution. This is recorded per merge rather than
+    // derived from the command-wide `acc.targets` array on purpose: reading `!hasTargets` in the
+    // judge meant a single targeted merge ANYWHERE on the line flipped every OTHER merge onto the
+    // target-scoped path, so `cd <protected> && gh pr merge 41` after a `-R` merge was laundered
+    // through a protected worktree (bead sparkle-psg1uh, roborev job 81715). Filtered to non-empty
+    // targets exactly as the push below is, so `-R ''` (no effective override) counts as untargeted.
+    const namedTargets = merge.targetRepos.filter((t) => typeof t === "string" && t.length > 0);
+    if (namedTargets.length === 0) acc.hasUntargetedMerge = true;
+    for (const t of namedTargets) acc.targets.push(t);
     return;
   }
   if (SHELL_BINARIES.has(bin)) {
@@ -2372,15 +2423,75 @@ function mergePolicyCandidateDirs(cwd, cdDirs) {
  *
  *  Any filesystem failure while resolving a policy is itself the unreadable state — a merge is
  *  irreversible and "we could not tell" must never read as "allowed". */
+// The BUILD-PINNED merge-protection FLOOR. This is the hand-written TWIN of the
+// `MERGE_PROTECTED_SLUGS` constant in `services/conciergeTools/policy.ts` and of its copies in the
+// Rust side; all of them are kept in sync by a drift test that reads
+// `shared/merge-protected-repos.json` from disk and asserts they match (see
+// mergePolicyGuard.test.ts and policy.pinnedRepos.test.ts). It is a COMPILED constant on purpose,
+// NOT a runtime read of that JSON: `apps/desktop/shared/` is not in tauri.conf.json's
+// `bundle.resources`, so reading the file at runtime resolves in the dev tree and FAILS OPEN in
+// the shipped DMG — no pinned slugs, no floor — which is the worst outcome available for a security
+// floor. These slugs are repos Sparkle will NEVER merge on its own authority, whatever any policy
+// file or config says — for any merge whose target repo this guard can identify: by an explicit
+// -R/--repo/GH_REPO, by a PR-URL operand (`.../OWNER/REPO/pull/<n>`), or by a policy file in the
+// checkout it runs in. RESIDUAL (tracked, not closed here): a TRULY bare `gh pr merge <number>` in
+// a pinned repo's checkout that has NO policy file at all names the repo nowhere in the command, so
+// it cannot be identified without reading the git remote — which this string/filesystem guard does
+// not do. See bead sparkle-psg1uh follow-up.
+export const MERGE_PROTECTED_SLUGS = ["plow-pbc/tkmx-client", "plow-pbc/tkmx-server"];
+
 export function blocksProtectedMerge(command, cwd) {
   if (typeof command !== "string" || command.length === 0) return null;
   // Cheap bail-out. `gh` is the only binary this rule can fire on, so a command that never mentions
   // it cannot be a merge — and this keeps the guard's cost at one substring test for the ~100% of
   // commands that are not merges.
   if (!command.includes("gh")) return null;
-  const acc = { merges: false, dirs: [], targets: [] };
+  const acc = { merges: false, dirs: [], targets: [], hasUntargetedMerge: false };
   scanMergeCommand(command, 0, acc);
   if (!acc.merges) return null;
+
+  // THE REPO THIS COMMAND MERGES, not the repo the session happens to sit in. `gh` does not read
+  // its target repo from the worktree when the caller names one (`-R`/`--repo`/`GH_REPO`), so when a
+  // target IS named the merge lands there and the session worktree's own policy has NO bearing on
+  // it — a protected `plow-pbc/tkmx-client` session must not block `gh pr merge -R drodio/sparkle`,
+  // and the refusal that did so named a repo the command never mentioned (bead sparkle-psg1uh). A
+  // policy governs this merge only when the directory it describes is one of the named targets.
+  const targets = [];
+  for (const t of acc.targets) {
+    const n = normalizeSlug(t);
+    if (n !== null && !targets.includes(n)) targets.push(n);
+  }
+  const hasTargets = targets.length > 0;
+  // Whether any merge on the line named NO target repo. Such a merge lands in the repo of the
+  // directory it runs in, so it is judged by a candidate directory's OWN policy — the pre-`-R`
+  // behaviour — and NOT by the target-scoped resolution below. Tracked per merge segment in
+  // `scanMergeTokens` rather than derived from `hasTargets`, because command-wide accumulation let
+  // one `-R` merge launder a protected untargeted merge past the guard (bead sparkle-psg1uh).
+  const hasUntargetedMerge = acc.hasUntargetedMerge;
+  // The cwd-policy rule (first blocking policy on the line wins) must fire whenever an untargeted
+  // merge is present AND, for safety, whenever NO usable target was resolved at all — a merge whose
+  // only `-R` value cannot be normalised to a slug must still be judged by the directory it runs in,
+  // fail-closed, exactly as the pre-`-R` guard did.
+  const judgeCwdPolicy = hasUntargetedMerge || !hasTargets;
+
+  // The first OK policy on the line — the repo the caller is standing in — so a foreign-target
+  // refusal can still name it, even though it is not the repo being merged.
+  let home = null;
+  const coveredTargets = new Set();
+  // Whether ANY policy file was actually resolved on the line. The foreign-target refusal below is
+  // fail-closed for an UNRESOLVABLE named target — but only inside a policy-aware environment. With
+  // NO policy anywhere (the ABSENT "no opinion" state — every worktree predating this feature, this
+  // repo included) it must stay null, or `gh pr merge 41 -R drodio/sparkle` from an unmanaged
+  // worktree is refused with a DO-NOT-RETRY that asserts a policy which does not exist — a
+  // self-contradictory instruction the agent would act on (bead sparkle-psg1uh, roborev job 81716).
+  let sawAnyPolicy = false;
+
+  // The build-pinned slugs, normalized once for every comparison below — both the per-target floor
+  // after the loop AND the untargeted cwd-policy check inside it. Hoisted here (it was previously
+  // computed only at the floor) so a bare `gh pr merge` in a pinned repo's own checkout can consult
+  // it too: a pin is a FLOOR, so no policy file may loosen it (roborev 81829, bead sparkle-psg1uh).
+  const pinnedNormalized = MERGE_PROTECTED_SLUGS.map((p) => normalizeSlug(p)).filter((p) => p !== null);
+
   for (const dir of mergePolicyCandidateDirs(cwd, acc.dirs)) {
     let found;
     try {
@@ -2395,25 +2506,85 @@ export function blocksProtectedMerge(command, cwd) {
       };
     }
     if (found === null) continue; // ABSENT at and above this dir — no opinion, keep looking
+    sawAnyPolicy = true;
     const verdict = judgeMergePolicy(found);
-    if (verdict.kind !== "ok") return verdict; // the first BLOCKING policy on the line wins
-    // THE POLICY SAID YES — TO A QUESTION ABOUT ITS OWN REPO. `gh` does not read the target repo
-    // from the worktree when the caller names one, so `gh pr merge 41 -R other/repo` run from an
-    // unprotected worktree is judged by a policy that describes a DIFFERENT repository. A policy
-    // can only speak for the slug it names, so a mismatch is refused rather than waved through:
-    // this guard has no way to resolve the other repo's policy, and "we could not tell" must never
-    // read as "allowed" on an irreversible act.
-    const foreign = acc.targets.find((t) => normalizeSlug(t) !== normalizeSlug(found.slugOf));
-    if (foreign !== undefined) {
+    // The repo THIS directory's policy describes. Resolved up here (it was previously derived only in
+    // the targeted branch) so the untargeted cwd-policy rule can consult the pin with it.
+    const dirSlug = normalizeSlug(found.slugOf ?? verdict.slug);
+
+    // BUILD-PINNED FLOOR on the UNTARGETED path. A bare `gh pr merge` in a pinned repo's own checkout
+    // is judged by this directory's policy, so a stale or hand-edited `mergeProtected:false` (or any
+    // `ok`) file there would LOOSEN a build-pinned slug — which merge-protected-repos.json's header
+    // says config can NEVER do. Consult the pin here, slug already in hand, so an ok policy cannot
+    // un-pin (roborev 81829, bead sparkle-psg1uh). Only on the cwd-policy path: a TARGETED merge is
+    // decided by `targets` and the per-target floor after the loop.
+    if (judgeCwdPolicy && dirSlug !== null && pinnedNormalized.includes(dirSlug)) {
+      return { kind: "protected", file: found.file, slug: dirSlug, why: null, remedy: null, target: dirSlug };
+    }
+
+    // The untargeted-merge rule, judged FIRST and INDEPENDENTLY of the target-scoped logic below: a
+    // merge that named no target merges the repo of the directory it runs in, so this candidate
+    // directory's own policy decides it, and the first BLOCKING policy on the line wins. A line that
+    // carries BOTH a targeted and an untargeted merge is judged by both halves — strictest wins.
+    if (judgeCwdPolicy && verdict.kind !== "ok") return verdict;
+
+    if (!hasTargets) {
+      // No explicit target anywhere on the line — only the untargeted-merge rule above applies.
+      continue;
+    }
+
+    // An explicit target is named. This directory's policy speaks only for the repo it describes, so
+    // it decides a TARGETED merge only when that repo is one of the named targets. `dirSlug` is
+    // resolved above the untargeted floor, which needs it too.
+    // Remember where the caller is standing (the first resolvable policy on the line), so a
+    // foreign-target refusal names it — whether that repo is protected or unprotected.
+    if (home === null && (found.slugOf ?? verdict.slug)) {
+      home = { file: found.file, slug: found.slugOf ?? verdict.slug };
+    }
+    if (verdict.kind === "ok") {
+      if (dirSlug !== null && targets.includes(dirSlug)) coveredTargets.add(dirSlug);
+      continue; // an OK policy for a non-target repo says nothing — neither covers nor blocks
+    }
+    // A BLOCKING verdict (protected/unreadable). It governs only when this directory's repo is one
+    // the command actually merges; when the repo is knowably NOT a named target, `gh` is merging a
+    // different repo and this policy has no say (the session-worktree over-block this bead fixes).
+    // When the repo cannot be identified — a tampered file with no slug — fail closed and block.
+    if (dirSlug === null || targets.includes(dirSlug)) return verdict;
+    // else: knowably foreign repo — this directory is not what is being merged; keep looking.
+  }
+
+  // THE BUILD-PINNED FLOOR, decided PER TARGET and BEFORE the `sawAnyPolicy` relaxation below. A
+  // slug on MERGE_PROTECTED_SLUGS is never mergeable on Sparkle's own authority, so a PINNED target
+  // must be refused even when NO policy file resolved anywhere on the line — the unmanaged-worktree
+  // hole the `sawAnyPolicy` gate opened, where `gh pr merge -R plow-pbc/tkmx-server` from a worktree
+  // with no policy fell through to null (ALLOW). Judged here, per target and ahead of the
+  // sawAnyPolicy fall-through, it closes that hole without disturbing the ABSENT "no opinion"
+  // behaviour for UNPINNED targets (roborev jobs 81792/81793, bead sparkle-psg1uh). `targets` are
+  // already normalized slugs; the pins are normalized the same way (and normalizeSlug now strips a
+  // bare `github.com/` host prefix too), so a `.git` suffix or a host prefix on the override cannot
+  // slip past. `pinnedNormalized` is computed once above the loop.
+  const pinnedTarget = targets.find((t) => pinnedNormalized.includes(t));
+  if (pinnedTarget !== undefined) {
+    return { kind: "protected", file: home ? home.file : null, slug: pinnedTarget, why: null, remedy: null, target: pinnedTarget };
+  }
+
+  // Only refuse an unresolved target when a policy was actually resolved somewhere on the line: with
+  // none, the environment has "no opinion" (ABSENT) and must stay null (see `sawAnyPolicy` above).
+  if (hasTargets && sawAnyPolicy) {
+    // Every named target that no matching policy permitted is a repo this guard could not resolve —
+    // its policy is not on any directory the command touched. A merge is irreversible and "we could
+    // not tell" must never read as "allowed", so refuse, naming the target and the caller's repo.
+    const uncovered = targets.find((t) => !coveredTargets.has(t));
+    if (uncovered !== undefined) {
       return {
         kind: "foreign-target",
-        file: found.file,
-        slug: verdict.slug,
+        file: home ? home.file : null,
+        slug: home ? home.slug : null,
         // No `why`: the head sentence carries this reason, and `why` is rendered under a
         // `Policy says:` label that would misattribute guard-authored text to the policy file.
         why: null,
         remedy: null,
-        target: normalizeSlug(foreign),
+        target: uncovered,
       };
     }
   }
@@ -2425,8 +2596,48 @@ export function blocksProtectedMerge(command, cwd) {
  *  policy slug never accidentally MATCHES an override — that direction has to fail closed. */
 function normalizeSlug(s) {
   if (typeof s !== "string" || s.length === 0) return null;
-  let v = s.trim().toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
-  v = v.replace(/^(?:https?:\/\/|git@|ssh:\/\/)[^/:]+[/:]/, "");
+  // A single left-to-right reduction to OWNER/REPO — NOT a bag of order-independent regexes. The
+  // earlier chained form mis-ordered the `.git`/slash strip and stopped the host at the first `:`,
+  // leaving a `:port` (or a `.git/` suffix) in the value so it never equalled a pin (roborev
+  // 81919/81920). gh reduces a URL via ghrepo.FromURL — Hostname() (drops the port), Trim path
+  // slashes, THEN TrimSuffix ".git" — so mirror that order, in one pass.
+  let v = s.trim().toLowerCase();
+  // 1. URL scheme + authority for ANY protocol gh accepts (http(s), ssh, git, git+ssh, git+https),
+  //    with an optional user@ and an optional :port — gh reads Hostname(), so the port is dropped.
+  const afterScheme = v.replace(/^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]*@)?[^/:]+(?::\d+)?\//, "");
+  // 2. git's SCP short form, which has no `://`: `git@github.com:owner/repo`.
+  const afterScp = afterScheme.replace(/^[^/:@]+@[^/:]+:/, "");
+  // A scheme:// or SCP prefix WAS present iff one of those strips changed the value. gh only treats
+  // that as a URL (git.IsURL -> ParseURL -> FromURL); a scheme-less value goes to FromFullName.
+  const wasUrl = afterScp !== v;
+  v = afterScp;
+  if (wasUrl) {
+    // gh's url.Parse splits the raw ?query/#fragment off FIRST, then hands FromURL the percent-
+    // DECODED u.Path (the raw form lives in RawPath). Mirror both, URL-arm ONLY — the scheme-less
+    // FromFullName arm is literal and must NOT decode, or `github.com/owner/re%2Dpo` (a different
+    // repo to gh) would false-block. Strip the raw query/fragment BEFORE decoding, and decode ONCE
+    // (gh decodes once: `%252D` stays `%2d`, it does NOT become `-`). decodeURIComponent THROWS on a
+    // malformed escape (`%zz`, a lone `%`) — url.Parse rejects those too, so keep the literal on
+    // throw and still return a verdict (roborev 81981/81982).
+    v = v.replace(/[?#].*$/, "");
+    // gh compares owner/repo case-insensitively (strings.EqualFold), and its decoded u.Path can yield
+    // an UPPERCASE letter (%54 -> 'T'), so re-fold AFTER decoding — the entry toLowerCase ran before
+    // this decode existed, leaving %41-%5A uppercase and unmatched (roborev 82012/82013).
+    v = percentDecodeLoose(v).toLowerCase();
+  }
+  // 3. Trim slashes on BOTH ends — gh's `strings.Trim(u.Path, "/")`. A lone trailing trim left
+  //    `github.com//owner/repo` with a leading slash (roborev 81950/81951).
+  v = v.replace(/^\/+|\/+$/g, "");
+  let seg = v.split("/");
+  // 4. Drop a scheme-less HOST remnant (`github.com/owner/repo`): a first segment that is dotted
+  //    (github.com) or a purely-numeric port remnant. A GitHub OWNER is never either.
+  if (seg.length >= 3 && (seg[0].includes(".") || /^\d+$/.test(seg[0]))) seg = seg.slice(1);
+  // 5. gh does SplitN(path, "/", 3) and keeps parts[0:2], DISCARDING everything past OWNER/REPO — so
+  //    `owner/repo/pull/41` and `owner/repo/anything` reduce to `owner/repo`. Truncating a
+  //    scheme-less `owner/repo/extra` gh would reject is the fail-closed direction and is safe.
+  if (seg.length > 2) seg = seg.slice(0, 2);
+  // 6. Finally strip a `.git` suffix from the repo segment (gh's TrimSuffix, after the path trim).
+  v = seg.join("/").replace(/\.git$/, "");
   return v.length > 0 ? v : null;
 }
 

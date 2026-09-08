@@ -66,6 +66,12 @@ declare module "*/worktree-guard.mjs" {
   // Reads the file only after the command is recognised as a merge, and sees inside a compound
   // (`cd other && gh pr merge`) — which is the whole reason the lexer layer exists, since a
   // prefix-matched deny rule cannot.
+  // The BUILD-PINNED merge-protection FLOOR: repos Sparkle will NEVER merge on its own authority,
+  // whatever any policy file or config says. A hand-written twin of `MERGE_PROTECTED_SLUGS` in
+  // services/conciergeTools/policy.ts (and the Rust copies), kept in sync by a drift test that reads
+  // shared/merge-protected-repos.json. `blocksProtectedMerge` refuses a pinned target per-target,
+  // ahead of the sawAnyPolicy fall-through, so it blocks even from an UNMANAGED worktree with no policy.
+  export const MERGE_PROTECTED_SLUGS: readonly string[];
   export function blocksProtectedMerge(
     command: unknown,
     cwd: unknown,

@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { blocksProtectedMerge } from "../../src-tauri/resources/worktree-guard.mjs";
+import { blocksProtectedMerge, MERGE_PROTECTED_SLUGS } from "../../src-tauri/resources/worktree-guard.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fixture = JSON.parse(
@@ -269,18 +269,18 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
   // names one. So an override is the cheap version of the `cd` laundering above, and the two halves
   // of the hole failed in OPPOSITE directions.
   it("refuses a merge whose --repo is not the repo this worktree's policy describes", () => {
-    const v = blocksProtectedMerge("gh pr merge 41 -R plow-pbc/tkmx-server", worktree(OPEN));
+    const v = blocksProtectedMerge("gh pr merge 41 -R acme/widgets", worktree(OPEN));
     expect(v?.kind).toBe("foreign-target");
     // …while the same worktree happily merges its OWN repo, so this is not "any --repo blocks".
     expect(blocksProtectedMerge("gh pr merge 41 -R drodio/sparkle", worktree(OPEN))).toBeNull();
   });
 
   it.each([
-    ["separate word", "gh pr merge 41 -R plow-pbc/tkmx-server"],
-    ["long form", "gh pr merge 41 --repo plow-pbc/tkmx-server"],
-    ["equals form", "gh pr merge 41 --repo=plow-pbc/tkmx-server"],
-    ["attached shorthand", "gh pr merge 41 -Rplow-pbc/tkmx-server"],
-    ["environment", "GH_REPO=plow-pbc/tkmx-server gh pr merge 41"],
+    ["separate word", "gh pr merge 41 -R acme/widgets"],
+    ["long form", "gh pr merge 41 --repo acme/widgets"],
+    ["equals form", "gh pr merge 41 --repo=acme/widgets"],
+    ["attached shorthand", "gh pr merge 41 -Racme/widgets"],
+    ["environment", "GH_REPO=acme/widgets gh pr merge 41"],
   ])("catches the %s spelling", (_label, command) => {
     expect(blocksProtectedMerge(command, worktree(OPEN))?.kind).toBe("foreign-target");
   });
@@ -296,11 +296,11 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
   });
 
   it.each([
-    ["bare", "GH_REPO=plow-pbc/tkmx-server gh pr merge 41"],
-    ["behind env", "env GH_REPO=plow-pbc/tkmx-server gh pr merge 41"],
-    ["behind nohup env", "nohup env GH_REPO=plow-pbc/tkmx-server gh pr merge 41"],
-    ["inside env -S", "env -S 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'"],
-    ["inside a shell -c", "bash -lc 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'"],
+    ["bare", "GH_REPO=acme/widgets gh pr merge 41"],
+    ["behind env", "env GH_REPO=acme/widgets gh pr merge 41"],
+    ["behind nohup env", "nohup env GH_REPO=acme/widgets gh pr merge 41"],
+    ["inside env -S", "env -S 'GH_REPO=acme/widgets gh pr merge 41'"],
+    ["inside a shell -c", "bash -lc 'GH_REPO=acme/widgets gh pr merge 41'"],
   ])("follows the environment override %s", (_label, command) => {
     // ONE WORD defeated this: `envParse` skips NAME=value operands as env's own before handing on
     // the tail, so the assignment never reached the gh segment. An environment override is in force
@@ -313,9 +313,9 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
     // override where the picker looks first and the hostile one that actually runs is never seen.
     // Both spellings were live, and the first was a regression introduced by the inheritance fix.
     for (const command of [
-      "env GH_REPO=drodio/sparkle bash -lc 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
-      "env GH_REPO=drodio/sparkle gh pr merge 41 -R plow-pbc/tkmx-server",
-      "gh pr merge 41 -R drodio/sparkle --repo plow-pbc/tkmx-server",
+      "env GH_REPO=drodio/sparkle bash -lc 'GH_REPO=acme/widgets gh pr merge 41'",
+      "env GH_REPO=drodio/sparkle gh pr merge 41 -R acme/widgets",
+      "gh pr merge 41 -R drodio/sparkle --repo acme/widgets",
     ]) {
       expect(blocksProtectedMerge(command, worktree(OPEN))?.kind, command).toBe("foreign-target");
     }
@@ -334,7 +334,7 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
     // The split command is not a SUFFIX of env's args, so the tail branch's length arithmetic
     // cannot serve it — and narrowing to "the words env owns" left it with nothing at all.
     expect(
-      blocksProtectedMerge("env GH_REPO=plow-pbc/tkmx-server -S 'gh pr merge 41'", worktree(OPEN))?.kind,
+      blocksProtectedMerge("env GH_REPO=acme/widgets -S 'gh pr merge 41'", worktree(OPEN))?.kind,
     ).toBe("foreign-target");
     // The paired direction, and the shape that must NOT be swallowed: a `-S` string that STARTS
     // with an assignment is assignment-shaped as a token, so reading it as one would turn the whole
@@ -349,10 +349,10 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
     // `envRunTokenLists` says so in as many words and the tail branch already composes them; the
     // split branch scanned the string alone and threw them away.
     expect(
-      blocksProtectedMerge("env -S 'gh pr merge 41' -R plow-pbc/tkmx-server", worktree(OPEN))?.kind,
+      blocksProtectedMerge("env -S 'gh pr merge 41' -R acme/widgets", worktree(OPEN))?.kind,
     ).toBe("foreign-target");
     expect(
-      blocksProtectedMerge("env --split-string='gh pr merge 41' -R plow-pbc/tkmx-server", worktree(OPEN))?.kind,
+      blocksProtectedMerge("env --split-string='gh pr merge 41' -R acme/widgets", worktree(OPEN))?.kind,
     ).toBe("foreign-target");
     // The paired direction, or the rule collapses into "any -S with operands blocks".
     expect(blocksProtectedMerge("env -S 'gh pr merge 41' -R drodio/sparkle", worktree(OPEN))).toBeNull();
@@ -361,7 +361,7 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
   it("excludes the -S value POSITIONALLY, so repeating it cannot launder a real assignment", () => {
     expect(
       blocksProtectedMerge(
-        "env GH_REPO=plow-pbc/tkmx-server -S 'GH_REPO=plow-pbc/tkmx-server' gh pr merge 41",
+        "env GH_REPO=acme/widgets -S 'GH_REPO=acme/widgets' gh pr merge 41",
         worktree(OPEN),
       )?.kind,
     ).toBe("foreign-target");
@@ -383,9 +383,9 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
     }
     // …and the same spellings still REFUSE a foreign one, or the exclusion has just gone blind.
     for (const command of [
-      "env -iS 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
-      "env --split 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
-      "env -iS 'gh pr merge 41' -R plow-pbc/tkmx-server",
+      "env -iS 'GH_REPO=acme/widgets gh pr merge 41'",
+      "env --split 'GH_REPO=acme/widgets gh pr merge 41'",
+      "env -iS 'gh pr merge 41' -R acme/widgets",
     ]) {
       expect(blocksProtectedMerge(command, worktree(OPEN))?.kind, command).toBe("foreign-target");
     }
@@ -394,8 +394,8 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
   it("walks BUNDLED shorthand clusters, which pflag accepts and a whole-token test misses", () => {
     // The third time this file has had to learn the cluster walk (see envParse's own
     // letter-by-letter comment). It fails in BOTH directions at once when it is not done.
-    expect(blocksProtectedMerge("gh pr merge 41 -mR plow-pbc/tkmx-server", worktree(OPEN))?.kind).toBe("foreign-target");
-    expect(blocksProtectedMerge("gh pr merge 41 -sRplow-pbc/tkmx-server", worktree(OPEN))?.kind).toBe("foreign-target");
+    expect(blocksProtectedMerge("gh pr merge 41 -mR acme/widgets", worktree(OPEN))?.kind).toBe("foreign-target");
+    expect(blocksProtectedMerge("gh pr merge 41 -sRacme/widgets", worktree(OPEN))?.kind).toBe("foreign-target");
     expect(blocksProtectedMerge("gh pr merge 41 -mR drodio/sparkle", worktree(OPEN))).toBeNull();
     // …and the over-block half: an exact-token test could not see the `t` inside `-st`, so a
     // commit SUBJECT beginning with -R was read as a repo name and refused with no approval path.
@@ -419,7 +419,7 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
     ).toBeNull();
     // …and skipping those values must not cost the real override sitting beside them.
     expect(
-      blocksProtectedMerge("gh pr merge 41 -t '-Rebase' -R plow-pbc/tkmx-server", worktree(OPEN))?.kind,
+      blocksProtectedMerge("gh pr merge 41 -t '-Rebase' -R acme/widgets", worktree(OPEN))?.kind,
     ).toBe("foreign-target");
   });
 
@@ -435,7 +435,7 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
     // Under-block: that same misreading shadowed a real foreign --repo beside it.
     expect(
       blocksProtectedMerge(
-        "env gh pr merge 41 --subject 'GH_REPO=drodio/sparkle' -R plow-pbc/tkmx-server",
+        "env gh pr merge 41 --subject 'GH_REPO=drodio/sparkle' -R acme/widgets",
         worktree(OPEN),
       )?.kind,
     ).toBe("foreign-target");
@@ -450,13 +450,144 @@ describe("blocksProtectedMerge — an explicit --repo override", () => {
   });
 
   it("names the targeted repo and refuses the obvious wrong remedy", () => {
-    const { status, stderr } = runGuard("gh pr merge 41 -R plow-pbc/tkmx-server", worktree(OPEN));
+    const { status, stderr } = runGuard("gh pr merge 41 -R acme/widgets", worktree(OPEN));
     expect(status).toBe(2);
-    expect(stderr).toContain("plow-pbc/tkmx-server");
+    expect(stderr).toContain("acme/widgets");
     expect(stderr).toContain("drodio/sparkle");
     // Dropping the override would merge a DIFFERENT PR, so the copy must not offer it as the way out.
     expect(stderr).toMatch(/is NOT the remedy/);
     expect(stderr).toContain("DO NOT RETRY");
+  });
+});
+
+describe("blocksProtectedMerge — the SESSION worktree does not decide another repo's merge (sparkle-psg1uh)", () => {
+  // The incident: the agent's SESSION worktree was a merge-protected repo, and it merged a PR in a
+  // DIFFERENT, unprotected repo. `gh` reads its target from `-R`/`GH_REPO`, not from the worktree, so
+  // the session's protection describes a repo the command never touches — yet the guard read it,
+  // blocked the merge, and named the wrong repo in a DO-NOT-RETRY refusal with no approval path. The
+  // policy that governs a merge is the TARGET repo's, resolved from where that repo is checked out.
+  //
+  // These build TWO real worktrees whose policies DIFFER (the "same-file, different-source" trap):
+  // the session's file must not be the source the verdict is read from when the command names, and
+  // runs in, a different repo. Each case is paired with its opposite so neither is vacuous.
+
+  it("resolves the TARGET repo's policy (allow), not the protected session it runs from", () => {
+    const session = worktree(PROTECTED); // plow-pbc/tkmx-server, mergeProtected: true
+    const target = worktree(OPEN); //       drodio/sparkle, mergeProtected: false
+    // The merge targets drodio/sparkle and runs in its checkout; the session is merely where the
+    // shell started. The OLD guard returned the session's `protected` verdict here.
+    expect(
+      blocksProtectedMerge(`cd ${target} && gh pr merge 41 -R drodio/sparkle`, session),
+    ).toBeNull();
+  });
+
+  it("still BLOCKS when that resolved target repo is itself protected — a resolution, not a blanket allow", () => {
+    // The paired direction: without it, the case above is satisfied by a guard that ignores the
+    // session AND every target. A protected target is refused with its OWN `protected` verdict —
+    // not the coarser `foreign-target`, because the target's policy WAS resolvable here.
+    const session = worktree(OPEN); //   drodio/sparkle, mergeProtected: false
+    const target = worktree(PROTECTED); // plow-pbc/tkmx-server, mergeProtected: true
+    expect(
+      blocksProtectedMerge(`cd ${target} && gh pr merge 41 -R plow-pbc/tkmx-server`, session)?.kind,
+    ).toBe("protected");
+  });
+
+  it("refuses an UNRESOLVABLE foreign target by naming the TARGET, never the session's own repo", () => {
+    // No checkout of the target is on the command's path, so its policy cannot be read. The old guard
+    // returned the session's `protected` verdict, naming plow-pbc/tkmx-server — a repo the command
+    // never mentioned. It must fail closed on the TARGET (foreign-target), not on the session.
+    const v = blocksProtectedMerge("gh pr merge 41 -R drodio/sparkle", worktree(PROTECTED));
+    expect(v?.kind).toBe("foreign-target");
+    expect(v?.target).toBe("drodio/sparkle");
+    // The head sentence must name the target, and must NOT read as a protected-repo refusal of the
+    // session (the exact wrong-repo message the bead reports).
+    const { status, stderr } = runGuard("gh pr merge 41 -R drodio/sparkle", worktree(PROTECTED));
+    expect(status).toBe(2);
+    expect(stderr).toContain("drodio/sparkle");
+    expect(stderr).not.toMatch(/refusing to merge a pull request in "plow-pbc\/tkmx-server"/);
+  });
+
+  it("still blocks when the explicit target IS the protected session's own repo", () => {
+    // The narrowing must not go too far: naming your own protected repo on `-R` is still a protected
+    // merge. This pins the block direction so "ignore a foreign target" cannot become "ignore -R".
+    expect(
+      blocksProtectedMerge("gh pr merge 41 -R plow-pbc/tkmx-server", worktree(PROTECTED))?.kind,
+    ).toBe("protected");
+    // And a bare merge in the protected session (no override) is unchanged — the session's own repo.
+    expect(blocksProtectedMerge("gh pr merge 41", worktree(PROTECTED))?.kind).toBe("protected");
+  });
+});
+
+describe("blocksProtectedMerge — MULTIPLE merges on one line are judged per segment (sparkle-psg1uh)", () => {
+  // roborev jobs 81715/81716 on PR #3052 found two HIGH bugs that BOTH shipped because every earlier
+  // case used a SINGLE-merge command line. (1) SECURITY REGRESSION: `acc.targets` accumulated
+  // COMMAND-WIDE, so one `-R` merge anywhere flipped EVERY merge onto the target-scoped path — a bare
+  // merge in a protected worktree, the very thing this guard exists to stop, was then read as "some
+  // other repo's" and ALLOWED. (2) ABSENT over-block: the post-loop foreign-target refusal fired when
+  // NO policy existed anywhere, refusing an ordinary merge from an unmanaged worktree with a
+  // DO-NOT-RETRY that asserted a policy which does not exist. Each case is paired with its opposite.
+
+  it("BLOCKS an untargeted merge in a protected `cd` target even when an EARLIER merge named -R (laundering)", () => {
+    const open = worktree(OPEN); //      drodio/sparkle, unprotected
+    const prot = worktree(PROTECTED); // plow-pbc/tkmx-server, protected
+    const session = worktree(OPEN); //   unprotected session
+    // The first merge legitimately targets an unprotected repo; the SECOND, after a `cd` into a
+    // protected worktree, names no target and so merges THAT worktree's own repo. The old code
+    // allowed it because merge 7's `-R` made hasTargets=true for merge 41 too.
+    const laundering = `cd ${open} && gh pr merge 7 -R drodio/sparkle && cd ${prot} && gh pr merge 41`;
+    expect(blocksProtectedMerge(laundering, session)?.kind).toBe("protected");
+  });
+
+  it("…and PERMITS the same shape when the `cd` target is unprotected — not 'any multi-merge blocks'", () => {
+    const open = worktree(OPEN);
+    const alsoOpen = worktree(OPEN);
+    const session = worktree(OPEN);
+    const benign = `cd ${open} && gh pr merge 7 -R drodio/sparkle && cd ${alsoOpen} && gh pr merge 41`;
+    expect(blocksProtectedMerge(benign, session)).toBeNull();
+  });
+
+  it("BLOCKS a bare untargeted merge sharing a line with a targeted one, in a protected session", () => {
+    // No `cd` at all: the untargeted merge 41 runs in the protected session. Command-wide
+    // accumulation read merge 41 as targeting drodio/sparkle (inherited from merge 7) and let it by.
+    const session = worktree(PROTECTED);
+    expect(
+      blocksProtectedMerge("gh pr merge 7 -R drodio/sparkle && gh pr merge 41", session)?.kind,
+    ).toBe("protected");
+    // Paired: the same two merges in an UNPROTECTED session are both fine.
+    expect(
+      blocksProtectedMerge("gh pr merge 7 -R drodio/sparkle && gh pr merge 41", worktree(OPEN)),
+    ).toBeNull();
+  });
+
+  it("ABSENT stays null even WITH an explicit UNPINNED -R target — no policy anywhere means no opinion", () => {
+    // The over-block direction: the post-loop foreign-target refusal must NOT fire when no policy
+    // file was resolved on any candidate dir. This repo itself has no .sparkle/merge-policy.json.
+    // Both targets are UNPINNED: a PINNED target from an unmanaged worktree is refused by the build
+    // floor regardless (see the pinned-floor describe below), so "no opinion" is the ABSENT rule
+    // only for the repos that floor does NOT cover.
+    expect(blocksProtectedMerge("gh pr merge 41 -R drodio/sparkle", worktree())).toBeNull();
+    expect(blocksProtectedMerge("gh pr merge 41 -R acme/widgets", worktree())).toBeNull();
+  });
+
+  it("…but a RESOLVED policy for an UNRESOLVABLE target still fails closed (foreign-target)", () => {
+    // The paired direction: gating on sawAnyPolicy must not turn every unresolved target into an
+    // allow. In a MANAGED worktree whose policy names a different repo than the target, the guard
+    // cannot tell whether the target permits merging, so on an irreversible act it refuses.
+    const v = blocksProtectedMerge("gh pr merge 41 -R drodio/sparkle", worktree(PROTECTED));
+    expect(v?.kind).toBe("foreign-target");
+    expect(v?.target).toBe("drodio/sparkle");
+  });
+
+  it("the shipped hook exits 0 on the ABSENT+target merge and 2 on the laundering merge", () => {
+    // Drive the PROCESS, so both fixes are proven WIRED INTO main(), not just the predicate.
+    expect(runGuard("gh pr merge 41 -R drodio/sparkle", worktree()).status).toBe(0);
+    const open = worktree(OPEN);
+    const prot = worktree(PROTECTED);
+    const session = worktree(OPEN);
+    expect(
+      runGuard(`cd ${open} && gh pr merge 7 -R drodio/sparkle && cd ${prot} && gh pr merge 41`, session)
+        .status,
+    ).toBe(2);
   });
 });
 
@@ -820,5 +951,326 @@ describe("the refusal copy", () => {
     // The guard's own instructions survive the oversized field.
     expect(msg).toContain("DO NOT RETRY");
     expect(msg.split("\n").filter((l) => l.startsWith("Policy remedy:"))).toHaveLength(1);
+  });
+});
+
+describe("blocksProtectedMerge — the build-pinned floor (roborev 81792/81793)", () => {
+  // THE HOLE the floor closes: `sawAnyPolicy` correctly stops an UNMANAGED worktree (no
+  // .sparkle/merge-policy.json) from refusing an ordinary merge — but the same gate let
+  // `gh pr merge -R plow-pbc/tkmx-server` from such a worktree fall through to ALLOW, even though
+  // that slug is build-pinned as never-mergeable. The floor is judged per target, ahead of the
+  // sawAnyPolicy fall-through, so a pinned target blocks whether or not any policy file resolved.
+
+  it("BLOCKS a pinned target from an UNMANAGED worktree, where no policy file exists at all", () => {
+    // The exact regression the two HIGH findings named: worktree() has NO policy file, so
+    // sawAnyPolicy is false and the old fall-through returned null (ALLOW).
+    const v = blocksProtectedMerge("gh pr merge 41 -R plow-pbc/tkmx-server", worktree());
+    expect(v?.kind).toBe("protected");
+    expect(v?.target).toBe("plow-pbc/tkmx-server");
+  });
+
+  it("BLOCKS the OTHER pinned repo too, so the floor is the whole list and not one entry", () => {
+    const v = blocksProtectedMerge("gh pr merge 41 -R plow-pbc/tkmx-client", worktree());
+    expect(v?.kind).toBe("protected");
+    expect(v?.target).toBe("plow-pbc/tkmx-client");
+  });
+
+  it("blocks EVERY pinned slug from an unmanaged worktree — keyed on the exported list, not a copy", () => {
+    // Reading MERGE_PROTECTED_SLUGS rather than re-listing the slugs means a repo added to the pin
+    // is covered here automatically, and removing the floor reds this whichever entry remains.
+    expect(MERGE_PROTECTED_SLUGS.length).toBeGreaterThan(0);
+    for (const slug of MERGE_PROTECTED_SLUGS) {
+      const v = blocksProtectedMerge(`gh pr merge 41 -R ${slug}`, worktree());
+      expect(v?.kind, slug).toBe("protected");
+      expect(v?.target, slug).toBe(slug);
+    }
+  });
+
+  it("blocks a pinned target even in a MANAGED worktree whose policy names a DIFFERENT repo", () => {
+    // Without the floor this reached `foreign-target` (the target's own policy was not on the path);
+    // the floor upgrades it to a definite `protected`, because a pinned repo is never mergeable
+    // whatever its own — possibly absent — policy would have said.
+    const v = blocksProtectedMerge("gh pr merge 41 -R plow-pbc/tkmx-server", worktree(OPEN));
+    expect(v?.kind).toBe("protected");
+    expect(v?.target).toBe("plow-pbc/tkmx-server");
+  });
+
+  it("normalizes the override, so a .git suffix, host prefix, or casing cannot slip a pinned repo past", () => {
+    for (const command of [
+      "gh pr merge 41 -R plow-pbc/tkmx-server.git",
+      "gh pr merge 41 --repo=git@github.com:plow-pbc/tkmx-server.git",
+      "gh pr merge 41 -R PLOW-PBC/TKMX-Server",
+    ]) {
+      expect(blocksProtectedMerge(command, worktree())?.kind, command).toBe("protected");
+    }
+  });
+
+  it("the shipped hook exits 2 on the pinned floor from an unmanaged worktree", () => {
+    // Prove the floor is WIRED INTO main(), not just the predicate.
+    expect(runGuard("gh pr merge 41 -R plow-pbc/tkmx-server", worktree()).status).toBe(2);
+  });
+});
+
+describe("blocksProtectedMerge — the floor holds under gh's host spelling and untargeted merges (roborev 81828/81829)", () => {
+  // Two HIGH findings on the floor commit, each a WIDENING hole the block-direction mutants of the
+  // original suite could not have found (it only ever pushed the block direction). Both are pinned
+  // here in BOTH directions: the pinned spelling/path must BLOCK, and the unpinned twin must NOT, so
+  // neither fix can over-reach into ordinary merges.
+
+  // --- 81828: gh's documented `[HOST/]OWNER/REPO` override spelling ---
+  it("BLOCKS the bare-host override spelling `-R github.com/OWNER/REPO` (roborev 81828)", () => {
+    // No scheme, so the scheme-strip in normalizeSlug missed it and exact-equality never matched the
+    // pin — a four-character bypass from an unmanaged worktree. normalizeSlug now drops a bare host.
+    const v = blocksProtectedMerge("gh pr merge 41 -R github.com/plow-pbc/tkmx-server", worktree());
+    expect(v?.kind).toBe("protected");
+    expect(v?.target).toBe("plow-pbc/tkmx-server");
+  });
+
+  it("BLOCKS the bare-host spelling via GH_REPO too", () => {
+    const v = blocksProtectedMerge("GH_REPO=github.com/plow-pbc/tkmx-server gh pr merge 41", worktree());
+    expect(v?.kind).toBe("protected");
+    expect(v?.target).toBe("plow-pbc/tkmx-server");
+  });
+
+  it("does NOT block a host-prefixed UNPINNED override — the host strip must not over-match", () => {
+    // MUST run against a MANAGED worktree. From worktree() (ABSENT) the result is null whether or not
+    // the host strip exists (sawAnyPolicy is false on that path), so it cannot grip an over-match —
+    // the earlier version of this test was vacuous for exactly that reason (roborev 81889). In
+    // worktree(OPEN) the target resolves to drodio/sparkle and is COVERED by its own ok policy → null;
+    // if normalization stopped reducing the host, the target would stay github.com/drodio/sparkle,
+    // never covered, and this reds as foreign-target.
+    expect(blocksProtectedMerge("gh pr merge 41 -R github.com/drodio/sparkle", worktree(OPEN))).toBeNull();
+  });
+
+  // --- 81829: a bare (untargeted) merge inside a pinned repo's own checkout ---
+  const STALE_PINNED_OPEN = {
+    version: 1,
+    slug: "plow-pbc/tkmx-server",
+    mergeProtected: false,
+    reason: "stale/hand-edited: written before the slug joined the pinned list",
+    remedy: "",
+  };
+
+  it("BLOCKS a bare merge in a pinned checkout whose OWN policy says mergeProtected:false (roborev 81829)", () => {
+    // The untargeted path is judged by the cwd's policy; an ok/false policy for a build-pinned repo
+    // would LOOSEN the pin. The floor is now consulted on this path too, so it cannot.
+    const v = blocksProtectedMerge("gh pr merge 41", worktree(STALE_PINNED_OPEN));
+    expect(v?.kind).toBe("protected");
+    expect(v?.target).toBe("plow-pbc/tkmx-server");
+  });
+
+  it("BLOCKS `cd <pinned checkout> && gh pr merge` where that checkout's policy would permit it", () => {
+    // Exercises the cd-dir scan (acc.dirs), not just the session cwd: the merge lands in the pinned
+    // repo the command cd's into, and its permissive policy must not un-pin it.
+    const pinned = worktree(STALE_PINNED_OPEN);
+    const v = blocksProtectedMerge(`cd '${pinned}' && gh pr merge 41`, worktree());
+    expect(v?.kind).toBe("protected");
+  });
+
+  it("does NOT block a bare merge in an UNPINNED checkout that permits it — the pin must not over-block", () => {
+    // worktree(OPEN) is drodio/sparkle, mergeProtected:false and unpinned; a bare merge there stays
+    // allowed. This is the paired allow direction for the untargeted floor.
+    expect(blocksProtectedMerge("gh pr merge 41", worktree(OPEN))).toBeNull();
+  });
+
+  // --- 81888: a PR URL operand names the target repo in the command string ---
+  it("BLOCKS a pinned repo named by a PR URL operand, from managed AND unmanaged worktrees (roborev 81888)", () => {
+    for (const wt of [worktree(), worktree(OPEN)]) {
+      const v = blocksProtectedMerge("gh pr merge https://github.com/plow-pbc/tkmx-server/pull/41", wt);
+      expect(v?.kind).toBe("protected");
+      expect(v?.target).toBe("plow-pbc/tkmx-server");
+    }
+  });
+
+  it("does NOT block an UNPINNED repo named by a PR URL from a managed worktree — the URL parse must not over-match", () => {
+    expect(
+      blocksProtectedMerge("gh pr merge https://github.com/drodio/sparkle/pull/41", worktree(OPEN)),
+    ).toBeNull();
+  });
+
+  it("does NOT treat a bare PR number or a URL with no repo as a target", () => {
+    // A number names no repo; neither does a URL without an OWNER/REPO/pull/<n> shape.
+    expect(blocksProtectedMerge("gh pr merge 41", worktree(OPEN))).toBeNull();
+    expect(blocksProtectedMerge("gh pr merge https://example.com/some/path", worktree(OPEN))).toBeNull();
+  });
+
+  // --- 81889: gh accepts git://, git+ssh://, git+https:// too, not just http(s)/ssh/scp ---
+  it("BLOCKS every URL-scheme spelling gh accepts for a pinned -R target (roborev 81889)", () => {
+    for (const target of [
+      "git://github.com/plow-pbc/tkmx-server",
+      "git+https://github.com/plow-pbc/tkmx-server",
+      "git+ssh://git@github.com/plow-pbc/tkmx-server",
+      "ssh://git@github.com/plow-pbc/tkmx-server",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree())?.kind, target).toBe("protected");
+      expect(blocksProtectedMerge(`GH_REPO=${target} gh pr merge 41`, worktree())?.kind, target).toBe("protected");
+    }
+  });
+
+  // --- 81919/81920: an authority :port, and a `.git` with a trailing slash ---
+  it("BLOCKS a pinned target whose URL authority carries a :port (roborev 81919/81920)", () => {
+    // gh reads Hostname() and drops the port; the old strip stopped the host at `:`, leaving the
+    // port as a path segment that never equalled a pin.
+    for (const target of [
+      "https://github.com:443/plow-pbc/tkmx-server",
+      "ssh://git@github.com:22/plow-pbc/tkmx-server",
+      "git+ssh://git@github.com:22/plow-pbc/tkmx-server",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree())?.kind, target).toBe("protected");
+      expect(blocksProtectedMerge(`GH_REPO=${target} gh pr merge 41`, worktree())?.kind, target).toBe("protected");
+    }
+  });
+
+  it("BLOCKS a pinned target spelled with both `.git` and a trailing slash (roborev 81919/81920)", () => {
+    // gh trims path slashes THEN the `.git` suffix; stripping `.git` before the slash left `.git`.
+    for (const target of [
+      "https://github.com/plow-pbc/tkmx-server.git/",
+      "plow-pbc/tkmx-server.git/",
+      "github.com/plow-pbc/tkmx-server.git/",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree())?.kind, target).toBe("protected");
+    }
+  });
+
+  it("does NOT block the UNPINNED twins of the port / .git-slash spellings (managed worktree)", () => {
+    // Paired allow direction: an over-reducing normalization that mangled these would fail to cover
+    // drodio/sparkle and red as foreign-target from worktree(OPEN).
+    expect(
+      blocksProtectedMerge("gh pr merge 41 -R https://github.com:443/drodio/sparkle", worktree(OPEN)),
+    ).toBeNull();
+    expect(
+      blocksProtectedMerge("gh pr merge 41 -R https://github.com/drodio/sparkle.git/", worktree(OPEN)),
+    ).toBeNull();
+  });
+
+  // --- 81950/81951: full ghrepo.FromURL mirror — doubled leading slash, query/fragment, extra path ---
+  it("BLOCKS a pinned target with a doubled leading slash, a query, or extra path segments (roborev 81950/81951)", () => {
+    // gh does strings.Trim(path,"/") (both ends) then SplitN(...,3)[0:2], discarding query/fragment
+    // and any path past OWNER/REPO. normalizeSlug now mirrors that fully.
+    for (const target of [
+      "https://github.com//plow-pbc/tkmx-server",
+      "ssh://git@github.com//plow-pbc/tkmx-server",
+      "https://github.com/plow-pbc/tkmx-server/pull/41",
+      "https://github.com/plow-pbc/tkmx-server?x=1",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree())?.kind, target).toBe("protected");
+      expect(blocksProtectedMerge(`GH_REPO=${target} gh pr merge 41`, worktree())?.kind, target).toBe("protected");
+    }
+  });
+
+  it("does NOT block the UNPINNED twins of the doubled-slash / extra-path spellings (managed worktree)", () => {
+    for (const target of [
+      "https://github.com//drodio/sparkle",
+      "https://github.com/drodio/sparkle/pull/41",
+      "https://github.com/drodio/sparkle?x=1",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree(OPEN)), target).toBeNull();
+    }
+  });
+
+  // --- 81981/81982: gh percent-DECODES u.Path (URL arm) before matching; the scheme-less arm does not ---
+  it("BLOCKS a pinned target spelled with percent-escapes in a URL value (roborev 81981/81982)", () => {
+    // gh's url.Parse hands FromURL the decoded path, so %2D->'-' and %2F->'/' resolve to the pin.
+    for (const target of [
+      "https://github.com/plow-pbc/tkmx%2Dserver",       // %2D -> '-'
+      "https://github.com/plow-pbc%2Ftkmx-server",       // %2F -> '/' (an encoded separator)
+      "https://github.com/plow-pbc/tkmx-server%2F",      // encoded trailing slash
+      "ssh://git@github.com/plow-pbc/tkmx%2Dserver.git",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree())?.kind, target).toBe("protected");
+      expect(blocksProtectedMerge(`GH_REPO=${target} gh pr merge 41`, worktree())?.kind, target).toBe("protected");
+    }
+    // and via the PR-URL operand path (prUrlRepo feeds normalizeSlug too)
+    expect(
+      blocksProtectedMerge("gh pr merge https://github.com/plow-pbc/tkmx%2Dserver/pull/41", worktree())?.kind,
+    ).toBe("protected");
+  });
+
+  // --- 82043: gh matches pullURLRE against the DECODED path, so an encoded /pull/ separator resolves ---
+  it("BLOCKS a pinned PR-URL operand whose /pull/ separator is percent-encoded (roborev 82043)", () => {
+    for (const op of [
+      "https://github.com/plow-pbc/tkmx-server%2Fpull/41",
+      "https://github.com/plow-pbc/tkmx-server%2Fpull%2F41",
+      "https://github.com/plow-pbc%2Ftkmx-server%2Fpull%2F41",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge ${op}`, worktree())?.kind, op).toBe("protected");
+    }
+  });
+
+  it("does NOT block an UNPINNED PR-URL operand with an encoded /pull/ separator (managed worktree)", () => {
+    expect(
+      blocksProtectedMerge("gh pr merge https://github.com/drodio/sparkle%2Fpull%2F41", worktree(OPEN)),
+    ).toBeNull();
+  });
+
+  it("does NOT decode the scheme-less arm — a literal %2D there is a different repo to gh (roborev 81982)", () => {
+    // gh's FromFullName (no scheme) is literal, so github.com/plow-pbc/tkmx%2Dserver is repo
+    // "tkmx%2dserver", NOT the pin. From worktree() (ABSENT) that is genuine no-opinion -> null.
+    // If the decode were applied unconditionally this would reduce to the pin and wrongly block.
+    expect(blocksProtectedMerge("gh pr merge 41 -R github.com/plow-pbc/tkmx%2Dserver", worktree())).toBeNull();
+  });
+
+  it("returns a verdict (does not throw) on a malformed percent-escape", () => {
+    // decodeURIComponent throws on `%zz` / a lone `%`; the guard must swallow it and keep the literal.
+    expect(() =>
+      blocksProtectedMerge("gh pr merge 41 -R https://github.com/plow-pbc/tkmx%zz", worktree()),
+    ).not.toThrow();
+    expect(blocksProtectedMerge("gh pr merge 41 -R https://github.com/plow-pbc/tkmx%zz", worktree())).toBeNull();
+  });
+
+  // --- 82012/82013: an escape decoding to an UPPERCASE letter (case fold ran before decode), and a
+  //     byte JS rejects but Go keeps in a DISCARDED trailing segment ---
+  it("BLOCKS a URL escape that decodes to an uppercase letter (roborev 82012/82013)", () => {
+    // %54 -> 'T', %53 -> 'S'; GitHub matches case-insensitively, so these are the pinned repo.
+    for (const target of [
+      "https://github.com/plow-pbc/%54kmx-server",
+      "https://github.com/plow-pbc/tkmx-%53erver",
+      "ssh://git@github.com/plow-pbc/%54kmx-server.git",
+    ]) {
+      expect(blocksProtectedMerge(`gh pr merge 41 -R ${target}`, worktree())?.kind, target).toBe("protected");
+      expect(blocksProtectedMerge(`GH_REPO=${target} gh pr merge 41`, worktree())?.kind, target).toBe("protected");
+    }
+  });
+
+  it("BLOCKS a pinned URL with a JS-invalid but Go-valid byte in a discarded trailing segment (roborev 82013)", () => {
+    // gh: SplitN(path,"/",3)[0:2] discards the /%80 segment -> plow-pbc/tkmx-server (the pin). A
+    // swallow-all catch abandoned the whole decode; the loose per-escape decode keeps owner/repo.
+    const v = blocksProtectedMerge("gh pr merge 41 -R https://github.com/plow-pbc/tkmx%2Dserver/%80", worktree());
+    expect(v?.kind).toBe("protected");
+  });
+
+  it("re-folds case after decoding an UNPINNED escaped URL and covers it (managed worktree)", () => {
+    // %53 -> 'S' -> 'sparkle' after the re-fold, which is the OPEN policy's own slug -> covered -> null.
+    // Without the post-decode toLowerCase this stays drodio/Sparkle and reds as foreign-target.
+    expect(
+      blocksProtectedMerge("gh pr merge 41 -R https://github.com/drodio/%53parkle", worktree(OPEN)),
+    ).toBeNull();
+  });
+
+  it("decodes a percent-escaped UNPINNED URL target and covers it (managed worktree)", () => {
+    // Paired allow direction, and it also proves decode is APPLIED on the URL arm: %65 -> 'e', so
+    // this reduces to the OPEN policy's own slug drodio/sparkle and is COVERED -> null. Without the
+    // decode it would stay drodio/sparkl%65, never covered, and red as foreign-target.
+    expect(
+      blocksProtectedMerge("gh pr merge 41 -R https://github.com/drodio/sparkl%65", worktree(OPEN)),
+    ).toBeNull();
+  });
+});
+
+describe("blocksProtectedMerge — the pinned list does not drift from the shared JSON", () => {
+  // `MERGE_PROTECTED_SLUGS` in worktree-guard.mjs is a hand-written twin of the same constant in
+  // policy.ts and of the Rust copies. This reads shared/merge-protected-repos.json FROM DISK — via
+  // `here`, which is fileURLToPath(new URL(".", import.meta.url)), never `.pathname` (the worktree
+  // path contains a space, which `.pathname` would percent-encode into a non-existent directory) —
+  // and asserts the guard's list matches it, so the two copies cannot silently diverge.
+  it("the guard's MERGE_PROTECTED_SLUGS is exactly the shared JSON's pinnedSlugs", () => {
+    const file = JSON.parse(
+      readFileSync(join(here, "..", "..", "shared", "merge-protected-repos.json"), "utf8"),
+    ) as { version: number; pinnedSlugs: string[] };
+    // NON-VACUITY first: an emptied list would pass a `for … of` loop on zero iterations while the
+    // whole floor was gone, and emptying both sides is a plausible single "cleanup" edit.
+    expect(file.pinnedSlugs.length).toBeGreaterThan(0);
+    expect(new Set(MERGE_PROTECTED_SLUGS).size).toBe(MERGE_PROTECTED_SLUGS.length);
+    expect([...MERGE_PROTECTED_SLUGS].sort()).toEqual([...file.pinnedSlugs].sort());
   });
 });
