@@ -145,18 +145,40 @@ export function parseObservedReading(
  *   that pane's reading is live, continuous and richer than a grid scrape, and this overlay exists
  *   only to supply a writer where none exists. Being over-broad here is the safe direction: a
  *   false "yes" means today's behaviour, a false "no" means fighting a live producer.
+ * @param isAnsweredLeftover (agentId) → is this agent's drawn `awaiting` a LEFTOVER of a prompt the
+ *   app already answered? This is the fix for sparkle-of1ix7: the grid observer re-derives `awaiting`
+ *   forever for a `footer-without-options` leftover, so a needs-you badge stays lit long after the
+ *   concierge answered the prompt. The predicate is `engine/blockedPromptGrace.promptAnsweredLeftover`:
+ *   suppress iff a CONFIRMED button press was delivered to this agent within the last 30s. There is
+ *   deliberately NO per-prompt identity check — this branch is only reachable for an UNMOUNTED agent,
+ *   for which no such signal exists on this side (see that function's header, roborev
+ *   82076/82084/82085/82088) — so suppression is unconditional within the bounded window and a new
+ *   prompt can be badge-dark for ≤30s before re-lighting (a bounded delay, never permanent). Applied
+ *   ONLY to `awaiting`, the sole verdict that raises a
+ *   prompt to red; the other arms are answer-blind. Optional — a caller with no ledger (or a test)
+ *   passes nothing and gets today's behaviour, which errs toward showing the founder.
  */
 export function withObservedAttention(
   agents: ReadonlyArray<{ id: string }>,
   base: Readonly<Record<string, AgentTabStatus>>,
   readings: Readonly<Record<string, ObservedReading>>,
   hasLiveWriter: (agentId: string) => boolean,
+  isAnsweredLeftover?: (agentId: string) => boolean,
 ): Record<string, AgentTabStatus> {
   let out: Record<string, AgentTabStatus> | null = null;
   for (const id of overlaidRowIds(agents, readings)) {
     const reading = readings[id];
     if (!reading) continue;
     if (hasLiveWriter(id)) continue;
+    // ROUTE A (sparkle-of1ix7): drop a LEFTOVER `awaiting`. The grid observer keeps re-deriving
+    // `awaiting` for a footer whose prompt was already answered, and nothing on that frozen screen
+    // will ever move it. When the app has confirmed a real answer to THIS on-screen prompt (identity
+    // via the capture onset, bounded in time), the reading is about a prompt that is now gone — so
+    // the badge must clear, not latch. See `promptAnsweredLeftover` for the three conditions that
+    // keep this from ever hiding a genuinely new or genuinely unanswered prompt.
+    if (reading.verdict === "awaiting" && isAnsweredLeftover?.(id) === true) {
+      continue;
+    }
     const current = base[id];
     const next = applyVerdict(current, reading.verdict);
     if (next === undefined || next === current) continue;

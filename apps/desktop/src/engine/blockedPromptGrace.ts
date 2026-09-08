@@ -119,6 +119,21 @@ export const BLOCKED_PROMPT_GRACE_MS = 30_000;
  */
 export const CONCIERGE_ESCALATION_GRACE_MS = 240_000;
 
+/**
+ * How long a CONFIRMED delivered answer suppresses a lingering `awaiting` reading of the SAME
+ * on-screen prompt before the row is allowed to surface again — the bounded backstop in rule 3 of
+ * {@link promptAnsweredLeftover} (sparkle-of1ix7, roborev 82076/82077).
+ *
+ * It is a CEILING, exactly as {@link BLOCKED_PROMPT_GRACE_MS} is, and for the same safety reason: the
+ * common case (the agent repaints and leaves the ask) clears the badge on its own long before this,
+ * and prompt-identity clears it the instant a NEW prompt is captured — so what this bounds is only
+ * the case neither of those can reach: a never-again-mounted agent whose capture never refreshes. A
+ * delivered answer is a reason to hide a stale red briefly; it is NEVER a reason to hide a possibly-
+ * new question forever. Thirty seconds, the same short ceiling this module already trusts, so a
+ * missed real prompt degrades to the ORIGINAL stuck-on bug rather than an invisible one.
+ */
+export const ANSWERED_LEFTOVER_GRACE_MS = 30_000;
+
 /** TWO ceilings on how many holds may begin for one agent in a rolling {@link HOLD_BUDGET_WINDOW_MS},
  *  chosen by how much evidence stands behind the re-open. Every hold is charged against the same
  *  count; only the ceiling differs. See {@link PromptGraceLedger.holds} for why a budget, rather than
@@ -317,6 +332,15 @@ export interface PromptGraceLedger {
   burned: Map<string, Set<string>>;
   /** agentId → the most recent outcome an answerer reported, and when. */
   outcome: Map<string, { outcome: PromptAnswerOutcome; at: number }>;
+  /**
+   * agentId → epoch ms of the most recent CONFIRMED button press delivered to that agent's picker.
+   * Written ONLY by {@link noteConfirmedAnswerDelivery} (a real `picker-option` keystroke, or the
+   * auto-approver's option keystroke), NEVER by a bare `handled` — so a `queued`/`free-text`
+   * optimistic send cannot clear the badge (roborev 82077). {@link promptAnsweredLeftover} reads it.
+   * Separate from {@link outcome} on purpose: `outcome` serves the GRACE HOLD, where broad `handled`
+   * is correct; this serves the LEFTOVER BADGE, which needs the narrower "a button was really pressed".
+   */
+  deliveredAnswer: Map<string, number>;
 }
 
 export function emptyPromptGraceLedger(): PromptGraceLedger {
@@ -327,6 +351,7 @@ export function emptyPromptGraceLedger(): PromptGraceLedger {
     askSince: new Map(),
     burned: new Map(),
     outcome: new Map(),
+    deliveredAnswer: new Map(),
   };
 }
 
@@ -359,6 +384,7 @@ export function resetPromptGraceLedgerForTests(): void {
   WINDOW_LEDGER.askSince.clear();
   WINDOW_LEDGER.burned.clear();
   WINDOW_LEDGER.outcome.clear();
+  WINDOW_LEDGER.deliveredAnswer.clear();
 }
 
 /**
@@ -386,6 +412,104 @@ export function notePromptAnswerOutcome(
   // backstop these two outcomes exist to pre-empt (roborev 62851). Safe to fire synchronously
   // because every caller is a service — a promise arm or an event handler — never a render.
   if (ledger === WINDOW_LEDGER) notifyPromptGraceChanged();
+}
+
+/**
+ * Record that a REAL answer keystroke was just delivered to `agentId`'s on-screen picker — a
+ * confirmed button press, not an optimistic or queued send.
+ *
+ * THIS IS THE ASYMMETRY ROUTE A OF sparkle-of1ix7 TURNS ON. The mount-independent grid observer
+ * (`src-tauri/src/observed_attention.rs` → `engine/observedAttention.ts`) re-derives `awaiting` once
+ * a second off the raw grid, and on a screen carrying a picker FOOTER with no option block under it
+ * (`blind:"footer-without-options"`) that reading is stable FOREVER — nothing on such a screen will
+ * change until the agent prints again, so there is no writer whose next read would disagree. When
+ * the concierge answered the prompt minutes earlier, that frozen `awaiting` is a LEFTOVER, and the
+ * needs-you badge stays lit over a question that is already resolved.
+ *
+ * The screen alone cannot separate that leftover from a LIVE dialog whose option block scrolled off
+ * (`engine/approvalDeadEnd`'s deliberate red): both render identically and both persist for exactly
+ * as long. The one fact that DOES separate them is on this side — the app knows, timestamped, that
+ * it pressed a real button on this agent's picker. {@link promptAnsweredLeftover} reads that fact.
+ *
+ * WHY THIS IS SEPARATE FROM `handled`, AND NARROWER (roborev 82077). `notePromptAnswerOutcome`'s
+ * `handled` is deliberately broad — `answerOutcomeForPath` maps `picker-option`, `free-text` AND
+ * `queued` all to it, because for the GRACE HOLD's purpose "the bytes are in flight" is enough. For
+ * clearing the badge it is NOT: a `queued` send to a pane still starting, or a `free-text` write onto
+ * a footer that never pressed a button, would latch the badge OFF over a prompt nobody actually
+ * answered — the founder then MISSES a real question, which is worse than the stuck-on bug this fixes.
+ * So only the genuine button-press sites call this: `conciergeDispatch` on `path === "picker-option"`
+ * and `approvalsRuntime`'s auto-answer keystroke on success. `queued` and `free-text` never do.
+ *
+ * Fires the change notification so a subscribed UI clears the badge at once (see
+ * {@link onPromptGraceChanged}); safe to call synchronously from a service promise arm.
+ */
+export function noteConfirmedAnswerDelivery(
+  agentId: string,
+  at: number = Date.now(),
+  ledger: PromptGraceLedger = WINDOW_LEDGER,
+): void {
+  ledger.deliveredAnswer.set(agentId, at);
+  if (ledger === WINDOW_LEDGER) notifyPromptGraceChanged();
+}
+
+/**
+ * Is this agent's currently-drawn `awaiting` a LEFTOVER of a prompt the app already answered? Suppress
+ * the needs-you badge iff a CONFIRMED button press was delivered to this agent within the last
+ * {@link ANSWERED_LEFTOVER_GRACE_MS}.
+ *
+ * TWO conditions, and it is DELIBERATELY THIS SIMPLE after three rounds of review:
+ *
+ *  1. A CONFIRMED button press was delivered ({@link noteConfirmedAnswerDelivery}) — never a bare
+ *     `handled`, so a `queued`/`free-text` optimistic send cannot clear the badge (roborev 82077).
+ *  2. It is within {@link ANSWERED_LEFTOVER_GRACE_MS} of `now` — a BOUNDED window.
+ *
+ * ── WHY THERE IS NO PER-PROMPT IDENTITY CHECK, STATED HONESTLY (roborev 82076/82084/82085/82088) ──
+ * This branch is reachable ONLY for an UNMOUNTED agent (`withObservedAttention` bails on
+ * `hasLiveWriter` first), and for such an agent there is NO per-prompt identity signal on this side:
+ *   • `reading.atMs` is the VERDICT onset — the Rust producer never refreshes it while the verdict is
+ *     unchanged, so two prompts in one `awaiting` run share it (82076);
+ *   • `runtimeStore.attentionScreenAt` is written only by the MOUNTED Terminal and deleted on unmount,
+ *     so it is `undefined` here and keying on it made the fix inert (82084/82085);
+ *   • the grace ledger's `askSince` is written ONLY for a demonstrated-ask status and DELETED for every
+ *     other — but this branch only changes the output when the base status is NOT already an ask
+ *     (`working`/`idle`/`blocked`), so whenever an identity gate could matter `askSince` is guaranteed
+ *     absent (82088). It was dead machinery.
+ * The only thing that could distinguish a new prompt from a leftover for an unmounted agent is a
+ * per-prompt id carried on the Rust wire — route B in the bead, OUT OF SCOPE here.
+ *
+ * So suppression is UNCONDITIONAL within the window. The worst case is a genuinely NEW unanswered
+ * prompt B, drawn seconds after answering A, sitting badge-dark for the REMAINDER of the window (≤30s)
+ * before it re-lights — a BOUNDED delay, never a permanently hidden prompt. That is strictly better
+ * than the original bug (the badge stuck on forever), and it is the safe direction: a late badge, not
+ * a missed one. {@link nextAnsweredLeftoverExpiry} arms the re-light so the window actually ends.
+ */
+export function promptAnsweredLeftover(
+  agentId: string,
+  now: number = Date.now(),
+  ledger: PromptGraceLedger = WINDOW_LEDGER,
+): boolean {
+  const delivered = ledger.deliveredAnswer.get(agentId);
+  if (delivered === undefined) return false;
+  return now - delivered < ANSWERED_LEFTOVER_GRACE_MS;
+}
+
+/**
+ * When the soonest answered-leftover suppression is due to LAPSE, or null if none is active — so a
+ * UI caller can arm a wake-up and re-light the badge exactly when the bounded window (rule 3 of
+ * {@link promptAnsweredLeftover}) expires. Without it a quiet fleet would keep the stale-cleared
+ * badge past the ceiling, which is the very "hidden indefinitely" the ceiling exists to forbid — the
+ * same reason {@link nextPromptGraceExpiry} exists for the hold.
+ */
+export function nextAnsweredLeftoverExpiry(
+  now: number = Date.now(),
+  ledger: PromptGraceLedger = WINDOW_LEDGER,
+): number | null {
+  let soonest: number | null = null;
+  for (const at of ledger.deliveredAnswer.values()) {
+    const expiry = at + ANSWERED_LEFTOVER_GRACE_MS;
+    if (expiry > now && (soonest === null || expiry < soonest)) soonest = expiry;
+  }
+  return soonest;
 }
 
 type PromptGraceListener = () => void;
@@ -643,6 +767,7 @@ export function notePromptEpisodes(
   for (const id of [...ledger.askSince.keys()]) if (!live.has(id)) ledger.askSince.delete(id);
   for (const id of [...ledger.outcome.keys()]) if (!live.has(id)) ledger.outcome.delete(id);
   for (const id of [...ledger.burned.keys()]) if (!live.has(id)) ledger.burned.delete(id);
+  for (const id of [...ledger.deliveredAnswer.keys()]) if (!live.has(id)) ledger.deliveredAnswer.delete(id);
 }
 
 /**

@@ -5,12 +5,16 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ANSWERED_LEFTOVER_GRACE_MS,
   BLOCKED_PROMPT_GRACE_MS,
   answerOutcomeForPath,
   emptyPromptGraceLedger,
+  noteConfirmedAnswerDelivery,
   notePromptAnswerOutcome,
   notePromptEpisodes,
+  nextAnsweredLeftoverExpiry,
   nextPromptGraceExpiry,
+  promptAnsweredLeftover,
   promptEpisodeKey,
   withBlockedPromptGrace,
   type PromptAsk,
@@ -468,5 +472,51 @@ describe("answerOutcomeForPath", () => {
       "queue-full", "expired", "abandoned",
     ] as const;
     for (const p of refusals) expect(answerOutcomeForPath(p)).not.toBe("handled");
+  });
+});
+
+describe("promptAnsweredLeftover — the sparkle-of1ix7 leftover clear (roborev 82077/82088)", () => {
+  const DELIV = T0 + 2_000;
+
+  it("clears on a CONFIRMED button press within the window — no capture, no episode, unmounted-safe", () => {
+    // The motivating case: an unmounted grid worker, no attentionScreenAt, no ask episode. The
+    // predicate reads only the confirmed-delivery ledger, so it clears regardless.
+    const ledger = emptyPromptGraceLedger();
+    noteConfirmedAnswerDelivery("a", DELIV, ledger);
+    expect(promptAnsweredLeftover("a", DELIV + 1_000, ledger)).toBe(true);
+  });
+
+  it("a QUEUED / optimistic `handled` MUST NOT clear the badge — only a confirmed button press does", () => {
+    // roborev 82077: `answerOutcomeForPath` maps queued AND free-text to `handled`, but neither
+    // pressed a button. `notePromptAnswerOutcome` alone must therefore never mark a leftover.
+    const ledger = emptyPromptGraceLedger();
+    notePromptAnswerOutcome("a", "handled", DELIV, ledger); // e.g. a `queued` send
+    expect(promptAnsweredLeftover("a", DELIV + 1_000, ledger)).toBe(false);
+  });
+
+  it("is BOUNDED in time — past the 30s window the badge re-lights, never hidden forever (82088)", () => {
+    // Suppression is unconditional within the window (no per-prompt identity exists for an unmounted
+    // agent — route B/Rust-wire, out of scope), so the window is the ONLY thing that ends it. A new
+    // unanswered prompt is dark for at most the remaining window, then surfaces: bounded, never permanent.
+    const ledger = emptyPromptGraceLedger();
+    noteConfirmedAnswerDelivery("a", DELIV, ledger);
+    expect(promptAnsweredLeftover("a", DELIV + ANSWERED_LEFTOVER_GRACE_MS - 1, ledger)).toBe(true);
+    expect(promptAnsweredLeftover("a", DELIV + ANSWERED_LEFTOVER_GRACE_MS, ledger)).toBe(false);
+  });
+
+  it("is false with no confirmed delivery at all", () => {
+    const ledger = emptyPromptGraceLedger();
+    expect(promptAnsweredLeftover("a", DELIV, ledger)).toBe(false);
+  });
+
+  it("nextAnsweredLeftoverExpiry arms the soonest still-future window lapse, or null when none", () => {
+    const ledger = emptyPromptGraceLedger();
+    expect(nextAnsweredLeftoverExpiry(T0, ledger)).toBeNull();
+    noteConfirmedAnswerDelivery("a", DELIV, ledger);
+    noteConfirmedAnswerDelivery("b", DELIV + 3_000, ledger);
+    // Soonest = agent a's window end; both are in the future at DELIV.
+    expect(nextAnsweredLeftoverExpiry(DELIV, ledger)).toBe(DELIV + ANSWERED_LEFTOVER_GRACE_MS);
+    // Once both windows have lapsed, nothing is armed.
+    expect(nextAnsweredLeftoverExpiry(DELIV + 3_000 + ANSWERED_LEFTOVER_GRACE_MS, ledger)).toBeNull();
   });
 });

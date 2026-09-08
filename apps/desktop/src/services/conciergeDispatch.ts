@@ -120,7 +120,11 @@ import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
 import { altScreenEvidence } from "../engine/claudeCodeDialogScreen";
 // The blocked-prompt grace window's outcome channel. A VALUE import, and it does not close a cycle:
 // that module imports `ConciergeDispatchPath` from here `import type`, which erases at compile time.
-import { answerOutcomeForPath, notePromptAnswerOutcome } from "../engine/blockedPromptGrace";
+import {
+  answerOutcomeForPath,
+  notePromptAnswerOutcome,
+  noteConfirmedAnswerDelivery,
+} from "../engine/blockedPromptGrace";
 import { pickerFingerprint } from "./pickerFingerprint";
 import {
   screenBlocksWrite,
@@ -759,6 +763,12 @@ export function answersLivePicker(agentId: string, text: string): boolean {
  */
 function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatchResult {
   notePromptAnswerOutcome(result.agentId, answerOutcomeForPath(result.path));
+  // sparkle-of1ix7 (roborev 82077): a `picker-option` is the ONE dispatch path that pressed a real
+  // button on the agent's live picker, so it — and only it — clears a lingering `awaiting` badge for
+  // that answered prompt. `free-text` (a NEW prompt, no button pressed) and `queued` (not yet
+  // delivered) both map to `handled` above for the grace hold, but neither answered the on-screen
+  // question, so neither may clear the badge. See `noteConfirmedAnswerDelivery`.
+  if (result.path === "picker-option") noteConfirmedAnswerDelivery(result.agentId);
   return result;
 }
 

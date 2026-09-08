@@ -209,6 +209,65 @@ describe("withObservedAttention — `awaiting` raises a row NOBODY has opened", 
   });
 });
 
+describe("withObservedAttention — a LEFTOVER `awaiting` clears once the app confirmed an answer (sparkle-of1ix7)", () => {
+  const agents = [{ id: "a1" }];
+  // The grid observer re-derives `awaiting` forever for a `footer-without-options` screen, so the
+  // needs-you badge latched on after the concierge answered the prompt minutes earlier. The overlay
+  // takes an IDENTITY-keyed predicate `isAnsweredLeftover(id)` (the caller binds it to the capture
+  // onset + the confirmed-delivery ledger); the overlay itself no longer reads `reading.atMs`, which
+  // is the verdict onset and does not advance between two prompts in one `awaiting` run (roborev 82076).
+  const awaiting: ObservedReading = { verdict: "awaiting", alternate: false, atMs: 1_000_000 };
+  const IS_LEFTOVER = (): boolean => true;
+  const NOT_LEFTOVER = (): boolean => false;
+
+  it("does NOT raise a latched green when the app confirms this prompt is an answered leftover", () => {
+    const base: Record<string, AgentTabStatus> = { a1: "working" };
+    // Non-vacuity: the SAME input raises the row to red without the leftover signal (this is the bug).
+    const litWithoutSignal = withObservedAttention(agents, base, { a1: awaiting }, NO_PANE);
+    expect(litWithoutSignal.a1).toBe("waiting");
+    expect(colorOf(litWithoutSignal.a1)).toBe(AGENT_STATUS.waiting.color);
+    // …and with NOT_LEFTOVER it is still raised — proving the predicate, not its mere presence, decides.
+    expect(withObservedAttention(agents, base, { a1: awaiting }, NO_PANE, NOT_LEFTOVER).a1).toBe("waiting");
+
+    // Confirmed leftover → the badge clears: the row keeps `working`, not the red `waiting`.
+    const out = withObservedAttention(agents, base, { a1: awaiting }, NO_PANE, IS_LEFTOVER);
+    expect(out.a1).toBe("working");
+    expect(colorOf(out.a1)).not.toBe(AGENT_STATUS.waiting.color);
+  });
+
+  it("clears a leftover that would otherwise raise a status-less row", () => {
+    const out = withObservedAttention(agents, {}, { a1: awaiting }, NO_PANE, IS_LEFTOVER);
+    // No entry at all — the row falls back to its uncoloured/gray default, NOT the red `waiting`.
+    expect(out.a1).toBeUndefined();
+  });
+
+  it("clears a leftover even over `blocked`, the one red the overlay would otherwise promote", () => {
+    const out = withObservedAttention(agents, { a1: "blocked" }, { a1: awaiting }, NO_PANE, IS_LEFTOVER);
+    expect(out.a1).toBe("blocked");
+    expect(needsAttention(out.a1)).toBe(false);
+  });
+
+  it("STILL raises a prompt the predicate does NOT call a leftover — a real unanswered ask", () => {
+    // The other arm of the finish line: with a real unanswered prompt on screen, the badge is lit.
+    const out = withObservedAttention(agents, { a1: "working" }, { a1: awaiting }, NO_PANE, NOT_LEFTOVER);
+    expect(out.a1).toBe("waiting");
+    expect(colorOf(out.a1)).toBe(AGENT_STATUS.waiting.color);
+  });
+
+  it("only suppresses `awaiting` — the leftover signal never changes any other verdict", () => {
+    // `unreadable`/`calm`/`gone` are answer-blind; `delegating` promotes off motion, not a prompt. So
+    // even an always-true predicate leaves `delegating`'s `idle → working` promotion intact.
+    const out = withObservedAttention(
+      agents,
+      { a1: "idle" },
+      { a1: { verdict: "delegating", alternate: false, atMs: 1_000_000 } },
+      NO_PANE,
+      IS_LEFTOVER,
+    );
+    expect(out.a1).toBe("working");
+  });
+});
+
 describe("withObservedAttention — `unreadable` holds NO opinion", () => {
   const agents = [{ id: "a1" }];
 

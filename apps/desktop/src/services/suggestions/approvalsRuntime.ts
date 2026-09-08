@@ -13,7 +13,10 @@ import { useSettingsStore } from "../../stores/settingsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { aiFeatureVisibleNow } from "../aiGate";
 import { writePtyChainedStrict } from "../../pty";
-import { notePromptAnswerOutcome } from "../../engine/blockedPromptGrace";
+import {
+  notePromptAnswerOutcome,
+  noteConfirmedAnswerDelivery,
+} from "../../engine/blockedPromptGrace";
 import { classifyApproval, headerRegion } from "./approvalClassifier";
 import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
 import { detectResumePrompt, pickerSignature } from "./heuristics";
@@ -108,6 +111,11 @@ function typeAutoAnswer(
   void writePtyChainedStrict(agentId, keystroke).then(
     () => {
       notePromptAnswerOutcome(agentId, "handled");
+      // sparkle-of1ix7 (roborev 82077): this keystroke IS a real button press on the live picker
+      // (an auto-approve/resume/plan/trust option, chained with its own CR), so it clears a lingering
+      // `awaiting` badge for the answered prompt — unlike a `queued`/`free-text` `handled`, which
+      // pressed no button. See `noteConfirmedAnswerDelivery`.
+      noteConfirmedAnswerDelivery(agentId);
     },
     (err: unknown) => {
       notePromptAnswerOutcome(agentId, "unreachable");

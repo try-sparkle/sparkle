@@ -26,6 +26,7 @@
 import { useEffect, useState } from "react";
 
 import {
+  nextAnsweredLeftoverExpiry,
   nextPromptGraceExpiry,
   onPromptGraceChanged,
   type PromptGraceLedger,
@@ -125,5 +126,41 @@ export function usePromptGraceTick<T extends { id: string }>(
     // and none of the other inputs changed (the ledger is a mutated singleton, so its identity never
     // changes either). Without `tick` the second prompt would never surface.
   }, [agents, ledger, attentionScreen, attentionScreenAt, statusMap, tick]);
+  return tick;
+}
+
+/**
+ * A counter for the ANSWERED-LEFTOVER badge clear (sparkle-of1ix7), incrementing on the two edges a
+ * status/observed-map dependency cannot see:
+ *
+ *   • a CONFIRMED answer is delivered — `noteConfirmedAnswerDelivery` fires `onPromptGraceChanged`,
+ *     which must recompute the observed-attention overlay so the stale red CLEARS at once. The
+ *     observed store no-ops on an unchanged verdict (`setObservedAttention` drops `at_ms`), so a
+ *     frozen `awaiting` reading never moves the overlay's inputs on its own.
+ *   • the bounded window LAPSES — `nextAnsweredLeftoverExpiry` arms one timer at the soonest expiry
+ *     so the badge RE-LIGHTS on schedule instead of staying dark until some unrelated render. This
+ *     is the safety backstop (`ANSWERED_LEFTOVER_GRACE_MS`): without the wake-up a quiet fleet would
+ *     keep a possibly-new prompt hidden past the ceiling, the very thing the ceiling forbids.
+ *
+ * Shared by both status chains (`hooks/useOverlaidStatus` and the published/rollup path) so they
+ * clear and re-light in lockstep, the same reason the overlay itself is applied identically in both.
+ * No timer exists when nothing is being suppressed — a quiet fleet costs nothing.
+ */
+export function useAnsweredLeftoverTick(): number {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const bump = (): void => setTick((t) => t + 1);
+    return onPromptGraceChanged(bump);
+  }, []);
+  useEffect(() => {
+    const due = nextAnsweredLeftoverExpiry(Date.now());
+    if (due === null) return;
+    const wake = Math.max(MIN_WAKE_MS, due - Date.now());
+    const h = setTimeout(() => setTick((t) => t + 1), wake);
+    return () => clearTimeout(h);
+    // `tick` re-arms: when the soonest window lapses and another delivery is still inside its own, this
+    // effect must run again to aim at that one. The ledger is a mutated singleton (stable identity),
+    // so nothing else would move it. Mirrors `usePromptGraceTick`'s `tick` dependency, same reason.
+  }, [tick]);
   return tick;
 }

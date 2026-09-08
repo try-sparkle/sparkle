@@ -20,6 +20,8 @@
 // it compares come out of the one `composeRollup`.
 import { useEffect, useMemo, useState } from "react";
 import { withObservedAttention } from "../engine/observedAttention";
+import { promptAnsweredLeftover } from "../engine/blockedPromptGrace";
+import { useAnsweredLeftoverTick } from "./useBlockedPromptGrace";
 import {
   withRedWorkerAttention,
   withUnstartedWorkerAttention,
@@ -154,9 +156,27 @@ export function useOverlaidStatus(
   const durableDead = useResurrectableDeadStore((s) => s.causes);
   const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
 
+  // sparkle-of1ix7: clear a needs-you badge that latched on an already-answered prompt. The overlay
+  // suppresses an `awaiting` reading only when the app CONFIRMED a real button press for this agent's
+  // CURRENT ask episode (`promptAnsweredLeftover` reads the grace ledger's `askSince` + confirmed-
+  // delivery maps — both survive unmount, unlike the mounted-only `attentionScreenAt` the first cut
+  // used, which made the fix inert for the very grid workers it targets — roborev 82084/82085). See
+  // `promptAnsweredLeftover` for the conditions that keep this from ever hiding a new/unanswered prompt.
+  // The two edges a status/observed dependency cannot see: a confirmed delivery clears the badge, and
+  // the bounded window lapsing re-lights it. `setObservedAttention` no-ops on an unchanged verdict, so
+  // a frozen `awaiting` reading never moves this memo on its own. See `hooks/useBlockedPromptGrace`.
+  const answeredLeftoverTick = useAnsweredLeftoverTick();
+
   const observedCorrected = useMemo(
-    () => withObservedAttention(agents, liveStatus, observedAttention, (id) => openIds.has(id)),
-    [agents, liveStatus, observedAttention, openIds],
+    // Single line, first two args `agents, liveStatus` — `observedAttentionChainParity.test.ts`
+    // reads this source to prove both chains feed the overlay the RAW map. The last arg is the
+    // sparkle-of1ix7 leftover-badge clear, keyed on the ledger ask-episode onset (NOT the verdict `at_ms`).
+    () => withObservedAttention(agents, liveStatus, observedAttention, (id) => openIds.has(id), (id) => promptAnsweredLeftover(id)),
+    // `answeredLeftoverTick` is a dependency ONLY — not read in the body; it is the sole input that
+    // moves when a delivery is recorded or its window lapses with no store write behind it, the same
+    // shape `deadSessionWake` and `durableDead` use below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [agents, liveStatus, observedAttention, openIds, answeredLeftoverTick],
   );
   // (0) BEFORE THE BUBBLES: a spawned-but-never-briefed agent reads `new` (GRAY) rather than the red
   // `blocked` statusEngine's 25s stall timer hands it for being quiet. Once a red has bubbled to an

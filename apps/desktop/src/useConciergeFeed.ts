@@ -10,7 +10,7 @@
 // agent wherever it is" path a notification click takes.
 import { useEffect, useMemo, useState } from "react";
 import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
-import { usePromptGraceTick } from "./hooks/useBlockedPromptGrace";
+import { usePromptGraceTick, useAnsweredLeftoverTick } from "./hooks/useBlockedPromptGrace";
 import { windowRetractionLedger } from "./engine/movementRetraction";
 import { windowPromptGraceLedger } from "./engine/blockedPromptGrace";
 import { getRoster, onRosterChanged } from "./services/attention";
@@ -136,6 +136,13 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   // would band CALM FOREVER while the founder never learns a question was asked. Same defect, same
   // fix; see hooks/useBlockedPromptGrace.
   const promptTick = usePromptGraceTick(fleetAgents, promptGrace, attentionScreen, attentionScreenAt, status);
+  // …AND THE ANSWERED-LEFTOVER BADGE CLEAR (sparkle-of1ix7) rides the same shape. `publishedStatusFor`
+  // (inside `buildConciergeFeed`) suppresses a stale `awaiting` when the app confirmed a real answer,
+  // and that fact lives in the ledger with no store write behind it — so a confirmed delivery must
+  // recompute this feed (badge clears) and the bounded window lapsing must recompute it again (badge
+  // re-lights). `attentionScreenAt` in the deps covers a NEW captured prompt; this tick covers the
+  // other two edges. See hooks/useBlockedPromptGrace.
+  const answeredLeftoverTick = useAnsweredLeftoverTick();
 
   return useMemo(
     () =>
@@ -185,6 +192,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       pinnedProjectId,
       graceTick,
       promptTick,
+      answeredLeftoverTick,
       // READ in the body (passed to `buildConciergeFeed`), unlike the two ticks above. Held by the
       // after-mount test rather than by the compiler — see the note at the call site (roborev 65465).
       nudgeFlags,

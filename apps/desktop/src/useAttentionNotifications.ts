@@ -71,7 +71,11 @@ import { isHumanBlockedIn, type NudgeFlagSnapshot } from "./services/humanBlockF
 import { nudgeFlagsSnapshot } from "./services/authRecovery";
 import type { DeathCause } from "./engine/deathTypes";
 import { useNewAgentCalm } from "./hooks/useNewAgentCalm";
-import { withBlockedPromptGrace, windowPromptGraceLedger } from "./engine/blockedPromptGrace";
+import {
+  withBlockedPromptGrace,
+  windowPromptGraceLedger,
+  promptAnsweredLeftover,
+} from "./engine/blockedPromptGrace";
 import { usePromptGraceTick } from "./hooks/useBlockedPromptGrace";
 import { useInteractionStore } from "./stores/interactionStore";
 import {
@@ -180,6 +184,11 @@ export function publishedStatusFor(
    *  production caller gets the real reading without passing anything while `composeRollup` itself
    *  stays pure. */
   observed: Readonly<Record<string, ObservedReading>> = observedAttentionSnapshot(),
+  /** See `composeRollup`'s parameter of the same name (the sparkle-of1ix7 leftover-badge fix).
+   *  Defaults to the live capture-onset + confirmed-delivery snapshot at this OUTERMOST boundary,
+   *  exactly as `observed` above does, so every production caller clears an answered prompt's stale
+   *  badge without passing anything while `composeRollup` itself stays pure. */
+  isAnsweredLeftover: (agentId: string) => boolean = answeredLeftoverSnapshot(),
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -195,6 +204,7 @@ export function publishedStatusFor(
     hasBackgroundTasksOf,
     nudgeFlags,
     observed,
+    isAnsweredLeftover,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -255,6 +265,11 @@ export function rollupViewFor(
    *  production caller gets the real reading without passing anything while `composeRollup` itself
    *  stays pure. */
   observed: Readonly<Record<string, ObservedReading>> = observedAttentionSnapshot(),
+  /** See `composeRollup`'s parameter of the same name (the sparkle-of1ix7 leftover-badge fix). The
+   *  Build column needs it too: `dotOf` reads the CONTRACTED published map, so a column that skipped
+   *  it would keep painting a needs-you dot for a prompt every other surface had cleared. Defaults to
+   *  the live capture-onset + confirmed-delivery snapshot at this OUTERMOST boundary. */
+  isAnsweredLeftover: (agentId: string) => boolean = answeredLeftoverSnapshot(),
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -270,6 +285,7 @@ export function rollupViewFor(
     hasBackgroundTasksOf,
     nudgeFlags,
     observed,
+    isAnsweredLeftover,
   );
   return { own, dotOf };
 }
@@ -281,6 +297,16 @@ export function rollupViewFor(
  *  inside the composition makes every test driving it depend on what a prior test left behind. */
 function observedAttentionSnapshot(): Readonly<Record<string, ObservedReading>> {
   return useRuntimeStore.getState().observedAttention;
+}
+
+/** The live answered-leftover predicate, for the two OUTERMOST boundaries' defaults (sparkle-of1ix7).
+ *  `promptAnsweredLeftover` reads the grace ledger (`askSince` + confirmed-delivery) and the wall
+ *  clock from its own defaults, so this needs no store read at all — the ledger already survives
+ *  unmount, which is the whole point of keying identity on `askSince` rather than the mounted-only
+ *  `attentionScreenAt` (roborev 82084/82085). Kept as a boundary helper mirroring
+ *  `observedAttentionSnapshot` so `composeRollup` stays PURE (its default is `() => false`). */
+function answeredLeftoverSnapshot(): (agentId: string) => boolean {
+  return (id) => promptAnsweredLeftover(id);
 }
 
 function composeRollup(
@@ -343,6 +369,15 @@ function composeRollup(
    *  exactly today's behaviour for a caller with no evidence to give. Wired at the OUTERMOST
    *  boundaries above. */
   observed: Readonly<Record<string, ObservedReading>> = {},
+  /** (agentId) → is this agent's drawn `awaiting` a LEFTOVER of a prompt the app already answered?
+   *  The fix for sparkle-of1ix7: the grid observer re-derives `awaiting` forever for a
+   *  `footer-without-options` screen, so the needs-you badge latches on after the concierge answered.
+   *  Keyed on the CONFIRMED delivery + the capture onset, NOT the verdict `at_ms` (roborev 82076/82077)
+   *  — see `engine/blockedPromptGrace.promptAnsweredLeftover`. Injected for the same reason `observed`
+   *  is — this composition documents itself as PURE and the ledger/store are module state. Defaults to
+   *  `() => false` ("not a known leftover"), which suppresses nothing: exactly today's behaviour for a
+   *  caller with no evidence to give. The live wiring is at the two OUTERMOST boundaries above. */
+  isAnsweredLeftover: (agentId: string) => boolean = () => false,
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -391,7 +426,10 @@ function composeRollup(
   // `applyVerdict`'s `unreadable` arm returns `undefined`, so there is no latch-break to order
   // against. `engine/observedAttention.ts` carries the current contract; read it there rather than
   // trusting a restatement here.
-  const observedCorrected = withObservedAttention(agents, status, observed, (id) => openIds.has(id));
+  // Single line, first three args `agents, status, observed` — `observedAttentionChainParity.test.ts`
+  // reads this source to prove both chains feed the overlay the RAW map. `isAnsweredLeftover` is the
+  // sparkle-of1ix7 leftover-badge clear, keyed on the capture onset (NOT the verdict `at_ms`).
+  const observedCorrected = withObservedAttention(agents, status, observed, (id) => openIds.has(id), isAnsweredLeftover);
   // (0b-ii) is the landed veto, and it sits INSIDE this expression rather than beside it so the two
   // chains apply it at the same point — `hooks/useOverlaidStatus` runs it in the identical slot,
   // between the dead-session calm and the background-task green. That symmetry is the whole lesson

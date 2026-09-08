@@ -21,6 +21,12 @@ import { useOverlaidStatus } from "./useOverlaidStatus";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { bandOfStatus } from "../engine/buildSections";
+import {
+  noteConfirmedAnswerDelivery,
+  notePromptAnswerOutcome,
+  resetPromptGraceLedgerForTests,
+  windowPromptGraceLedger,
+} from "../engine/blockedPromptGrace";
 import type { AgentTab } from "../types";
 
 /** A briefless agent — no goal, no bead — spawned `ageMs` ago. `isBriefless`'s subject. */
@@ -67,7 +73,80 @@ function seed(rt: Record<string, unknown>) {
   useInteractionStore.setState({ lastAt: {} } as never);
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  resetPromptGraceLedgerForTests();
+});
+
+describe("useOverlaidStatus — the answered-leftover badge clear, through the REAL binding (sparkle-of1ix7)", () => {
+  // roborev 82084/82085: the first cut keyed the leftover test on `attentionScreenAt`, which is
+  // undefined for exactly the UNMOUNTED grid worker this branch is reachable for — so the fix was
+  // inert. This drives the REAL `(id) => promptAnsweredLeftover(id)` binding (NO injected predicate)
+  // against a store where the agent is absent from openAgentIds and has NO attentionScreenAt entry,
+  // reading the module WINDOW ledger the production overlay reads. It fails on the first cut.
+  const observedAwaiting = { a: { verdict: "awaiting" as const, alternate: false, atMs: Date.now() } };
+
+  it("clears a needs-you badge on an UNMOUNTED agent once a confirmed answer was delivered — no capture needed", () => {
+    const agents = [worker("a", { parentId: null, worktreePath: null })];
+    // Frozen last reading `working`; the mount-independent observer reads `awaiting`; pane NOT open;
+    // and — the motivating case — NO attentionScreenAt entry at all.
+    seed({ status: { a: "working" }, openAgentIds: [], observedAttention: observedAwaiting });
+
+    // Non-vacuity: with NO confirmed delivery the observer RAISES the row to the red `waiting`.
+    const lit = renderHook(() => useOverlaidStatus(agents));
+    expect(lit.result.current.status["a"]).toBe("waiting");
+    expect(bandOfStatus(lit.result.current.status["a"]!)).toBe("needs_you");
+    cleanup();
+
+    // A real button press was delivered for this agent (window ledger, as production records it).
+    noteConfirmedAnswerDelivery("a");
+    const cleared = renderHook(() => useOverlaidStatus(agents));
+    // The badge CLEARS: the row keeps its frozen `working`, it is NOT raised to red.
+    expect(cleared.result.current.status["a"]).toBe("working");
+    expect(bandOfStatus(cleared.result.current.status["a"]!)).not.toBe("needs_you");
+  });
+
+  it("does NOT clear on a bare `handled` (a queued/optimistic send that pressed no button)", () => {
+    const agents = [worker("a", { parentId: null, worktreePath: null })];
+    seed({ status: { a: "working" }, openAgentIds: [], observedAttention: observedAwaiting });
+    // `handled` is the grace-hold outcome, NOT a confirmed button press — it must not clear the badge.
+    notePromptAnswerOutcome("a", "handled", Date.now(), windowPromptGraceLedger());
+
+    const { result } = renderHook(() => useOverlaidStatus(agents));
+    expect(result.current.status["a"]).toBe("waiting");
+    expect(bandOfStatus(result.current.status["a"]!)).toBe("needs_you");
+  });
+
+  it("clears within the 30s window and RE-LIGHTS after it — a bounded delay, never permanent (82088)", () => {
+    vi.useFakeTimers();
+    try {
+      const T = 1_700_000_000_000;
+      vi.setSystemTime(T);
+      const agents = [worker("a", { parentId: null, worktreePath: null })];
+      seed({
+        status: { a: "working" },
+        openAgentIds: [],
+        observedAttention: { a: { verdict: "awaiting" as const, alternate: false, atMs: T } },
+      });
+      noteConfirmedAnswerDelivery("a"); // delivered at T
+
+      // Within the window: the badge is cleared.
+      const within = renderHook(() => useOverlaidStatus(agents));
+      expect(within.result.current.status["a"]).toBe("working");
+      expect(bandOfStatus(within.result.current.status["a"]!)).not.toBe("needs_you");
+      cleanup();
+
+      // 30s later the window has lapsed: the badge RE-LIGHTS. A new unanswered prompt cannot be hidden
+      // past the bound — the safe direction, and strictly better than the original stuck-on-forever bug.
+      vi.setSystemTime(T + 30_000);
+      const after = renderHook(() => useOverlaidStatus(agents));
+      expect(after.result.current.status["a"]).toBe("waiting");
+      expect(bandOfStatus(after.result.current.status["a"]!)).toBe("needs_you");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("useOverlaidStatus — observed attention runs BEFORE the new-agent calm", () => {
   it("leaves a briefless, freshly-spawned `errored` agent GRAY rather than reddening it", () => {
