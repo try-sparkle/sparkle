@@ -1043,6 +1043,30 @@ const SWEEP_BUDGET: Duration = Duration::from_secs(60);
 /// reason string would hide the one case a human can actually fix by reducing the fleet.
 const SWEEP_BUDGET_REASON: &str = "sweep-budget";
 
+/// Ceiling on the wall-clock ONE project's worktree fan-out may consume before the sweep stops
+/// asking more of that project's worktrees and moves on to the next project.
+///
+/// [`MAX_PROBE_FALLBACKS`] caps the fan-out by COUNT; this caps it by TIME, and the two catch
+/// different failures. The fallback exists to survive an INDIVIDUALLY broken checkout — a `.git`
+/// pointing at a pruned gitdir, a directory `gh` cannot resolve a remote from — and every one of
+/// those fails FAST, so all [`MAX_PROBE_FALLBACKS`] attempts still fit inside this window and the
+/// count cap is what holds them down. What this cap stops is the OTHER shape: a `gh` that HANGS (a
+/// network stall, a rate-limit retry). Every worktree of a project is a linked checkout of the SAME
+/// remote, so a hang on the first worktree is the answer the rest would give too — retrying them is
+/// the same question again at [`PROBE_TIMEOUT`] apiece.
+///
+/// WITHOUT this cap, one project's fan-out alone can burn the entire [`SWEEP_BUDGET`]
+/// ([`MAX_PROBE_FALLBACKS`] × [`PROBE_TIMEOUT`] = the whole 60s), and because the sweep walks
+/// projects SERIALLY that starves every project after it in the round-robin — they take the
+/// [`SWEEP_BUDGET_REASON`] `Err` arm having never been asked. That is the concrete report behind
+/// bead sparkle-yu0h9a: 24 unread PRs in tkmx-client surfaced as "needing attention" only because
+/// tkmx-client sat behind exactly one such unhealthy project and was never reached.
+///
+/// Set to one [`PROBE_TIMEOUT`]: a single hung attempt is already the whole answer for a
+/// remote-level failure, so one timeout of fan-out per project leaves the rest of the sweep budget
+/// for the other projects rather than letting one of them consume it all.
+const PER_PROJECT_PROBE_BUDGET: Duration = PROBE_TIMEOUT;
+
 /// Per-project probe backoff: `project_id -> (retry_at_ms, consecutive_failures, last_reason)`.
 ///
 /// Keyed by PROJECT, not global — one repo with a broken `gh` must not slow the probe of a healthy
@@ -1118,21 +1142,43 @@ fn blind_streak(backoff: &ProbeBackoff, project: &str) -> u32 {
 ///
 /// `max_attempts` is the cap from [`MAX_PROBE_FALLBACKS`]; it is a parameter rather than a constant
 /// read inside so a test can state the bound it is asserting instead of inheriting it.
-fn probe_repo<P>(
+///
+/// `per_project_budget_ms` is the TIME half of the same bound ([`PER_PROJECT_PROBE_BUDGET`]),
+/// checked BETWEEN attempts so the first worktree is always asked. A worktree that fails FAST — the
+/// individually-broken checkout the fallback exists for — does not advance the injected `clock`, so
+/// it still burns through every attempt up to `max_attempts`. Only a worktree that HANGS spends real
+/// time, and once this project's fan-out has spent its budget the loop stops rather than asking the
+/// next worktree the same question the remote already refused — which is what keeps one unhealthy
+/// project from consuming the whole [`SWEEP_BUDGET`] and starving the rest (bead sparkle-yu0h9a).
+///
+/// The clock is injected (epoch ms, `now_ms` in production) so this bound, like the sweep's, is
+/// assertable without a real subprocess.
+fn probe_repo<P, C>(
     repo: &Repo,
     max_attempts: usize,
+    per_project_budget_ms: u64,
+    mut clock: C,
     mut probe: P,
 ) -> Result<(PathBuf, Probed), &'static str>
 where
     P: FnMut(&Path) -> Result<Probed, &'static str>,
+    C: FnMut() -> u64,
 {
     let mut last = "no-worktree";
+    let started = clock();
     // `.max(1)` so a nonsense cap still asks once — a zero here would report every project
     // unreadable forever, which is a far worse failure than an unbounded fallback.
     for dir in repo.dirs.iter().take(max_attempts.max(1)) {
         match probe(dir) {
             Ok(prs) => return Ok((dir.clone(), prs)),
             Err(reason) => last = reason,
+        }
+        // TIME cap on the fan-out — see [`PER_PROJECT_PROBE_BUDGET`]. Checked AFTER the attempt so
+        // the first worktree is always tried; a fast failure leaves the clock still and so keeps
+        // every fallback, while a hung one is not repeated across sibling checkouts of the same
+        // remote. `saturating_sub` keeps a clock that steps backwards from extending the window.
+        if clock().saturating_sub(started) >= per_project_budget_ms {
+            break;
         }
     }
     Err(last)
@@ -1265,10 +1311,16 @@ where
         }
 
         let probe_started = clock();
-        let out = probe_repo(&repos[idx], MAX_PROBE_FALLBACKS, |dir| {
-            probe_calls += 1;
-            probe(dir)
-        });
+        let out = probe_repo(
+            &repos[idx],
+            MAX_PROBE_FALLBACKS,
+            PER_PROJECT_PROBE_BUDGET.as_millis() as u64,
+            &mut clock,
+            |dir| {
+                probe_calls += 1;
+                probe(dir)
+            },
+        );
         match &out {
             Ok(_) => {
                 // The first success clears the whole entry, so a repo that comes back is on the
@@ -3897,18 +3949,26 @@ mod tests {
             dirs: vec!["/a/broken".into(), "/a/works".into()],
         };
         let mut asked: Vec<String> = Vec::new();
-        let got = probe_repo(&repo, MAX_PROBE_FALLBACKS, |dir| {
-            asked.push(dir.to_string_lossy().to_string());
-            if dir.ends_with("broken") {
-                Err("gh-failed")
-            } else {
-                Ok(Probed {
-                    prs: vec![conflicting_facts()],
-                    saturated: false,
-                    saturated_by: SATURATED_BY_LIST_WINDOW,
-                })
-            }
-        });
+        // A never-advancing clock: the broken checkout fails FAST, which is the case the per-project
+        // time cap deliberately does not touch, so the fallback still reaches the second worktree.
+        let got = probe_repo(
+            &repo,
+            MAX_PROBE_FALLBACKS,
+            PER_PROJECT_PROBE_BUDGET.as_millis() as u64,
+            || 0,
+            |dir| {
+                asked.push(dir.to_string_lossy().to_string());
+                if dir.ends_with("broken") {
+                    Err("gh-failed")
+                } else {
+                    Ok(Probed {
+                        prs: vec![conflicting_facts()],
+                        saturated: false,
+                        saturated_by: SATURATED_BY_LIST_WINDOW,
+                    })
+                }
+            },
+        );
         let (dir, probed) = got.expect("the second worktree answered");
         assert_eq!(dir, PathBuf::from("/a/works"), "and the caller learns WHICH one answered");
         assert_eq!(probed.prs.len(), 1);
@@ -3917,7 +3977,13 @@ mod tests {
         // Only a probe that fails EVERYWHERE declares the project unreadable — and it reports the
         // last real reason, not a generic one.
         assert_eq!(
-            probe_repo(&repo, MAX_PROBE_FALLBACKS, |_| Err("gh-unavailable")),
+            probe_repo(
+                &repo,
+                MAX_PROBE_FALLBACKS,
+                PER_PROJECT_PROBE_BUDGET.as_millis() as u64,
+                || 0,
+                |_| Err("gh-unavailable")
+            ),
             Err("gh-unavailable")
         );
     }
@@ -3989,6 +4055,72 @@ mod tests {
         assert!(
             swept.skipped.is_empty(),
             "nothing was skipped for time; the cap alone did this"
+        );
+    }
+
+    /// ONE UNHEALTHY PROJECT MUST NOT STARVE THE REST (bead sparkle-yu0h9a).
+    ///
+    /// The report behind the bead: a `gh` HANGING on the first project's worktrees fanned out
+    /// [`MAX_PROBE_FALLBACKS`] × [`PROBE_TIMEOUT`] = the whole [`SWEEP_BUDGET`], so every project
+    /// after it in the serial round-robin was BudgetSkipped — its open PRs surfaced to the concierge
+    /// as "needing attention" though the sweep never asked GitHub about them at all.
+    ///
+    /// The fixture is the minimal shape of that: an unhealthy project A whose every worktree HANGS
+    /// (each probe burns a full [`PROBE_TIMEOUT`]), followed by a project B. Under a 60s budget the
+    /// per-project time cap holds A to a single hung attempt, so B is still ASKED inside the budget.
+    /// REMOVE the cap and A's fan-out alone spends the whole budget, B takes the BudgetSkipped arm,
+    /// and this test reds — which is the mutation that proves the cap is what does the work.
+    #[test]
+    fn a_single_hanging_project_does_not_consume_the_whole_budget() {
+        use std::cell::Cell;
+        // A: three worktrees, every one hangs. B: after A in probe order.
+        let repos = vec![repo_of("A", MAX_PROBE_FALLBACKS), repo_of("B", 1)];
+        let clock = Cell::new(0u64);
+        let mut backoff = ProbeBackoff::new();
+        let budget = SWEEP_BUDGET.as_millis() as u64;
+        let swept = sweep_probes(
+            &repos,
+            &mut backoff,
+            0,
+            budget,
+            |_| {
+                // Every probe HANGS for a full timeout — the shape the per-project cap targets, as
+                // opposed to a broken directory that fails instantly.
+                clock.set(clock.get() + PROBE_TIMEOUT.as_millis() as u64);
+                Err("gh-unavailable")
+            },
+            || clock.get(),
+        );
+
+        // A cost ONE hung attempt, not its full fan-out: the time cap stopped it after the first
+        // worktree. Without the cap this is MAX_PROBE_FALLBACKS.
+        assert_eq!(
+            swept.probe_calls, 2,
+            "one hung attempt on A plus one on B — not A's full fan-out ({} calls) before B is even \
+             reached",
+            MAX_PROBE_FALLBACKS + 1
+        );
+
+        // THE SIDE EFFECT THE BEAD NAMES: B was actually ASKED, inside the budget, rather than
+        // reported as needing attention over a look that never happened.
+        let b = swept
+            .outcomes
+            .iter()
+            .find(|(i, _, _)| repos[*i].project_id == "B")
+            .expect("B still has an outcome");
+        assert_eq!(
+            b.2,
+            Disposition::Asked,
+            "B must be ASKED, not starved into the sweep-budget arm by A's fan-out"
+        );
+        assert!(
+            !swept.skipped.contains(&"B".to_string()),
+            "and B must not appear in the budget-skipped set"
+        );
+        assert!(
+            swept.elapsed_ms <= budget,
+            "the whole sweep stayed inside its budget: {}ms of {budget}ms",
+            swept.elapsed_ms
         );
     }
 
