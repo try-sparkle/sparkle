@@ -65,6 +65,29 @@ const PUBLIC_RELEASE_REPO: &str = "try-sparkle/sparkle";
 const ROBOREV_STATUS_TIMEOUT: Duration = Duration::from_secs(8);
 const ROBOREV_STATUS_TIMEOUT_SECS: u64 = 8;
 
+/// How many CONSECUTIVE not-answering probes a WEDGE verdict costs (bead `sparkle-7r5qn`).
+///
+/// THE BUG (measured 2026-09-06): the WEDGE arm fired on a SINGLE `roborev status` that missed the
+/// {@link ROBOREV_STATUS_TIMEOUT} bound. A timeout is a property of the OBSERVATION, and a
+/// one-minute poll turns one unlucky sample into a page. The daemon behind that alert was answering
+/// in 0.5ms, held 127.0.0.1:7373 alone, and drained a real review job in 1m57s — it was never
+/// wedged. The component flapped healthy → WARNING → healthy inside eight minutes.
+///
+/// WHY IT SURFACED NOW: the SLOW arm below only covers a store at/above
+/// {@link ROBOREV_DB_BLOAT_BYTES}. Compacting the store from 982MB to ~240MB dropped it UNDER that
+/// gate, so transient slowness that used to land on SLOW ("not wedged, go compact") now falls
+/// through to WEDGE ("genuine WEDGE, kickstart it"). Shrinking the store removed the only arm that
+/// was absorbing a slow sample.
+///
+/// THREE is the smallest N that outlives a single load spike at the one-minute
+/// {@link PIPELINE_HEALTH_POLL_INTERVAL_MS} cadence: a real wedge persists for many minutes and
+/// still reports within ~3 minutes, while a spike lasting one or two ticks never pages anyone.
+/// Measured cold/warm spread on this machine: 1.71s cold, 0.19-0.31s warm — an ~8x cold-start
+/// penalty, which is how an 8s bound is reachable under load without anything being stuck.
+///
+/// Mirrored by `PH_ROBOREV_WEDGE_CONFIRMATIONS` in scripts/lib/pipeline-health.sh.
+const ROBOREV_WEDGE_CONFIRMATIONS: u32 = 3;
+
 /// The roborev store size at which a cold sqlite open can plausibly outrun the probe bound above —
 /// i.e. above which "the daemon is merely SLOW" is a live explanation for a silent `roborev status`.
 /// Arithmetic, not a guess: the measured 860MB store took ~20s to open (~43MB/s on this machine), so
@@ -450,15 +473,19 @@ impl DaemonEvidence {
 ///
 /// roborev is NEVER `Blocking`: review stopping does not stop merges or deploys, so its worst state
 /// is `Warning`. The caller decides `NotApplicable` (roborev disabled) before reaching here.
-fn classify_roborev(status: &StatusProbe, evidence: DaemonEvidence) -> (HealthState, String) {
+fn classify_roborev(
+    status: &StatusProbe,
+    evidence: DaemonEvidence,
+    consecutive: u32,
+) -> (HealthState, String) {
     match status {
         // A TIMEOUT is not a diagnosis. See `classify_not_answering` for why this no longer says
         // "wedged" on its own evidence.
-        StatusProbe::TimedOut => classify_not_answering(true, evidence),
+        StatusProbe::TimedOut => classify_not_answering(true, evidence, consecutive),
         StatusProbe::Failed(err) => {
             // roborev's own "failed to connect to daemon" wording — down, wedged, or merely slow.
             if err.to_lowercase().contains("connect to daemon") {
-                classify_not_answering(false, evidence)
+                classify_not_answering(false, evidence, consecutive)
             } else {
                 (
                     HealthState::Unknown,
@@ -473,7 +500,7 @@ fn classify_roborev(status: &StatusProbe, evidence: DaemonEvidence) -> (HealthSt
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if daemon_line.contains("not running") {
-                classify_not_answering(false, evidence)
+                classify_not_answering(false, evidence, consecutive)
             } else if daemon_line.contains("running") {
                 classify_running(out, evidence.enqueue)
             } else {
@@ -682,6 +709,31 @@ fn classify_running_daemon(out: &str) -> (HealthState, String) {
     }
 }
 
+/// CROSS-TICK MEMORY for {@link ROBOREV_WEDGE_CONFIRMATIONS}.
+///
+/// The probe command is stateless and is re-invoked every
+/// {@link PIPELINE_HEALTH_POLL_INTERVAL_MS}, so "consecutive" has to live somewhere across ticks.
+/// One counter, not a per-root map: there is ONE roborev daemon per machine (one LaunchAgent, one
+/// 127.0.0.1:7373), so every project root is probing the same process and their observations belong
+/// to the same streak.
+static ROBOREV_SILENT_STREAK: std::sync::OnceLock<std::sync::Mutex<u32>> =
+    std::sync::OnceLock::new();
+
+/// Fold this tick's observation into the streak and return the run length INCLUDING this tick.
+///
+/// Answering RESETS to zero rather than decaying: the question a wedge verdict asks is "has it been
+/// silent every time since it was last heard from", and one clean answer settles that as
+/// definitively as a hundred. Saturating, so a daemon left down for a week cannot wrap the counter
+/// back under the threshold.
+fn record_roborev_silence(not_answering: bool) -> u32 {
+    let cell = ROBOREV_SILENT_STREAK.get_or_init(|| std::sync::Mutex::new(0));
+    // A poisoned lock is recovered rather than propagated: a panic in another probe must not take
+    // the health indicator down with it, and the counter's worst case is a re-armed streak.
+    let mut streak = cell.lock().unwrap_or_else(|e| e.into_inner());
+    *streak = if not_answering { streak.saturating_add(1) } else { 0 };
+    *streak
+}
+
 /// THE NOT-ANSWERING RESULT — three causes, three remedies (bead `sparkle-4i8kd6`).
 ///
 /// This used to fold every silent-daemon shape onto one word ("wedged") and one instruction
@@ -705,7 +757,11 @@ fn classify_running_daemon(out: &str) -> (HealthState, String) {
 /// All four are `Warning`: a down or unreadable daemon must never read as "nothing to do".
 ///
 /// Mirrored by `ph_classify_roborev_not_answering` in scripts/lib/pipeline-health.sh.
-fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, String) {
+fn classify_not_answering(
+    timed_out: bool,
+    ev: DaemonEvidence,
+    consecutive: u32,
+) -> (HealthState, String) {
     let why = if timed_out {
         format!("roborev status did not answer within {ROBOREV_STATUS_TIMEOUT_SECS}s")
     } else {
@@ -782,6 +838,34 @@ fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, 
                     ),
                 );
             }
+            // UNCONFIRMED — alive, small store, but this is not yet the Nth CONSECUTIVE silent
+            // probe. A single missed 8s bound is a property of the OBSERVATION, not of the daemon:
+            // measured on this machine a "wedged" daemon was answering in 0.5ms and drained a real
+            // review in 1m57s. `Warning` is the state that PAGES A HUMAN
+            // (`services/pipelineHealthEscalation.isAlarmState` counts warning and deliberately
+            // excludes unknown), so a wedge that has not repeated must stop short of it.
+            //
+            // `Unknown` is not green: it outranks Healthy in `severity_rank` and paints the chip
+            // amber, so a daemon that really is going silent is visible from the FIRST tick — it
+            // just does not assert a fault, or hand out a restart, until the evidence repeats.
+            if consecutive < ROBOREV_WEDGE_CONFIRMATIONS {
+                return (
+                    HealthState::Unknown,
+                    format!(
+                        "{why}, the daemon process is ALIVE, and {ROBOREV_DB_LABEL} is only {mb} MB \
+                         — which WOULD be a wedge, but this is silent probe {consecutive} of the \
+                         {ROBOREV_WEDGE_CONFIRMATIONS} consecutive ones a wedge verdict costs, so \
+                         it is NOT being called one yet. A single missed \
+                         {ROBOREV_STATUS_TIMEOUT_SECS}s bound is a property of the probe, not of \
+                         the daemon, and this one flapped healthy->warning->healthy inside eight \
+                         minutes while answering in under a millisecond. Code review may be \
+                         degraded; merges and deploys are unaffected. Do NOT restart on this \
+                         reading — if the next probes are silent too the verdict will say WEDGE and \
+                         name the recovery."
+                    ),
+                );
+            }
+
             // WEDGE — alive, and the store is demonstrably small, so the daemon itself is stuck.
             return (
                 HealthState::Warning,
@@ -2723,7 +2807,11 @@ fn roborev_component(root: &str) -> ComponentHealth {
         } else {
             DaemonEvidence { enqueue, ..Default::default() }
         };
-        classify_roborev(&status, evidence)
+        // Fold this observation into the consecutive-silence streak BEFORE classifying: a
+        // wedge verdict is gated on it (see `ROBOREV_WEDGE_CONFIRMATIONS`), and an answering
+        // daemon must clear the streak even though it never reaches the not-answering arms.
+        let consecutive = record_roborev_silence(not_answering);
+        classify_roborev(&status, evidence, consecutive)
     };
     // THE EVIDENCE, carried out with the verdict. `enqueue_evidence` is re-derived here rather than
     // threaded out of the block above because the disabled arm never took a reading at all, and
@@ -3166,6 +3254,144 @@ pub async fn pipeline_health_probe(root: String) -> Result<PipelineHealth, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── STREAK SHIMS ────────────────────────────────────────────────────────────────────────────
+    // Every pre-existing test in this module was written against a probe whose verdict came from a
+    // SINGLE reading, and each one is still the right assertion about a CONFIRMED silence. These
+    // two local items shadow the glob-imported originals so those tests keep reading as they did,
+    // pinned at a streak that has already met `ROBOREV_WEDGE_CONFIRMATIONS`.
+    //
+    // Tests that are ABOUT the streak call `super::classify_roborev` / `super::classify_not_answering`
+    // directly with the count they mean — see `a_single_silent_probe_is_not_yet_a_wedge`.
+    fn classify_roborev(status: &StatusProbe, evidence: DaemonEvidence) -> (HealthState, String) {
+        super::classify_roborev(status, evidence, ROBOREV_WEDGE_CONFIRMATIONS)
+    }
+
+    fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, String) {
+        super::classify_not_answering(timed_out, ev, ROBOREV_WEDGE_CONFIRMATIONS)
+    }
+
+    /// THE FLAP THIS FIXES (measured 2026-09-06).
+    ///
+    /// A live daemon behind a SMALL store was called "a genuine WEDGE" on ONE `roborev status` that
+    /// missed the 8s bound, and the chip flapped healthy -> WARNING -> healthy inside eight minutes.
+    /// The daemon was answering in 0.5ms, held 127.0.0.1:7373 alone, and completed a real review in
+    /// 1m57s. `Warning` PAGES someone, so the identical evidence must stay short of it until the
+    /// silence has repeated `ROBOREV_WEDGE_CONFIRMATIONS` times.
+    ///
+    /// The pair is the point: the ONLY difference between the two halves is the streak count.
+    #[test]
+    fn a_single_silent_probe_is_not_yet_a_wedge() {
+        for n in 1..ROBOREV_WEDGE_CONFIRMATIONS {
+            let (state, detail) = super::classify_roborev(
+                &StatusProbe::TimedOut,
+                evidence(Some(true), Some(true), Some(RB_SMALL)),
+                n,
+            );
+            assert_eq!(
+                state,
+                HealthState::Unknown,
+                "silence {n} of {ROBOREV_WEDGE_CONFIRMATIONS} must not page anyone: {detail}"
+            );
+            assert!(
+                !detail.to_ascii_lowercase().contains("genuine wedge"),
+                "an unrepeated timeout is not a wedge finding: {detail}"
+            );
+            assert!(
+                !detail.contains("launchctl kickstart -k"),
+                "and must not hand out the restart before the diagnosis: {detail}"
+            );
+            assert!(
+                !prescribes_daemon_restart(&detail),
+                "never the harmful daemon restart either: {detail}"
+            );
+            assert!(
+                detail.contains("merges and deploys are unaffected"),
+                "roborev is never blocking: {detail}"
+            );
+        }
+
+        // THE PAIRED POSITIVE — the SAME evidence at the threshold is the wedge verdict, unchanged,
+        // with its recovery attached. Without this the test also passes for a change that simply
+        // stopped reporting wedges at all, which would withhold the fix from a real one.
+        let (state, detail) = super::classify_roborev(
+            &StatusProbe::TimedOut,
+            evidence(Some(true), Some(true), Some(RB_SMALL)),
+            ROBOREV_WEDGE_CONFIRMATIONS,
+        );
+        assert_eq!(state, HealthState::Warning, "a confirmed wedge still warns: {detail}");
+        assert!(detail.contains("genuine WEDGE"), "and still says so: {detail}");
+        assert!(
+            detail.contains("launchctl kickstart -k"),
+            "and still hands over the launchd recovery: {detail}"
+        );
+        assert!(
+            !prescribes_daemon_restart(&detail),
+            "which is never the broken `roborev daemon` one: {detail}"
+        );
+    }
+
+    /// THE BEAD'S OWN ACCEPTANCE (sparkle-7xuarv): "a test drives a probe that fails once then
+    /// succeeds and asserts NO warning is emitted."
+    ///
+    /// This is the MEASURED sequence, not a hypothetical. `roborev status` was sampled 529 times at
+    /// 4s intervals: 521 answered (p50 0.30s, max 2.72s) and 7 returned `Daemon: not running` — with
+    /// EXIT CODE 0, no stderr, and a duration of 2.049-2.062s, a 13ms band. That is roborev's own
+    /// internal ~2s deadline manufacturing a false negative, not Sparkle's 8s bound expiring: NO
+    /// sample of the 529 came within 5s of the 8s bound. Caught live, at the instant `status` said
+    /// "not running" the daemon held 127.0.0.1:7373 and answered curl in 0.58ms.
+    ///
+    /// So the isolated failure below is the SHAPE that actually occurs here — a text claim of "not
+    /// running" against a live daemon — and one of them must not page anyone.
+    #[test]
+    fn a_probe_that_fails_once_then_succeeds_emits_no_warning() {
+        let not_running = StatusProbe::Text("Daemon: not running\n".to_string());
+        let alive_small = evidence(Some(true), Some(true), Some(RB_SMALL));
+
+        // Tick 1 — the isolated bad poll. Amber, so it is visible, but NOT the state that pages.
+        let (first, detail) = super::classify_roborev(&not_running, alive_small, 1);
+        assert_eq!(first, HealthState::Unknown, "one bad poll must not warn: {detail}");
+        assert_ne!(first, HealthState::Warning, "and must not reach the alarm state: {detail}");
+        assert!(
+            detail.contains(&format!("{ROBOREV_WEDGE_CONFIRMATIONS}")),
+            "the alert must say how many polls it is based on: {detail}"
+        );
+
+        // Tick 2 — it answers again. The streak is cleared by the caller, and the verdict is plain
+        // healthy: no residue of the bad poll survives into the recovered state.
+        let (second, detail) = super::classify_roborev(
+            &StatusProbe::Text(healthy_status()),
+            evidence(Some(true), Some(true), Some(RB_SMALL)),
+            0,
+        );
+        assert_eq!(second, HealthState::Healthy, "the recovered poll is healthy: {detail}");
+
+        // And the counter itself agrees, which is what makes the two ticks above consecutive rather
+        // than two independent readings that happen to be ordered.
+        record_roborev_silence(false);
+        assert_eq!(record_roborev_silence(true), 1, "the bad poll opens a run of one");
+        assert_eq!(record_roborev_silence(false), 0, "the good poll closes it");
+        assert!(
+            1 < ROBOREV_WEDGE_CONFIRMATIONS,
+            "a run of one must be under the threshold, or this test proves nothing"
+        );
+    }
+
+    /// The streak counts CONSECUTIVE silence, so one answer clears it however long the run was.
+    /// Pinned because the opposite (a decaying counter) would let a daemon that answers every other
+    /// tick — the flapping signature — accumulate its way to a wedge verdict it never earned.
+    #[test]
+    fn answering_resets_the_silence_streak() {
+        // Drain whatever the process-wide counter holds, so this asserts on runs, not on history.
+        record_roborev_silence(false);
+
+        for expected in 1..=ROBOREV_WEDGE_CONFIRMATIONS {
+            assert_eq!(record_roborev_silence(true), expected, "silence must accumulate");
+        }
+        assert_eq!(record_roborev_silence(false), 0, "one answer clears the whole run");
+        assert_eq!(record_roborev_silence(true), 1, "and the next silence starts over at 1");
+        record_roborev_silence(false);
+    }
 
     fn comp(state: HealthState) -> ComponentHealth {
         ComponentHealth {
