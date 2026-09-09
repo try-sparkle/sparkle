@@ -1040,6 +1040,17 @@ struct RunnerPoolReading {
     /// member of it (an offline-but-registered runner still appears in the list, so this stays true
     /// and the verdict stays Blocking — a genuinely-offline runner is never greened).
     saw_runners: bool,
+    /// Does ANY runner in the fleet carry this pool's label, at ANY status?
+    ///
+    /// Separates two faults the other fields collapse (bead `sparkle-00dmmc`). `saw_runners` says the
+    /// read enumerated SOME fleet; this says THIS pool's runner is a member of it. Zero ONLINE release
+    /// runners means two very different things depending on this bit, and they want OPPOSITE repairs:
+    /// `true` is a registered runner that is merely offline — asleep, or its runner service stopped —
+    /// where the registration is intact and waking it is the entire fix; `false` is a label absent
+    /// from the fleet, where waking accomplishes nothing and the registration has to be re-created.
+    /// The old ladder printed "Wake the release Mac" for both, so a reader who followed it correctly
+    /// in the first case was left with no instruction at all in the second.
+    registered_label: bool,
 }
 
 impl RunnerPoolReading {
@@ -1089,10 +1100,11 @@ fn read_runner_pool(json: &str, label: &str) -> Option<RunnerPoolReading> {
     let saw_runners = !merged.is_empty();
     let mut online_idle = 0;
     let mut online_busy = 0;
+    let mut registered_label = false;
     for r in merged {
-        if r.get("status").and_then(|s| s.as_str()) != Some("online") {
-            continue;
-        }
+        // THE LABEL TEST NOW COMES FIRST, ahead of the status gate. `registered_label` has to count an
+        // OFFLINE registration — that is the entire distinction it carries — so testing status first
+        // would make it a duplicate of the online counts and the two blocking arms indistinguishable.
         let has_label = r
             .get("labels")
             .and_then(|l| l.as_array())
@@ -1103,13 +1115,17 @@ fn read_runner_pool(json: &str, label: &str) -> Option<RunnerPoolReading> {
         if !has_label {
             continue;
         }
+        registered_label = true;
+        if r.get("status").and_then(|s| s.as_str()) != Some("online") {
+            continue;
+        }
         if r.get("busy").and_then(|b| b.as_bool()).unwrap_or(false) {
             online_busy += 1;
         } else {
             online_idle += 1;
         }
     }
-    Some(RunnerPoolReading { online_idle, online_busy, complete, saw_runners })
+    Some(RunnerPoolReading { online_idle, online_busy, complete, saw_runners, registered_label })
 }
 
 /// Read `.total_count` from `gh api "repos/<repo>/actions/runs?status=queued&per_page=1"`.
@@ -1284,11 +1300,26 @@ fn classify_release_runner(reading: Option<RunnerPoolReading>) -> (HealthState, 
                  Re-read before concluding anything."
             ),
         ),
+        // THE BLOCKING SHAPE SPLITS ON `registered_label` (bead sparkle-00dmmc). Both arms block —
+        // no notarized DMG builds either way, so the severity ladder and the shell twin's arm ORDER
+        // are unchanged — but the two conditions want OPPOSITE repairs, and a remedy is an
+        // instruction the reader will follow (AGENTS.md, bead sparkle-8bvh).
+        Some(r) if r.online_total() == 0 && r.registered_label => (
+            HealthState::Blocking,
+            format!(
+                "the macOS release runner ({RELEASE_RUNNER_LABEL}) is REGISTERED but not online — no \
+                 notarized DMG can be built until it is back. Its registration is intact, so this is \
+                 the asleep/stopped-service shape: wake the release Mac (or start its runner service) \
+                 and re-check. Do NOT re-run setup-self-hosted-runner.sh — nothing needs re-registering."
+            ),
+        ),
         Some(r) if r.online_total() == 0 => (
             HealthState::Blocking,
             format!(
-                "the macOS release runner ({RELEASE_RUNNER_LABEL}) is offline — no notarized DMG can \
-                 be built until it is back online. Wake the release Mac and re-check."
+                "NO runner carrying the release label ({RELEASE_RUNNER_LABEL}) is registered at all — \
+                 it is ABSENT from the fleet, not merely offline, so no notarized DMG can be built. \
+                 Waking the Mac is not enough here; the registration itself is gone. Re-register it \
+                 with: sudo scripts/runner/setup-self-hosted-runner.sh"
             ),
         ),
         Some(r) if r.online_busy > 0 => (
@@ -3605,6 +3636,7 @@ mod tests {
             online_busy: 21,
             complete: true,
             saw_runners: true,
+            registered_label: true,
         };
         assert_eq!(ci_queue_sub_verdict(Some(saturated), Some(0)), "ok");
         assert_eq!(
@@ -3614,7 +3646,7 @@ mod tests {
         );
         // A backlog UNDER the floor is tolerated by the ladder, so it is `ok` here as well.
         let one_idle =
-            RunnerPoolReading { online_idle: 1, online_busy: 3, complete: true, saw_runners: true };
+            RunnerPoolReading { online_idle: 1, online_busy: 3, complete: true, saw_runners: true, registered_label: true };
         assert_eq!(ci_queue_sub_verdict(Some(one_idle), Some(2)), "ok");
         // …and a real backlog IS `backlog`, so the negative above is not vacuous.
         assert_eq!(ci_queue_sub_verdict(Some(one_idle), Some(43)), "backlog");
@@ -3630,9 +3662,9 @@ mod tests {
         // A real queue depth is used deliberately: with `queued: 43` the unguarded code CANNOT
         // reach any other answer, so these assertions go red the moment the guard is removed.
         let truncated_page =
-            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: false, saw_runners: true };
+            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: false, saw_runners: true, registered_label: true };
         let saw_nothing =
-            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: true, saw_runners: false };
+            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: true, saw_runners: false, registered_label: true };
         for (name, degraded) in [("truncated page", truncated_page), ("no runners seen", saw_nothing)]
         {
             assert_eq!(
@@ -3655,7 +3687,7 @@ mod tests {
         // enumeration did return runners — is a measurement, and its true `0` still reaches the
         // blocking arm with its evidence intact.
         let really_empty =
-            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: true, saw_runners: true };
+            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: true, saw_runners: true, registered_label: true };
         assert_eq!(
             ci_queue_sub_verdict(Some(really_empty), Some(43)),
             "backlog",
@@ -4682,6 +4714,58 @@ mod tests {
         format!(r#"{{"total_count":{},"runners":[{}]}}"#, entries.len(), items.join(","))
     }
 
+    /// The Rust twin of `claims_offline` in `scripts/tests/pipeline-health.test.sh` (roborev job
+    /// 82207). True when `detail` makes the release-runner-is-DOWN claim, in ANY of its shapes.
+    ///
+    /// WHY A HELPER AND NOT INLINE `contains` CALLS. Nearly every use is a NEGATIVE assertion — "a
+    /// truncated read must not claim the Mac is offline" — and a pattern that stops matching turns
+    /// every one of them green over the exact text it was written to catch. That is not theoretical:
+    /// when the blocking arm split into REGISTERED-but-offline and DEREGISTERED, five negatives here
+    /// were left keyed on the retired wording and became satisfiable by EVERY value
+    /// `classify_release_runner` can return. The shell side had already learned this and grown a
+    /// self-check; the Rust twin had not.
+    fn claims_runner_down(detail: &str) -> bool {
+        let d = detail.to_ascii_lowercase();
+        d.contains(&format!("({RELEASE_RUNNER_LABEL}) is offline").to_ascii_lowercase())
+            || d.contains("wake the release mac")
+            || d.contains("is registered but not online")
+            || d.contains("is registered at all")
+    }
+
+    /// SELF-CHECK for `claims_runner_down`, one arm per blocking shape — mirroring the two self-checks
+    /// the shell suite runs. A helper recognising only one of the two shapes would leave every
+    /// negative assertion for the other silently vacuous, which is the defect this whole helper exists
+    /// to make impossible to reintroduce.
+    #[test]
+    fn claims_runner_down_recognises_every_blocking_shape_and_no_hedge() {
+        let asleep = runners_json(&[("sparkle-release", "offline", false)]);
+        let (state, detail) = classify_release_runner(read_runner_pool(&asleep, RELEASE_RUNNER_LABEL));
+        assert_eq!(state, HealthState::Blocking, "{detail}");
+        assert!(claims_runner_down(&detail), "REGISTERED-but-offline must be recognised: {detail}");
+
+        let gone = runners_json(&[("linux-ci", "online", true)]);
+        let (state, detail) = classify_release_runner(read_runner_pool(&gone, RELEASE_RUNNER_LABEL));
+        assert_eq!(state, HealthState::Blocking, "{detail}");
+        assert!(claims_runner_down(&detail), "DEREGISTERED must be recognised: {detail}");
+
+        // THE PAIRED NEGATIVE. Without it a helper hardcoded to `true` would satisfy both arms above
+        // and make every negative assertion in this module unfalsifiable in the other direction. The
+        // hedged UNKNOWN wording deliberately contains the word "offline" inside a clause DENYING it,
+        // and must not read as the claim.
+        let (state, truncated) = classify_release_runner(Some(RunnerPoolReading {
+            online_idle: 0,
+            online_busy: 0,
+            complete: false,
+            saw_runners: true,
+            registered_label: false,
+        }));
+        assert_eq!(state, HealthState::Unknown, "{truncated}");
+        assert!(
+            !claims_runner_down(&truncated),
+            "the truncated hedge denies the claim rather than making it: {truncated}"
+        );
+    }
+
     /// The same page, but with a `total_count` the caller chooses — the shape of a TRUNCATED read,
     /// where GitHub reports every registration on the repo beside the page it actually returned.
     fn runners_page(total_count: usize, entries: &[(&str, &str, bool)]) -> String {
@@ -4781,6 +4865,64 @@ mod tests {
         assert!(detail.contains("building a release"), "{detail}");
     }
 
+    /// REGISTERED-but-offline and DEREGISTERED are two faults with OPPOSITE repairs, and the ladder
+    /// used to print one string for both (bead `sparkle-00dmmc`). The twin of block (d) in
+    /// `scripts/tests/pipeline-health.test.sh` — change one side and this is the tripwire.
+    ///
+    /// Both stay BLOCKING: no notarized DMG builds either way, so the severity ladder is untouched.
+    /// What differs is the INSTRUCTION, and a remedy is something the reader will act on — telling
+    /// someone to re-run `setup-self-hosted-runner.sh` at a Mac that is merely asleep is a
+    /// destructive answer to a non-problem.
+    #[test]
+    fn registered_but_offline_and_deregistered_carry_different_remedies() {
+        // ASLEEP — the release runner IS in the fleet, carrying its label, simply not online.
+        let asleep =
+            runners_json(&[("linux-ci", "online", true), ("sparkle-release", "offline", false)]);
+        let reading = read_runner_pool(&asleep, RELEASE_RUNNER_LABEL).expect("fixture parses");
+        assert!(reading.registered_label, "an offline-but-registered runner is still REGISTERED");
+        let (state, asleep_detail) = classify_release_runner(Some(reading));
+        assert_eq!(state, HealthState::Blocking, "a DMG still cannot build: {asleep_detail}");
+        // PAIRED, and the pairing is not decoration. A bare `!contains("setup-self-hosted-runner")`
+        // matches this message's OWN REQUIRED DENIAL — the honest copy has to warn the reader off the
+        // command in so many words — so the negative must key on the PRESCRIBING phrase, and a
+        // positive is needed beside it because deleting a lie is not the same fact as stating the
+        // truth: a message trimmed to silence would satisfy the negative alone (AGENTS.md, copy
+        // ratchets).
+        assert!(
+            !asleep_detail.contains("Re-register it with"),
+            "an ASLEEP runner must not be told to re-register: {asleep_detail}"
+        );
+        assert!(
+            asleep_detail.contains("Do NOT re-run setup-self-hosted-runner.sh"),
+            "the asleep remedy must warn the reader OFF re-registering, not merely omit it: \
+             {asleep_detail}"
+        );
+
+        // DEREGISTERED — a real fleet was enumerated and NOTHING in it carries the release label.
+        let gone = runners_json(&[("linux-ci", "online", true), ("linux-ci", "online", false)]);
+        let reading = read_runner_pool(&gone, RELEASE_RUNNER_LABEL).expect("fixture parses");
+        assert!(!reading.registered_label, "no runner in this fleet carries the release label");
+        assert!(reading.saw_runners, "the read DID enumerate a fleet, so this is not a degraded read");
+        let (state, gone_detail) = classify_release_runner(Some(reading));
+        assert_eq!(state, HealthState::Blocking, "{gone_detail}");
+        assert!(
+            gone_detail.contains("Re-register it with"),
+            "a DEREGISTERED runner must name the re-registration repair: {gone_detail}"
+        );
+        assert!(
+            !gone_detail.contains("Do NOT re-run"),
+            "the deregistered remedy must not carry the asleep shape's warning-off: {gone_detail}"
+        );
+
+        // THE PAIR THAT KEEPS THE SPLIT HONEST. Every assertion above about STATE is satisfied by a
+        // classifier that prints ONE string for both shapes — which is exactly the defect being
+        // fixed — so the texts themselves have to be shown to differ.
+        assert_ne!(
+            asleep_detail, gone_detail,
+            "registered-but-offline and deregistered must not carry the same remedy"
+        );
+    }
+
     /// Reading is label-scoped: a busy linux-ci runner must not count toward the release pool and
     /// vice-versa. Proves the two components read the same JSON but see different pools.
     #[test]
@@ -4840,12 +4982,8 @@ mod tests {
         // ("not proof the Mac is offline"). What must never appear is the CLAIM: the Blocking
         // wording that asserts the runner is down and sends someone to the Mac.
         assert!(
-            !detail.contains(&format!("({RELEASE_RUNNER_LABEL}) is offline")),
-            "it must not assert the runner is offline: {detail}"
-        );
-        assert!(
-            !detail.contains("Wake the release Mac"),
-            "and must not dispatch anyone to a Mac that is probably fine: {detail}"
+            !claims_runner_down(&detail),
+            "it must not make the runner-is-down claim in ANY of its shapes: {detail}"
         );
         assert!(detail.contains("TRUNCATED"), "it must say WHY it cannot tell: {detail}");
 
@@ -4867,7 +5005,12 @@ mod tests {
         let (state, detail) =
             classify_release_runner(read_runner_pool(&runners_page(30, &entries), RELEASE_RUNNER_LABEL));
         assert_eq!(state, HealthState::Blocking, "a complete list CAN prove absence: {detail}");
-        assert!(detail.contains("offline"), "{detail}");
+        // Keyed on the DEREGISTERED claim, not the bare word "offline" — which now also appears
+        // incidentally inside "not merely offline" and would pass on wording that claims nothing.
+        assert!(
+            detail.contains("is registered at all"),
+            "a complete list holding no release registration is the DEREGISTERED claim: {detail}"
+        );
 
         let no_count = r#"{"runners":[{"name":"r","status":"offline","busy":false,"labels":[{"name":"sparkle-release"}]}]}"#;
         let reading = read_runner_pool(no_count, RELEASE_RUNNER_LABEL).expect("readable");
@@ -4894,12 +5037,8 @@ mod tests {
         assert_eq!(state, HealthState::Unknown, "an empty read proves nothing about the Mac: {detail}");
         assert_ne!(state, HealthState::Blocking, "and must never publish an outage on it: {detail}");
         assert!(
-            !detail.contains(&format!("({RELEASE_RUNNER_LABEL}) is offline")),
-            "it must not assert the runner is offline: {detail}"
-        );
-        assert!(
-            !detail.contains("Wake the release Mac"),
-            "and must not dispatch anyone to a Mac that is probably fine: {detail}"
+            !claims_runner_down(&detail),
+            "it must not make the runner-is-down claim in ANY of its shapes: {detail}"
         );
     }
 
@@ -4919,7 +5058,7 @@ mod tests {
         assert!(reading.saw_runners, "the list is non-empty — saw a fleet, so the empty-read arm cannot fire");
         let (state, detail) = classify_release_runner(Some(reading));
         assert_eq!(state, HealthState::Unknown, "a broken-count read proves nothing about the Mac: {detail}");
-        assert!(!detail.contains("Wake the release Mac"), "must not dispatch anyone: {detail}");
+        assert!(!claims_runner_down(&detail), "must not dispatch anyone: {detail}");
     }
 
     /// THE CI TWIN of the false-absence control (roborev 70860). The CI pool reads the SAME JSON, so
@@ -6601,12 +6740,12 @@ mod tests {
     #[test]
     fn release_in_progress_is_busy_true_idle_false_unknown_none() {
         assert_eq!(
-            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1, complete: true, saw_runners: true })),
+            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1, complete: true, saw_runners: true, registered_label: true })),
             Some(true),
             "a busy release VM means a DMG is building — the fleet must pause"
         );
         assert_eq!(
-            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0, complete: true, saw_runners: true })),
+            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0, complete: true, saw_runners: true, registered_label: true })),
             Some(false),
             "online but idle is NOT a release in progress"
         );

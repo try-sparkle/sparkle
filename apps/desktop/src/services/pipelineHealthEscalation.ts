@@ -18,7 +18,14 @@
 // startup is a steady state, not a transition.
 //
 // ── SEVERITY GATING (cost-insensitive to tokens, allergic to noise) ──────────────────────────────
-//   • BLOCKING — always escalates immediately (a deployment is prevented).
+//   • BLOCKING — escalates, but only once CONFIRMED: the component must still read blocking on
+//                BLOCKING_CONFIRMATIONS consecutive polls (default 2, the same confirmation the
+//                hourly scan's `PH_HYSTERESIS_PASSES` already demanded before writing a bead). A
+//                blocking reading that clears before then is a blip and is never announced, nor is
+//                its recovery. This costs one poll of latency on a real outage and removes the
+//                single-poll false alarm that shipped remediation which would have been wrong to
+//                run (bead sparkle-00dmmc). Confirmation is a DEFERRAL, not a debounce — see
+//                `pendingBlocking` for why a debounce could not work against an edge detector.
 //   • WARNING  — escalates, but DEBOUNCED per component: a second warning edge for the same
 //                component within WARNING_DEBOUNCE_MS is suppressed, so a flapping warning cannot
 //                spam. (A steady warning is already silent via the edge rule; the debounce guards
@@ -88,6 +95,23 @@ export interface EscalationEvent {
  * situation has settled is not swallowed. BLOCKING is never debounced; RECOVERY is never debounced.
  */
 export const WARNING_DEBOUNCE_MS = 30 * 60 * 1000;
+
+/**
+ * How many CONSECUTIVE polls must report `blocking` before that alarm is ANNOUNCED (bead
+ * sparkle-00dmmc). Mirrors `PH_HYSTERESIS_PASSES` (default 2) in scripts/pipeline-health-scan.sh so
+ * the real-time path and the hourly scan demand the same confirmation before either acts.
+ *
+ * THE MEASURED INCIDENT. On 2026-09-08 the release runner crossed green->blocking on ONE poll and
+ * was announced instantly with "Wake the release Mac and re-check". Nothing needed waking: the
+ * classifier blocks on a REGISTERED-but-offline runner by design, which is how a Mac idling between
+ * jobs presents, and the next poll was green. The scan filed no bead for the same reading because
+ * its hysteresis held the write; only this path had no confirmation of any kind. A remedy is an
+ * instruction the reader will follow (AGENTS.md, bead sparkle-8bvh), so shipping one for a reading
+ * that clears itself a minute later is worse than staying quiet.
+ *
+ * Setting this to 1 restores the old announce-on-first-reading behaviour.
+ */
+export const BLOCKING_CONFIRMATIONS = 2;
 
 /** Severity ordering, so "worse" is a comparison rather than a table of pairs.
  *  good (healthy / not_applicable) < unknown < warning < blocking. */
@@ -296,6 +320,42 @@ export function knightwatchRemediation(detail?: string): string {
  * concrete next action so the alert is actionable, not just a notification. `null` for an unknown id
  * — the message still names the component and severity, it simply has no canned fix to append.
  */
+/**
+ * The release runner's remedy, derived from the DETAIL rather than fixed per component — the same
+ * shape as `roborevRemediation`, and for the same reason (bead sparkle-00dmmc).
+ *
+ * The single old string said "wake the founder's Mac, and repair the runner with `sudo
+ * scripts/runner/setup-self-hosted-runner.sh` if it does not re-register", which conflates two
+ * faults whose repairs run in OPPOSITE directions. A Mac that is merely asleep has an intact
+ * registration, and re-running the setup script at it is a destructive answer to a non-problem; a
+ * runner absent from the fleet cannot be woken at all. A remedy is an instruction the reader will
+ * follow (AGENTS.md, bead sparkle-8bvh), so it has to name the one that applies.
+ *
+ * THE FALLBACK KEEPS THE OLD CONFLATED WORDING ON PURPOSE. It is reached only by a detail this
+ * function does not recognise — an older build's string, or a shape added later — and there naming
+ * BOTH actions is the conservative answer. Confidently naming the wrong one is the failure mode.
+ */
+export function releaseRunnerRemediation(detail?: string): string {
+  const d = detail ?? "";
+  if (d.includes("is REGISTERED but not online")) {
+    return (
+      "The release runner is REGISTERED but not online — its registration is intact, so this is the " +
+      "asleep or stopped-service shape. Wake the founder's Mac (or start its runner service) and " +
+      "re-check. Do NOT run `sudo scripts/runner/setup-self-hosted-runner.sh`: nothing needs " +
+      "re-registering, and running it against a healthy registration is a destructive answer to a " +
+      "machine that is merely asleep."
+    );
+  }
+  if (d.includes("is registered at all")) {
+    return (
+      "NO runner carrying the release label is registered at all — it is ABSENT from the fleet, not " +
+      "merely offline, so waking the Mac accomplishes nothing on its own. Re-register it with `sudo " +
+      "scripts/runner/setup-self-hosted-runner.sh`."
+    );
+  }
+  return "The release runner (DMG build) is offline — wake the founder's Mac, and repair the runner with `sudo scripts/runner/setup-self-hosted-runner.sh` if it does not re-register.";
+}
+
 export function remediationFor(componentId: string, detail?: string): string | null {
   switch (componentId) {
     case "roborev":
@@ -316,7 +376,7 @@ export function remediationFor(componentId: string, detail?: string): string | n
         "remediation is raising that quota, which is a founder spend decision tracked on sparkle-skcxyj."
       );
     case "release_runner":
-      return "The release runner (DMG build) is offline — wake the founder's Mac, and repair the runner with `sudo scripts/runner/setup-self-hosted-runner.sh` if it does not re-register.";
+      return releaseRunnerRemediation(detail);
     case "knightwatch":
       return knightwatchRemediation(detail);
     case "release_publication":
@@ -453,15 +513,131 @@ export interface EscalationDeps {
 const lastWarningAt = new Map<string, number>();
 
 /**
- * Components whose most recent WARNING edge was SUPPRESSED by the debounce — i.e. an alarm is
- * outstanding that nobody was ever told about. The recovery that clears such an alarm is suppressed
- * too, and consumes the flag. See `passesGate` for why both halves are needed.
+ * Components carrying an alarm that is outstanding and that NOBODY WAS EVER TOLD ABOUT. The recovery
+ * that clears such an alarm is suppressed too, and consumes the flag. See `passesGate` for why both
+ * halves are needed.
+ *
+ * TWO WAYS IN, not one. It began as "suppressed by the debounce" and that is no longer the whole
+ * meaning: an alarm that passed the gate and then reached NO SINK AT ALL is equally un-heard, and is
+ * recorded here beside `undelivered` (roborev jobs 82210, 82211). Both entries mean the same thing to
+ * the recovery gate, which is the point — it asks "was the reader told?", not "why not?".
+ *
+ * Entries are retired against the SNAPSHOT at the end of each sweep, not by a recovery event, because
+ * an alarm can end without emitting one.
  */
 const unannouncedAlarm = new Set<string>();
 
 /**
+ * Components whose alarm the reader HAS been told about — written by `passesGate` on every DELIVERED
+ * warning or blocking, cleared on every recovery.
+ *
+ * WHY THIS IS RECORDED RATHER THAN INFERRED (roborev job 82208). The first version of the drop guard
+ * asked `!isAlarmState(pending.ev.from)`, using the edge's origin as a proxy for "was anything
+ * already announced underneath this streak". The proxy is wrong for `unknown`, which is neither a
+ * good state nor an alarm state — and `unknown` is exactly where a component lands when its probe
+ * times out. So `healthy→warning` (delivered) → `warning→unknown` (no event) → `unknown→blocking`
+ * (held) → `blocking→healthy` still flagged the drop and still ate the announced warning's all-clear:
+ * the same bug the guard was written to fix, surviving one hop through `unknown`.
+ *
+ * A proxy for a fact is only ever as good as the enumeration behind it. This set IS the fact.
+ */
+const announcedAlarm = new Set<string>();
+
+/**
+ * THE ONLY WRITER of `unannouncedAlarm` — record that an alarm on this component is outstanding and
+ * UNHEARD, if and only if nothing was already announced underneath it.
+ *
+ * WHY THIS IS A FUNCTION AND NOT THREE CALL SITES (roborev jobs 82211, 82212). The flag SUPPRESSES —
+ * the recovery gate consumes it — so setting it when the reader HAS already been told eats that
+ * alarm's all-clear, leaving a component reported degraded with no notice that it recovered and the
+ * improvement pass never authorised to close its bead. There were three writers reaching this flag by
+ * three different routes (the deferred-streak drop, the sink-result restore, and the warning
+ * debounce), the conjunct was added to them ONE AT A TIME across three review rounds, and each round
+ * missed that another site needed it. The predicate belongs in one place because forgetting it is the
+ * failure mode, not writing it.
+ *
+ * Callers still decide WHETHER an alarm went unheard; this decides only whether recording that fact
+ * would trample one that was heard.
+ */
+function markUnannounced(componentId: string): void {
+  if (announcedAlarm.has(componentId)) return;
+  unannouncedAlarm.add(componentId);
+}
+
+/**
+ * Blocking alarms DETECTED but not yet CONFIRMED, keyed by component: the edge that opened the
+ * streak, and how many consecutive polls have reported `blocking` since.
+ *
+ * WHY A DEFERRAL AND NOT A DEBOUNCE — the shape that makes this different from the warning gate.
+ * Detection is EDGE-triggered, so a component that is blocking and STAYS blocking emits exactly ONE
+ * event; there is no second event for a time window to suppress, and a count of EVENTS could never
+ * reach two. Confirmation therefore has to be re-evaluated against each later SNAPSHOT, which is
+ * what `advancePendingBlocking` does. A gate written as a debounce here would be silently inert.
+ */
+const pendingBlocking = new Map<string, { ev: EscalationEvent; streak: number }>();
+
+/**
+ * Re-evaluate every deferred blocking alarm against THIS snapshot and return the ones now confirmed.
+ *
+ * MUST RUN BEFORE this sweep's edges are gated: an alarm dropped here records itself in
+ * `unannouncedAlarm`, and that has to be in place before the matching recovery edge reaches
+ * `passesGate`, or the all-clear for an alarm nobody heard is announced.
+ *
+ * A component that is no longer `blocking` — recovered, thawed to `warning`, gone `unknown`, or
+ * absent from the snapshot altogether — drops its streak. `unknown` drops it rather than extending
+ * it, which keeps this module's standing rule that an unreadable meter never alarms: a real outage
+ * that flickers through `unknown` simply re-confirms, and that is the fail-safe direction.
+ */
+function advancePendingBlocking(next: PipelineHealth): EscalationEvent[] {
+  if (pendingBlocking.size === 0) return [];
+  const byId = new Map(next.components.map((c) => [c.id, c]));
+  const confirmed: EscalationEvent[] = [];
+  for (const [id, pending] of [...pendingBlocking]) {
+    const cur = byId.get(id);
+    if (cur === undefined || cur.state !== "blocking") {
+      pendingBlocking.delete(id);
+      // FLAG THE DROP ONLY WHEN THIS STREAK WAS THE READER'S ONLY ALARM (roborev job 82171).
+      // `unannouncedAlarm` means "an alarm is outstanding that nobody was told about", and the
+      // recovery gate CONSUMES it — so setting it unconditionally eats the all-clear for a WARNING
+      // that was already announced underneath this blocking. Measured sequence, all on the 60s poll:
+      // healthy→warning (delivered, the reader HAS heard it) → warning→blocking (held) →
+      // blocking→healthy (dropped here). Flagging that drop leaves the component reported degraded
+      // with no all-clear ever issued — the identical harm the blocking branch of `passesGate`
+      // documents, and the notice the improvement pass reads as permission to close its P1 bead.
+      //
+      // ASK WHAT WAS ACTUALLY ANNOUNCED, never what the edge rose FROM (roborev job 82208). `from`
+      // has three shapes, not two — good, alarm, and `unknown` — and `unknown` is neither, so a proxy
+      // built on `isAlarmState(from)` mis-flags a streak that reached blocking via a timed-out probe
+      // and reproduces this very bug one hop away. A streak with nothing announced underneath it IS
+      // the reader's only alarm and still flags; one sitting on a delivered warning must not, and one
+      // sitting on a warning the debounce swallowed needs nothing from us — `passesGate` set the flag
+      // itself when it suppressed that warning.
+      markUnannounced(id);
+      continue;
+    }
+    const streak = pending.streak + 1;
+    if (streak < BLOCKING_CONFIRMATIONS) {
+      pendingBlocking.set(id, { ev: pending.ev, streak });
+      continue;
+    }
+    pendingBlocking.delete(id);
+    // DETAIL and remedy are re-read from the CONFIRMING snapshot rather than kept from the opening
+    // edge: the reader is told about the reading that is true NOW, and a remedy must be safe under
+    // the conditions that actually produced it (AGENTS.md, bead sparkle-8bvh).
+    confirmed.push({
+      ...pending.ev,
+      detail: cur.detail,
+      remediation: remediationFor(cur.id, cur.detail),
+    });
+  }
+  return confirmed;
+}
+
+/**
  * Should this event be delivered right now? Applies the severity gate:
- *   • blocking → always.
+ *   • blocking → only once CONFIRMED. A blocking edge does not reach this gate on its own reading;
+ *                it is deferred by `advancePendingBlocking` and arrives here on the poll that
+ *                confirms it, at which point it is always delivered.
  *   • warning  → only outside the per-component debounce window; records the time when it passes.
  *   • recovery → unless it clears an alarm that was itself suppressed (see below).
  * (Unknown never reaches here — `detectEscalations` emits no event for it.)
@@ -492,13 +668,17 @@ const unannouncedAlarm = new Set<string>();
  */
 function passesGate(ev: EscalationEvent, now: number): boolean {
   if (ev.severity === "recovery") {
-    // Consume the flag either way: the outstanding alarm is over, announced or not.
+    // The outstanding alarm is over either way, announced or not — so both records are cleared and
+    // the flag is CONSUMED, which is what decides whether this all-clear is worth delivering.
+    announcedAlarm.delete(ev.componentId);
     return !unannouncedAlarm.delete(ev.componentId);
   }
   if (ev.severity === "blocking") {
-    // CLEAR THE FLAG — a blocking alarm is an ANNOUNCED one, and returning early without saying so
-    // is what let a flap eat its all-clear. The suppression rule is "do not announce the clearing of
-    // an alarm nobody was told about"; blocking is never debounced, so the reader was always told.
+    // CLEAR THE FLAG — a blocking alarm that reaches this gate is an ANNOUNCED one, and returning
+    // early without saying so is what let a flap eat its all-clear. The suppression rule is "do not
+    // announce the clearing of an alarm nobody was told about"; an UNCONFIRMED blocking never gets
+    // here (`advancePendingBlocking` sets the flag itself when it drops one), so everything that
+    // does arrive here is about to be told to the reader.
     // Leaving a debounced WARNING's flag standing meant the next recovery consumed it and fell
     // silent — for the blocking alarm, not the warning that raised it. The component then reads
     // BLOCKED with no all-clear ever issued, and since the recovery is what tells the improvement
@@ -509,7 +689,7 @@ function passesGate(ev: EscalationEvent, now: number): boolean {
   // warning
   const last = lastWarningAt.get(ev.componentId);
   if (last !== undefined && now - last < WARNING_DEBOUNCE_MS) {
-    unannouncedAlarm.add(ev.componentId);
+    markUnannounced(ev.componentId);
     return false;
   }
   lastWarningAt.set(ev.componentId, now);
@@ -524,13 +704,26 @@ export interface EscalationResult {
   /** Warning events suppressed by the debounce this sweep. */
   debounced: EscalationEvent[];
   /**
+   * Blocking edges DEFERRED this sweep pending confirmation — detected, not yet announced. Unlike
+   * `debounced` these are not discarded: each is re-evaluated on the next poll and will either be
+   * announced (still blocking) or dropped as a blip (anything else). A non-empty `held` means "an
+   * alarm is being confirmed", never "an alarm was suppressed".
+   */
+  held: EscalationEvent[];
+  /**
    * Events that passed the gate and reached NO sink at all — every channel refused or threw.
    *
-   * This is NOT a subset of `delivered`; the two partition the gated events. It exists because
-   * `passesGate` CONSUMES the alarm (it clears `unannouncedAlarm` for the component), so an event
-   * that routed nowhere is not retried on the next sweep — it is simply gone. Counting such an
-   * event as `delivered` reported a lost alarm as a handled one, which is the one shape a watchdog
-   * must never produce.
+   * This is NOT a subset of `delivered`; the two partition the gated events. It exists because the
+   * event is not retried on the next sweep — it is simply gone. Counting such an event as
+   * `delivered` reported a lost alarm as a handled one, which is the one shape a watchdog must
+   * never produce.
+   *
+   * WHAT IT NO LONGER MEANS (roborev jobs 82209, 82210). This used to say `passesGate` CONSUMES the
+   * alarm by clearing `unannouncedAlarm`, and that consumption was itself the bug: a lost alarm
+   * cleared its own suppression flag and its later all-clear was announced to a reader who had never
+   * heard the alarm. Both records are now decided by the SINK RESULT — `announcedAlarm` is set beside
+   * `delivered`, `unannouncedAlarm` is restored beside `undelivered` — so a routed-nowhere event
+   * leaves the same state as one that was never gated at all.
    */
   undelivered: EscalationEvent[];
 }
@@ -549,12 +742,36 @@ export async function escalatePipelineHealth(
   deps: EscalationDeps,
 ): Promise<EscalationResult> {
   const now = deps.now();
+  // Deferred blocking alarms are re-evaluated FIRST, so one dropped for want of confirmation has
+  // already marked itself unannounced by the time this sweep's recovery edge is gated below.
+  const confirmedBlocking = advancePendingBlocking(next);
   const candidates = detectEscalations(prev, next);
   const delivered: EscalationEvent[] = [];
   const debounced: EscalationEvent[] = [];
+  const held: EscalationEvent[] = [];
   const undelivered: EscalationEvent[] = [];
 
+  // Gating is done for the whole sweep BEFORE any routing, so `passesGate` — which has side effects
+  // (it stamps the warning clock and consumes the unannounced flag) — is called exactly once per
+  // event.
+  const gated: EscalationEvent[] = [];
+  for (const ev of confirmedBlocking) {
+    // Always true for `blocking`; called for its side effect of clearing the unannounced flag.
+    if (passesGate(ev, now)) gated.push(ev);
+  }
   for (const ev of candidates) {
+    // A NEW blocking edge is never announced on its own reading — it opens a streak that a later
+    // poll has to confirm. This is the half that stops a self-healing blip from paging with
+    // remediation that would have been wrong to run (bead sparkle-00dmmc).
+    if (ev.severity === "blocking" && BLOCKING_CONFIRMATIONS > 1) {
+      pendingBlocking.set(ev.componentId, { ev, streak: 1 });
+      held.push(ev);
+      log.debug("pipeline-health", "blocking alarm held pending confirmation", {
+        component: ev.componentId,
+        needed: BLOCKING_CONFIRMATIONS,
+      });
+      continue;
+    }
     if (!passesGate(ev, now)) {
       debounced.push(ev);
       log.debug("pipeline-health", "escalation debounced", {
@@ -563,6 +780,10 @@ export async function escalatePipelineHealth(
       });
       continue;
     }
+    gated.push(ev);
+  }
+
+  for (const ev of gated) {
     const text = composeEscalationMessage(ev);
 
     // Concierge feed — best-effort visibility.
@@ -619,17 +840,60 @@ export async function escalatePipelineHealth(
         improve: improveOk,
         bead: beadOk,
       });
+      // "ANNOUNCED" IS RECORDED HERE, AT THE SINK RESULT — not in `passesGate` (roborev job 82209).
+      // The gate runs BEFORE routing, so recording there counted an event that reached NO sink at
+      // all as one the reader had been told about, which is the exact opposite of what `undelivered`
+      // means. A recovery is not an alarm and records nothing.
+      if (ev.severity !== "recovery") announcedAlarm.add(ev.componentId);
       delivered.push(ev);
     } else {
       log.error("pipeline-health", "escalation reached NO sink; this alarm is LOST", {
         component: ev.componentId,
         severity: ev.severity,
       });
+      // …AND THE SUPPRESSION FLAG IS RESTORED HERE, symmetrically (roborev job 82210). `passesGate`
+      // clears `unannouncedAlarm` at GATE time, before routing — but that flag is the one that
+      // decides whether a later all-clear is delivered, so an alarm that reached nobody would
+      // otherwise buy itself a recovery notice for an alarm nobody heard, waking a full improvement
+      // turn to close a bead that was never opened. Moving `announcedAlarm` to the sink result and
+      // leaving this one at the gate fixed the record that is READ by the drop guard and left the
+      // record that is read by the RECOVERY GATE untouched — half a fix. A recovery is not an alarm
+      // and records nothing.
+      // THE CONJUNCT IS NOT OPTIONAL, and the two sink-result writes are NOT symmetric (roborev job
+      // 82211). `announcedAlarm.add` beside `delivered` is safe unconditionally because a SET record
+      // can only broaden later delivery. This one SUPPRESSES, so it needs the same "was anything
+      // announced underneath" test `advancePendingBlocking`'s drop branch carries — without it a LOST
+      // alarm stacked on an ALREADY-DELIVERED one swallows that one's all-clear, which is bug 82171
+      // arriving by a different route: the reader is told the component is degraded and never told it
+      // recovered, and the improvement pass never sees the notice that authorises closing its bead.
+      if (ev.severity !== "recovery") markUnannounced(ev.componentId);
       undelivered.push(ev);
     }
   }
 
-  return { delivered, debounced, undelivered };
+  // RETIRE BOTH RECORDS AGAINST THE SNAPSHOT (roborev job 82209). Clearing them only on a recovery
+  // EVENT leaves a permanently stale entry whenever an alarm ends without emitting one — and it can:
+  // `detectEscalations` requires `isAlarmState(from) && isGoodState(to)`, so `alarm → unknown → good`
+  // (a probe that times out and then comes back green, the shape this module's own header names)
+  // emits nothing at either crossing. A component that vanishes from the snapshot and returns leaves
+  // one the same way, since an absent baseline is skipped.
+  //
+  // A stale `announcedAlarm` entry then defeats the drop guard for a LATER, unrelated blip and
+  // delivers an all-clear for an alarm nobody heard; a stale `unannouncedAlarm` entry is the
+  // symmetric pre-existing bug in the suppression direction, and this cures it too.
+  //
+  // ORDER IS LOAD-BEARING, and it is safe: `advancePendingBlocking` and `passesGate` both READ these
+  // sets earlier in this same sweep, so retiring here cannot affect a decision already taken — it
+  // only stops the NEXT sweep deciding on stale evidence. A component that is good now has nothing
+  // outstanding, whatever route it took to get there.
+  for (const c of next.components) {
+    if (isGoodState(c.state)) {
+      announcedAlarm.delete(c.id);
+      unannouncedAlarm.delete(c.id);
+    }
+  }
+
+  return { delivered, debounced, held, undelivered };
 }
 
 /**
@@ -732,6 +996,8 @@ export function __resetPipelineEscalationForTests(): void {
   depsOverride = null;
   lastWarningAt.clear();
   unannouncedAlarm.clear();
+  announcedAlarm.clear();
+  pendingBlocking.clear();
 }
 
 /**
@@ -759,6 +1025,6 @@ export async function runPipelineEscalation(
     // delivered nor undelivered. Narrowing that would mean returning the partial partition from
     // inside the sweep rather than losing it to the catch — a change to the sweep's shape, not to
     // this backstop, and deliberately not folded into a merge fix.
-    return { delivered: [], debounced: [], undelivered: [] };
+    return { delivered: [], debounced: [], held: [], undelivered: [] };
   }
 }

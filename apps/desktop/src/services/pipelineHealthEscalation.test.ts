@@ -11,6 +11,7 @@ import {
   detectEscalations,
   escalatePipelineHealth,
   liveEscalationDeps,
+  releaseRunnerRemediation,
   remediationFor,
   roborevRemediation,
   type EscalationDeps,
@@ -89,6 +90,26 @@ function recorder(now = 1_000_000): Recorder {
     },
   };
   return r;
+}
+
+/**
+ * Drive a blocking edge through its CONFIRMATION WINDOW and return the sweep that ANNOUNCES it.
+ *
+ * `BLOCKING_CONFIRMATIONS` (2) means a blocking reading opens a streak on the poll that detects it
+ * and is announced on the next poll that still reads blocking — so every test about what an
+ * ANNOUNCED blocking alarm DOES has to drive two sweeps. The second sweep passes `next` as both
+ * sides deliberately: it is the STEADY state, which emits no edge of its own, so anything delivered
+ * there came from the deferred alarm being confirmed and from nothing else.
+ *
+ * Tests about the WINDOW ITSELF drive their sweeps by hand — see "blocking confirmation window".
+ */
+async function escalateBlocking(
+  prev: PipelineHealth,
+  next: PipelineHealth,
+  deps: EscalationDeps,
+) {
+  await escalatePipelineHealth(prev, next, deps);
+  return escalatePipelineHealth(next, next, deps);
 }
 
 beforeEach(() => __resetPipelineEscalationForTests());
@@ -390,7 +411,7 @@ describe("escalatePipelineHealth — an alarm that reached NO sink is not `deliv
   }
 
   it("a blocking alarm whose concierge, inbox AND fail-safe bead all fail is reported UNDELIVERED", async () => {
-    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deadSinks());
+    const res = await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), deadSinks());
 
     // The side effect under test: it must NOT be counted as handled.
     expect(res.delivered).toHaveLength(0);
@@ -403,7 +424,7 @@ describe("escalatePipelineHealth — an alarm that reached NO sink is not `deliv
     // The paired case: same failing inbox and same throwing bead, one channel alive. Without this,
     // a rule that simply called every alarm undelivered would pass the test above.
     const deps: EscalationDeps = { ...deadSinks(), notifyConcierge: () => true };
-    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deps);
+    const res = await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), deps);
 
     expect(res.delivered).toHaveLength(1);
     expect(res.undelivered).toHaveLength(0);
@@ -417,7 +438,7 @@ describe("escalatePipelineHealth — an alarm that reached NO sink is not `deliv
         filed.push(ev);
       },
     };
-    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deps);
+    const res = await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), deps);
 
     expect(filed).toHaveLength(1);
     expect(res.delivered).toHaveLength(1);
@@ -436,7 +457,7 @@ describe("escalatePipelineHealth — an alarm that reached NO sink is not `deliv
 
   it("a healthy sweep reports an EMPTY undelivered list, not an absent one", async () => {
     const r = recorder();
-    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), r.deps);
+    const res = await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), r.deps);
     expect(res.undelivered).toEqual([]);
     expect(res.delivered).toHaveLength(1);
   });
@@ -465,7 +486,7 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
     // The measured store state: schema behind the bd binary, so reads are served and every WRITE is
     // refused. `notes.rs::select_bd_result` hands that back as Ok("{\"error\":…}") by design, so the
     // old `await invoke(...)` resolved and the fail-safe claimed a bead it had not filed.
-    const res = await escalatePipelineHealth(
+    const res = await escalateBlocking(
       snap("healthy"),
       snap("blocking", "wedged"),
       beadOnly(`{"error":"database schema is out of date; writes are blocked"}`),
@@ -477,7 +498,7 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
   });
 
   it("a clean exit with NO id is also a refusal — an unconfirmed write is not a floor", async () => {
-    const res = await escalatePipelineHealth(
+    const res = await escalateBlocking(
       snap("healthy"),
       snap("blocking", "wedged"),
       beadOnly(`{"warning":"nothing was created"}`),
@@ -486,7 +507,7 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
   });
 
   it("non-JSON stdout is a refusal too, rather than being passed through as success", async () => {
-    const res = await escalatePipelineHealth(
+    const res = await escalateBlocking(
       snap("healthy"),
       snap("blocking", "wedged"),
       beadOnly("bd: unknown subcommand"),
@@ -497,7 +518,7 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
   it("PAIRED: bd returning a real id IS delivery — the guard is not refusing everything", async () => {
     // Without this the three cases above pass for a `fileDurableBead` that always throws, which
     // would silently retire the fail-safe rather than fix it.
-    const res = await escalatePipelineHealth(
+    const res = await escalateBlocking(
       snap("healthy"),
       snap("blocking", "wedged"),
       beadOnly(`{"id":"sparkle-abc12"}`),
@@ -521,7 +542,7 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
       notifyConcierge: () => false,
       wakeImprove: async () => false,
     };
-    await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deps);
+    await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), deps);
 
     expect(calls).toHaveLength(1);
     const [cmd, args] = calls[0] as [string, Record<string, string>];
@@ -535,7 +556,7 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
 describe("escalatePipelineHealth — routing + gating side effects", () => {
   it("green→blocking fires EXACTLY ONE escalation to BOTH channels, naming component+severity+remediation", async () => {
     const r = recorder();
-    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), r.deps);
+    const res = await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), r.deps);
 
     expect(res.delivered).toHaveLength(1);
     expect(r.concierge).toHaveLength(1);
@@ -581,11 +602,11 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     expect(r.woke).toHaveLength(2);
   });
 
-  it("BLOCKING is NEVER debounced, even back-to-back within the warning window", async () => {
+  it("a CONFIRMED blocking is never debounced, even back-to-back within the warning window", async () => {
     const r = recorder();
-    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps);
+    await escalateBlocking(snap("healthy"), snap("blocking"), r.deps);
     r.now += 1000; // well inside WARNING_DEBOUNCE_MS
-    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps);
+    await escalateBlocking(snap("healthy"), snap("blocking"), r.deps);
     expect(r.woke).toHaveLength(2);
   });
 
@@ -682,7 +703,7 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
 
     // The pool now genuinely goes down. BLOCKING is never debounced, so it IS announced.
     r.now += POLL_MS;
-    const blocked = await escalatePipelineHealth(snap("warning"), snap("blocking"), r.deps);
+    const blocked = await escalateBlocking(snap("warning"), snap("blocking"), r.deps);
     expect(blocked.delivered).toHaveLength(1);
     expect(blocked.delivered[0]!.severity).toBe("blocking");
     expect(r.woke).toHaveLength(3);
@@ -743,7 +764,7 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
         r.beads.push(ev);
       },
     };
-    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps);
+    await escalateBlocking(snap("healthy"), snap("blocking"), r.deps);
     // The real-time push failed on both channels, but the durable bead is filed — nothing is lost.
     expect(r.beads).toHaveLength(1);
     expect(r.beads[0]!.componentId).toBe("roborev");
@@ -760,7 +781,7 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
         r.beads.push(ev);
       },
     };
-    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps);
+    await escalateBlocking(snap("healthy"), snap("blocking"), r.deps);
     expect(r.beads).toHaveLength(0); // inbox is durable; no bead needed
   });
 
@@ -777,5 +798,384 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     await expect(
       escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps),
     ).resolves.toBeDefined();
+  });
+});
+
+// ── THE BLOCKING CONFIRMATION WINDOW (bead sparkle-00dmmc) ───────────────────────────────────────
+//
+// THE MEASURED INCIDENT. On 2026-09-08 the release-runner component crossed green→blocking on ONE
+// 60s poll and was announced instantly with "Wake the release Mac and re-check." The Mac was never
+// asleep in any way that needed waking: `ph_classify_release_runner` blocks on a REGISTERED-but-
+// offline runner by design (scripts/lib/pipeline-health.sh: "an offline-but-registered runner still
+// appears in the list, so SAW=1 and the arm blocks"), which is exactly how a Mac idling between jobs
+// presents. The next poll was green. The alarm self-resolved having shipped remediation that would
+// have been wrong to run — and it shipped because `passesGate` returned true for `blocking`
+// unconditionally, with the comment "blocking is never debounced, so the reader was always told."
+//
+// The hourly `pipeline-health-scan.sh` did NOT file a bead for the same reading, because its own
+// hysteresis (`PH_HYSTERESIS_PASSES`, default 2) holds the store write until a second consecutive
+// non-green pass. The two surfaces disagreed: the scan wanted confirmation, the real-time path took
+// none. These tests pin the real-time path to the same rule.
+//
+// WHY THIS CANNOT BE TESTED AS A DEBOUNCE. Detection is EDGE-triggered, so a component that is
+// blocking and STAYS blocking emits no second event — there is nothing for a time-window gate to
+// suppress. Confirmation therefore has to be a DEFERRAL re-evaluated against each later snapshot,
+// which is why every case below drives at least two polls.
+describe("blocking confirmation window", () => {
+  /** A one-component release-runner snapshot — the component tonight's incident was about. */
+  function relSnap(state: PipelineHealth["overall"]): PipelineHealth {
+    return {
+      overall: state,
+      components: [
+        {
+          id: "release_runner",
+          name: "Release runner (DMG build)",
+          state,
+          detail:
+            "the macOS release runner (sparkle-release) is offline — no notarized DMG can be built until it is back online. Wake the release Mac and re-check.",
+        },
+      ],
+    };
+  }
+
+  it("HOLDS a first blocking reading instead of announcing it", async () => {
+    const r = recorder();
+    const res = await escalatePipelineHealth(relSnap("healthy"), relSnap("blocking"), r.deps);
+
+    expect(res.delivered, "one poll must never be enough to page").toEqual([]);
+    expect(r.concierge, "nothing may reach the concierge on an unconfirmed blocking").toEqual([]);
+    expect(r.woke, "nothing may wake Improve-Sparkle on an unconfirmed blocking").toEqual([]);
+    expect(r.beads, "an unconfirmed alarm must not file its fail-safe bead either").toEqual([]);
+  });
+
+  it("ANNOUNCES a blocking state that is still blocking on the next poll", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("blocking"), r.deps);
+    // Steady state: `detectEscalations` yields NO event here (from === to), so the announcement can
+    // only come from the deferred alarm being re-confirmed against this snapshot.
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("blocking"), r.deps);
+
+    expect(res.delivered.map((e) => e.componentId)).toEqual(["release_runner"]);
+    expect(r.concierge.length, "a confirmed outage must still reach the concierge").toBe(1);
+    expect(r.concierge[0]).toContain("Wake the release Mac");
+  });
+
+  it("announces NOTHING for a blip that clears before it is confirmed — tonight's incident", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("blocking"), r.deps);
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+
+    expect(res.delivered, "the blip must not page").toEqual([]);
+    // And the RECOVERY must be silent too: announcing the all-clear for an alarm nobody heard is the
+    // half-loud flap the warning debounce already learned to avoid.
+    expect(r.concierge, "no alarm and no all-clear for an unannounced alarm").toEqual([]);
+    expect(r.woke).toEqual([]);
+  });
+
+  it("re-confirms from scratch after a clear — a second blip is not the first one's second poll", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("blocking"), r.deps);
+    await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+    const res = await escalatePipelineHealth(relSnap("healthy"), relSnap("blocking"), r.deps);
+
+    expect(res.delivered, "the streak must reset on green, or two blips read as one outage").toEqual(
+      [],
+    );
+    expect(r.concierge).toEqual([]);
+  });
+
+  // ── DROPPING AN UNCONFIRMED BLOCKING MUST NOT EAT SOMEBODY ELSE'S ALL-CLEAR (roborev job 82171) ─
+  //
+  // `unannouncedAlarm` means "an alarm is outstanding that nobody was told about", and the recovery
+  // gate CONSUMES it. Setting it unconditionally when a streak is dropped is wrong whenever the
+  // deferred blocking rose out of a warning that WAS announced: the reader heard WARNING, and the
+  // all-clear that follows is the notice that closes it — including for the improvement pass, which
+  // reads a recovery as permission to close the P1 bead. Suppressing it leaves a green deployment
+  // reported as degraded, which is the identical harm `passesGate`'s blocking branch already
+  // documents for the other direction.
+  //
+  // These two are a PAIR and neither works alone: the first proves the all-clear survives, the second
+  // proves the suppression still fires when the warning underneath really was swallowed. A fix that
+  // simply stopped setting the flag would pass the first and fail the second.
+  it("delivers the RECOVERY for an announced warning sitting under an unconfirmed blocking", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the warning is announced — the reader HAS heard it").toBe(1);
+
+    // Worsens to blocking, which is held pending confirmation. Nothing new is announced.
+    await escalatePipelineHealth(relSnap("warning"), relSnap("blocking"), r.deps);
+    expect(r.concierge.length, "the blocking is unconfirmed, so it is not announced").toBe(1);
+
+    // …and clears before it confirms. The alarm the reader was told about is the WARNING, and its
+    // all-clear must still arrive.
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+    expect(res.delivered.map((e) => e.severity)).toEqual(["recovery"]);
+    expect(r.concierge.length, "the announced warning must get its all-clear").toBe(2);
+  });
+
+  it("still SUPPRESSES the recovery when the warning underneath was itself debounced", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalatePipelineHealth(relSnap("warning"), relSnap("healthy"), r.deps);
+    const announced = r.concierge.length; // warning + its recovery
+
+    // A second warning edge inside WARNING_DEBOUNCE_MS is swallowed, and `passesGate` flags it as
+    // unannounced itself.
+    r.now += 1000;
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the second warning is debounced").toBe(announced);
+
+    await escalatePipelineHealth(relSnap("warning"), relSnap("blocking"), r.deps);
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+    expect(res.delivered, "nothing was announced, so nothing may be un-announced").toEqual([]);
+    expect(r.concierge.length).toBe(announced);
+  });
+
+  // ── …AND THE SAME MUST HOLD ONE HOP THROUGH `unknown` (roborev job 82208) ──────────────────────
+  //
+  // `unknown` is the state a component lands in when its probe times out, and it is NEITHER good NOR
+  // an alarm. A drop guard that asked `!isAlarmState(pending.ev.from)` therefore mis-classified a
+  // streak that reached blocking via a timed-out probe and re-ate the announced warning's all-clear
+  // — the same bug, one hop away. These two pin the fact rather than the proxy: the first proves the
+  // all-clear survives the detour, the second proves a streak with nothing underneath it is still
+  // suppressed. A guard hardcoded to never flag would pass the first and fail the second.
+  it("delivers the RECOVERY when the streak reached blocking via unknown, over an announced warning", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the warning is announced").toBe(1);
+
+    // The probe times out. `detectEscalations` emits nothing: not a worse edge, and `unknown` is not
+    // a good state, so it is not a recovery either.
+    const quiet = await escalatePipelineHealth(relSnap("warning"), relSnap("unknown"), r.deps);
+    expect(quiet.delivered, "crossing into unknown never alarms").toEqual([]);
+
+    await escalatePipelineHealth(relSnap("unknown"), relSnap("blocking"), r.deps);
+    expect(r.concierge.length, "the blocking is unconfirmed").toBe(1);
+
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+    expect(res.delivered.map((e) => e.severity)).toEqual(["recovery"]);
+    expect(r.concierge.length, "the announced warning still gets its all-clear").toBe(2);
+  });
+
+  it("stays silent for an unknown-to-blocking blip with nothing announced underneath it", async () => {
+    const r = recorder();
+    const res0 = await escalatePipelineHealth(relSnap("unknown"), relSnap("blocking"), r.deps);
+    expect(res0.delivered, "unconfirmed, so nothing is announced").toEqual([]);
+
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+    expect(res.delivered, "no alarm was ever announced, so its all-clear is noise").toEqual([]);
+    expect(r.concierge).toEqual([]);
+  });
+
+  // ── THE RECORD MUST BE RETIRED AGAINST THE SNAPSHOT, NOT A RECOVERY EVENT (roborev job 82209) ──
+  //
+  // `announcedAlarm` was cleared in exactly one place: the recovery branch of `passesGate`. But
+  // `detectEscalations` emits a recovery only for `isAlarmState(from) && isGoodState(to)`, and
+  // crossing OUT of `unknown` emits nothing — so an alarm that ends via `alarm → unknown → good`
+  // left a PERMANENTLY stale entry, and the next unrelated blip read it as "the reader has been
+  // told" and delivered an all-clear for an alarm nobody ever heard. Under a flap that is the
+  // unbroken alternating stream ~61s apart this module exists to stop.
+  //
+  // Note this was a REGRESSION from the proxy it replaced: `!isAlarmState(pending.ev.from)` could
+  // not go stale, because it read the edge in front of it rather than a remembered fact. Replacing
+  // a proxy with a record is only an improvement if the record is also RETIRED correctly.
+  it("retires an announced alarm that ends through unknown, so a later blip stays silent", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the warning is announced").toBe(1);
+
+    // The probe stops answering, then comes back green. NEITHER crossing emits an event: `unknown`
+    // is not a worse state and not a good one, so there is no recovery to retire the record.
+    await escalatePipelineHealth(relSnap("warning"), relSnap("unknown"), r.deps);
+    await escalatePipelineHealth(relSnap("unknown"), relSnap("healthy"), r.deps);
+
+    // A LATER, UNRELATED blip. Nothing about it was ever announced.
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("blocking"), r.deps);
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+
+    expect(res.delivered, "an all-clear for an alarm nobody heard is pure noise").toEqual([]);
+    expect(r.concierge.length, "still just the one warning from the start").toBe(1);
+  });
+
+  it("does not count a ZERO-SINK alarm as announced", async () => {
+    // `passesGate` runs BEFORE routing, so an event that passes the gate and then reaches no sink at
+    // all — the `undelivered` partition, whose own doc says the event "is simply gone" — was still
+    // recorded as "the reader HAS been told". It had not been.
+    const dead: EscalationDeps = {
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+      fileDurableBead: async () => {
+        throw new Error("bd unavailable");
+      },
+    };
+    const lost = await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), dead);
+    expect(lost.undelivered, "the warning reached nothing").toHaveLength(1);
+    expect(lost.delivered).toEqual([]);
+
+    await escalatePipelineHealth(relSnap("warning"), relSnap("blocking"), dead); // held
+
+    // Now the blip clears, with working channels. The all-clear must still be silent: the alarm
+    // underneath it was never actually delivered to anyone.
+    const r = recorder();
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r.deps);
+    expect(res.delivered, "nothing was ever announced, so nothing may be un-announced").toEqual([]);
+    expect(r.concierge).toEqual([]);
+  });
+
+  // ── …AND THE SUPPRESSION FLAG IS THE HALF THAT ACTUALLY GATES DELIVERY (roborev job 82210) ────
+  //
+  // The test above routes its clearing through `advancePendingBlocking`'s drop branch, which reads
+  // `announcedAlarm` — so it exercises only the record that was moved to the sink result. The RECOVERY
+  // gate reads the OTHER one, `unannouncedAlarm`, and that write stayed at gate time: an alarm that
+  // passed the gate and reached no sink still CLEARED its suppression flag, so its later all-clear was
+  // announced for an alarm nobody heard, waking a full Improve-Sparkle turn to close a bead that was
+  // never opened. Two lines from the one that was fixed.
+  //
+  // This drives the measured shape the module documents: the improve inbox at its 50-message cap and
+  // `bd` not installed, so every channel refuses — then the channels come back.
+  it("a zero-sink alarm leaves the suppression flag SET, so its later all-clear stays silent", async () => {
+    const dead: EscalationDeps = {
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+      fileDurableBead: async () => {
+        throw new Error("bd unavailable");
+      },
+    };
+    const lost = await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), dead);
+    expect(lost.undelivered, "the warning reached nothing at all").toHaveLength(1);
+    expect(lost.delivered).toEqual([]);
+
+    // Channels recover, and so does the component. The all-clear must NOT be announced.
+    const r = recorder();
+    const res = await escalatePipelineHealth(relSnap("warning"), relSnap("healthy"), r.deps);
+    expect(res.delivered, "an all-clear for an alarm that reached nobody is pure noise").toEqual([]);
+    expect(r.concierge).toEqual([]);
+    expect(r.woke, "and it must not wake the improvement pass either").toEqual([]);
+  });
+
+  // ── …BUT SUPPRESSION NEEDS THE CONJUNCT ITS SIBLING CARRIES (roborev job 82211) ────────────────
+  //
+  // The two sink-result writes are NOT symmetric, and assuming they were is what this pins.
+  // `announcedAlarm.add` beside `delivered` is safe unconditionally: a set record can only BROADEN
+  // later delivery. `unannouncedAlarm.add` beside `undelivered` SUPPRESSES, so it needs the same
+  // "was anything announced underneath" conjunct `advancePendingBlocking`'s drop branch already
+  // carries — otherwise a LOST alarm stacked on an ALREADY-DELIVERED one swallows that one's
+  // all-clear, which is bug 82171 arriving by a different route.
+  //
+  // Both existing zero-sink tests open from a clean set, so `announcedAlarm` is empty and the missing
+  // conjunct cannot show. This one deliberately announces something first.
+  it("a lost alarm stacked on a DELIVERED one must not swallow that one's all-clear", async () => {
+    const dead: EscalationDeps = {
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+      fileDurableBead: async () => {
+        throw new Error("bd unavailable");
+      },
+    };
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the warning IS delivered — the reader has heard it").toBe(1);
+
+    // It worsens; the blocking confirms — but by now every channel refuses, so the blocking itself
+    // reaches nobody. That must not retroactively silence the warning's all-clear.
+    await escalatePipelineHealth(relSnap("warning"), relSnap("blocking"), dead);
+    const lost = await escalatePipelineHealth(relSnap("blocking"), relSnap("blocking"), dead);
+    expect(lost.undelivered, "the confirmed blocking reached nothing").toHaveLength(1);
+
+    const r2 = recorder();
+    const res = await escalatePipelineHealth(relSnap("blocking"), relSnap("healthy"), r2.deps);
+    expect(res.delivered.map((e) => e.severity), "the announced alarm is owed its all-clear").toEqual(
+      ["recovery"],
+    );
+    expect(r2.concierge.length).toBe(1);
+  });
+
+  // ── THE THIRD WRITER OF THE SAME FLAG NEEDS THE SAME CONJUNCT (roborev job 82212) ──────────────
+  //
+  // `unannouncedAlarm` has THREE writers, not two: the drop branch, the sink-result restore, and the
+  // warning DEBOUNCE branch. The first two ask whether anything was announced underneath; the third
+  // did not, and the argument applies to it verbatim — it suppresses, so it needs the conjunct.
+  //
+  // Reachable through the same `unknown` hop as job 82208, and `unknown` is where a component lands
+  // when its probe times out. `unknown` ranks BELOW `warning`, so `unknown → warning` does emit a
+  // warning edge; and the end-of-sweep reconciliation cannot retire the announced record on the way
+  // through, because `unknown` is not a good state.
+  it("a DEBOUNCED warning stacked on a delivered alarm must not swallow its all-clear", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the warning is delivered — the reader HAS been told").toBe(1);
+
+    // The probe stops answering, then answers again still degraded. Neither crossing clears the
+    // announced record: no event on the way in, and `unknown` is not good on the way out.
+    await escalatePipelineHealth(relSnap("warning"), relSnap("unknown"), r.deps);
+    r.now += 120_000; // well inside WARNING_DEBOUNCE_MS
+    await escalatePipelineHealth(relSnap("unknown"), relSnap("warning"), r.deps);
+    expect(r.concierge.length, "the re-raised warning is debounced, as intended").toBe(1);
+
+    // It clears. The alarm the reader WAS told about is owed its all-clear.
+    const res = await escalatePipelineHealth(relSnap("warning"), relSnap("healthy"), r.deps);
+    expect(res.delivered.map((e) => e.severity)).toEqual(["recovery"]);
+    expect(r.concierge.length, "the announced warning must still get its all-clear").toBe(2);
+  });
+});
+
+// ── THE RELEASE RUNNER'S REMEDY SPLITS THE WAY ITS DETAIL DOES (bead sparkle-00dmmc) ─────────────
+//
+// The old single string told the reader to "wake the founder's Mac, and repair the runner with `sudo
+// scripts/runner/setup-self-hosted-runner.sh` if it does not re-register" — two faults, opposite
+// repairs, one instruction. A Mac asleep between jobs has an intact registration and re-running the
+// setup script at it is a destructive answer to a non-problem; a runner absent from the fleet cannot
+// be woken at all. This is the human-facing half of the classifier split: the detail is what the
+// probe computes, this is what the person actually reads.
+//
+// EVERY ASSERTION HERE IS PAIRED. A bare "does not mention setup-self-hosted-runner" would match the
+// asleep remedy's OWN REQUIRED DENIAL, and a negative alone is green over copy trimmed to silence —
+// deleting a lie is not the same fact as stating the truth (AGENTS.md, copy ratchets).
+describe("releaseRunnerRemediation", () => {
+  const ASLEEP =
+    "the macOS release runner (sparkle-release) is REGISTERED but not online — no notarized DMG can be built until it is back.";
+  const GONE =
+    "NO runner carrying the release label (sparkle-release) is registered at all — it is ABSENT from the fleet.";
+
+  it("tells an ASLEEP runner to be woken, and explicitly warns OFF re-registering", () => {
+    const r = releaseRunnerRemediation(ASLEEP);
+    expect(r, "the positive: it must say what to do").toMatch(/wake the founder's Mac/i);
+    expect(r, "the positive: it must warn the reader off, not merely omit the command").toContain(
+      "Do NOT run",
+    );
+    expect(r, "the negative: keyed on the PRESCRIBING phrase, not the command name").not.toContain(
+      "Re-register it with",
+    );
+  });
+
+  it("tells a DEREGISTERED runner to be re-registered, and does not carry the asleep warning-off", () => {
+    const r = releaseRunnerRemediation(GONE);
+    expect(r).toContain("Re-register it with");
+    expect(r, "waking is not the fix here and must not be the instruction").not.toContain(
+      "Do NOT run",
+    );
+  });
+
+  it("the two remedies are genuinely different text, not one string behind two branches", () => {
+    expect(releaseRunnerRemediation(ASLEEP)).not.toBe(releaseRunnerRemediation(GONE));
+  });
+
+  it("an UNRECOGNISED detail keeps the old conflated wording — naming both beats naming the wrong one", () => {
+    // Reached by an older build's string, or a shape added later. Confidently prescribing one repair
+    // for a detail we cannot classify is the failure mode this fallback exists to avoid.
+    const r = releaseRunnerRemediation("some future detail nobody has written yet");
+    expect(r).toContain("wake the founder's Mac");
+    expect(r).toContain("setup-self-hosted-runner.sh");
+  });
+
+  it("is what `remediationFor` returns for release_runner — the split is actually WIRED", () => {
+    // Without this the whole split is dead code: `remediationFor` is the only caller the escalation
+    // path uses, and it returned a fixed string for years.
+    expect(remediationFor("release_runner", ASLEEP)).toBe(releaseRunnerRemediation(ASLEEP));
+    expect(remediationFor("release_runner", GONE)).toBe(releaseRunnerRemediation(GONE));
+    expect(remediationFor("release_runner", ASLEEP)).not.toBe(remediationFor("release_runner", GONE));
   });
 });

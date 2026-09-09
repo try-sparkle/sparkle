@@ -138,7 +138,7 @@ describe("refreshPipelineHealth → real-time escalation (driven through the rea
     __setPipelineEscalationDepsForTests(deps);
   });
 
-  it("a green→blocking transition across two REAL polls escalates once, naming the component+remediation", async () => {
+  it("a green→blocking transition escalates once, on the CONFIRMING poll, naming the component+remediation", async () => {
     __setPipelineProbeForTests(async () => HEALTHY);
     setPipelineRoot("/repo"); // eager poll #1 = HEALTHY (baseline, no alert)
     await flush();
@@ -155,6 +155,19 @@ describe("refreshPipelineHealth → real-time escalation (driven through the rea
     __setPipelineProbeForTests(async () => BLOCKED);
     await refreshPipelineHealth();
     await flush(); // let the fire-and-forget escalation settle
+
+    // HELD, NOT ANNOUNCED. A blocking edge now costs `BLOCKING_CONFIRMATIONS` consecutive readings
+    // (bead sparkle-00dmmc), so a single self-healing poll can no longer page anyone with remediation
+    // that would be wrong to run. Note what is asserted either side of it: the store PUBLISHES the
+    // blocking state on this very poll — the chip goes red immediately — and only the ESCALATION
+    // waits. Those two are separate concerns and the confirmation window must not conflate them.
+    expect(usePipelineHealthStore.getState().health?.overall).toBe("blocking");
+    expect(woke, "one blocking reading must not page").toHaveLength(0);
+    expect(told, "…on either channel").toHaveLength(0);
+
+    // The CONFIRMING poll — still blocking — is what announces it.
+    await refreshPipelineHealth();
+    await flush();
 
     expect(usePipelineHealthStore.getState().health?.overall).toBe("blocking");
     expect(woke).toHaveLength(1);
