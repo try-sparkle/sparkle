@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PipelineHealth } from "../stores/pipelineHealthStore";
 import {
+  WARNING_CONFIRMATIONS,
   WARNING_DEBOUNCE_MS,
   __resetPipelineEscalationForTests,
   composeEscalationMessage,
@@ -103,6 +104,26 @@ function recorder(now = 1_000_000): Recorder {
  *
  * Tests about the WINDOW ITSELF drive their sweeps by hand — see "blocking confirmation window".
  */
+/**
+ * Drive a WARNING edge through its confirmation window and return the sweep that ANNOUNCES it.
+ *
+ * `WARNING_CONFIRMATIONS` (3) means a warning reading opens a streak on the poll that detects it and
+ * is announced on the third consecutive reading (bead sparkle-00dmmc). Every test about what an
+ * ANNOUNCED warning does — including the ones about the DEBOUNCE, since a warning must be confirmed
+ * before it can reach the gate at all — therefore drives that many sweeps. The confirming sweeps pass
+ * `next` as both sides: the STEADY state emits no edge of its own, so anything delivered there came
+ * from the deferred alarm being confirmed and nothing else.
+ */
+async function escalateWarning(
+  prev: PipelineHealth,
+  next: PipelineHealth,
+  deps: EscalationDeps,
+) {
+  await escalatePipelineHealth(prev, next, deps);
+  for (let i = 2; i < WARNING_CONFIRMATIONS; i++) await escalatePipelineHealth(next, next, deps);
+  return escalatePipelineHealth(next, next, deps);
+}
+
 async function escalateBlocking(
   prev: PipelineHealth,
   next: PipelineHealth,
@@ -584,21 +605,21 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
   it("a WARNING is debounced: a second warning edge for the same component inside the window is suppressed", async () => {
     const r = recorder();
     // First warning edge fires.
-    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     expect(r.woke).toHaveLength(1);
 
     // A second warning edge for the same component, still inside the debounce window. (No recovery
     // is driven here on purpose — the flap that crosses one is the separate test below, and it is
     // the case this one used to CLAIM in a comment while never exercising it.)
     r.now += WARNING_DEBOUNCE_MS - 1;
-    const res = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    const res = await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     expect(res.delivered).toHaveLength(0);
     expect(res.debounced).toHaveLength(1);
     expect(r.woke).toHaveLength(1); // still just the first
 
     // Past the window, it fires again.
     r.now += 2;
-    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     expect(r.woke).toHaveLength(2);
   });
 
@@ -638,7 +659,7 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
   it("a flapping component goes SILENT after its first announced cycle — both channels", async () => {
     const r = recorder();
     // Cycle 1: announced in full, so a reader learns of the degradation and its clearing.
-    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     r.now += POLL_MS;
     await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
     expect(r.woke).toHaveLength(2); // 1 warning + 1 recovery
@@ -648,7 +669,7 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     // warning (debounced) nor its recovery (an all-clear for an alarm nobody was told about).
     for (let i = 0; i < 9; i++) {
       r.now += POLL_MS;
-      const up = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+      const up = await escalateWarning(snap("healthy"), snap("warning"), r.deps);
       expect(up.delivered).toHaveLength(0);
       expect(up.debounced).toHaveLength(1);
       r.now += POLL_MS;
@@ -662,19 +683,19 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
 
   it("a warning fires again once the window elapses, even though recoveries intervened", async () => {
     const r = recorder();
-    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     // Flap through the whole window; every cycle after the first is silent.
     for (let i = 0; i < 5; i++) {
       r.now += POLL_MS;
       await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
       r.now += POLL_MS;
-      await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+      await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     }
     expect(r.woke).toHaveLength(2); // the first warning + the first recovery, nothing since
 
     // Past the window, a genuinely new warning is NOT swallowed.
     r.now += WARNING_DEBOUNCE_MS;
-    const res = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    const res = await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     expect(res.delivered).toHaveLength(1);
     expect(res.delivered[0]!.severity).toBe("warning");
     expect(r.woke).toHaveLength(3);
@@ -691,14 +712,14 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
   it("a BLOCKING alarm's recovery fires even when a debounced warning left a flag standing", async () => {
     const r = recorder();
     // Cycle 1: announced in full, so the debounce window is now open for this component.
-    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     r.now += POLL_MS;
     await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
     expect(r.woke).toHaveLength(2);
 
     // Cycle 2's warning is debounced — this is what raises the suppression flag.
     r.now += POLL_MS;
-    const flapped = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    const flapped = await escalateWarning(snap("healthy"), snap("warning"), r.deps);
     expect(flapped.debounced).toHaveLength(1);
 
     // The pool now genuinely goes down. BLOCKING is never debounced, so it IS announced.
@@ -732,16 +753,16 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
   it("the debounce is PER COMPONENT: one flapping component does not silence another's alarm", async () => {
     const r = recorder();
     // roborev flaps into its debounce.
-    await escalatePipelineHealth(twoSnap("healthy", "healthy"), twoSnap("warning", "healthy"), r.deps);
+    await escalateWarning(twoSnap("healthy", "healthy"), twoSnap("warning", "healthy"), r.deps);
     r.now += POLL_MS;
     await escalatePipelineHealth(twoSnap("warning", "healthy"), twoSnap("healthy", "healthy"), r.deps);
     r.now += POLL_MS;
-    await escalatePipelineHealth(twoSnap("healthy", "healthy"), twoSnap("warning", "healthy"), r.deps);
+    await escalateWarning(twoSnap("healthy", "healthy"), twoSnap("warning", "healthy"), r.deps);
     expect(r.woke).toHaveLength(2); // roborev's first warning + first recovery only
 
     // ci_runners' FIRST warning still gets through, inside roborev's window.
     r.now += POLL_MS;
-    const res = await escalatePipelineHealth(
+    const res = await escalateWarning(
       twoSnap("warning", "healthy"),
       twoSnap("warning", "warning"),
       r.deps,
@@ -796,7 +817,7 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
       fileDurableBead: async () => {},
     };
     await expect(
-      escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps),
+      escalateWarning(snap("healthy"), snap("warning"), r.deps),
     ).resolves.toBeDefined();
   });
 });
@@ -899,7 +920,7 @@ describe("blocking confirmation window", () => {
   // simply stopped setting the flag would pass the first and fail the second.
   it("delivers the RECOVERY for an announced warning sitting under an unconfirmed blocking", async () => {
     const r = recorder();
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the warning is announced — the reader HAS heard it").toBe(1);
 
     // Worsens to blocking, which is held pending confirmation. Nothing new is announced.
@@ -915,14 +936,14 @@ describe("blocking confirmation window", () => {
 
   it("still SUPPRESSES the recovery when the warning underneath was itself debounced", async () => {
     const r = recorder();
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     await escalatePipelineHealth(relSnap("warning"), relSnap("healthy"), r.deps);
     const announced = r.concierge.length; // warning + its recovery
 
     // A second warning edge inside WARNING_DEBOUNCE_MS is swallowed, and `passesGate` flags it as
     // unannounced itself.
     r.now += 1000;
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the second warning is debounced").toBe(announced);
 
     await escalatePipelineHealth(relSnap("warning"), relSnap("blocking"), r.deps);
@@ -941,7 +962,7 @@ describe("blocking confirmation window", () => {
   // suppressed. A guard hardcoded to never flag would pass the first and fail the second.
   it("delivers the RECOVERY when the streak reached blocking via unknown, over an announced warning", async () => {
     const r = recorder();
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the warning is announced").toBe(1);
 
     // The probe times out. `detectEscalations` emits nothing: not a worse edge, and `unknown` is not
@@ -981,7 +1002,7 @@ describe("blocking confirmation window", () => {
   // a proxy with a record is only an improvement if the record is also RETIRED correctly.
   it("retires an announced alarm that ends through unknown, so a later blip stays silent", async () => {
     const r = recorder();
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the warning is announced").toBe(1);
 
     // The probe stops answering, then comes back green. NEITHER crossing emits an event: `unknown`
@@ -1009,7 +1030,7 @@ describe("blocking confirmation window", () => {
         throw new Error("bd unavailable");
       },
     };
-    const lost = await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), dead);
+    const lost = await escalateWarning(relSnap("healthy"), relSnap("warning"), dead);
     expect(lost.undelivered, "the warning reached nothing").toHaveLength(1);
     expect(lost.delivered).toEqual([]);
 
@@ -1043,7 +1064,7 @@ describe("blocking confirmation window", () => {
         throw new Error("bd unavailable");
       },
     };
-    const lost = await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), dead);
+    const lost = await escalateWarning(relSnap("healthy"), relSnap("warning"), dead);
     expect(lost.undelivered, "the warning reached nothing at all").toHaveLength(1);
     expect(lost.delivered).toEqual([]);
 
@@ -1076,7 +1097,7 @@ describe("blocking confirmation window", () => {
       },
     };
     const r = recorder();
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the warning IS delivered — the reader has heard it").toBe(1);
 
     // It worsens; the blocking confirms — but by now every channel refuses, so the blocking itself
@@ -1105,14 +1126,14 @@ describe("blocking confirmation window", () => {
   // through, because `unknown` is not a good state.
   it("a DEBOUNCED warning stacked on a delivered alarm must not swallow its all-clear", async () => {
     const r = recorder();
-    await escalatePipelineHealth(relSnap("healthy"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("healthy"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the warning is delivered — the reader HAS been told").toBe(1);
 
     // The probe stops answering, then answers again still degraded. Neither crossing clears the
     // announced record: no event on the way in, and `unknown` is not good on the way out.
     await escalatePipelineHealth(relSnap("warning"), relSnap("unknown"), r.deps);
     r.now += 120_000; // well inside WARNING_DEBOUNCE_MS
-    await escalatePipelineHealth(relSnap("unknown"), relSnap("warning"), r.deps);
+    await escalateWarning(relSnap("unknown"), relSnap("warning"), r.deps);
     expect(r.concierge.length, "the re-raised warning is debounced, as intended").toBe(1);
 
     // It clears. The alarm the reader WAS told about is owed its all-clear.
@@ -1177,5 +1198,118 @@ describe("releaseRunnerRemediation", () => {
     expect(remediationFor("release_runner", ASLEEP)).toBe(releaseRunnerRemediation(ASLEEP));
     expect(remediationFor("release_runner", GONE)).toBe(releaseRunnerRemediation(GONE));
     expect(remediationFor("release_runner", ASLEEP)).not.toBe(remediationFor("release_runner", GONE));
+  });
+});
+
+// ── THE WARNING CONFIRMATION WINDOW (bead sparkle-00dmmc, second half) ───────────────────────────
+//
+// THE MEASURED INCIDENT, and it is unusually clean evidence. Across 2026-09-08/09 the roborev
+// component alarmed FIVE times. All five self-recovered unattended within roughly one poll interval
+// and nobody ran the remediation at any point: five alarms, ZERO true positives. Every one carried
+// identical text inferring a WEDGE from ONE failed connection plus two circumstantial facts (process
+// alive, store small) — neither of which establishes a wedge; they only rule out two alternatives.
+//
+// WHY THE BLOCKING WINDOW DID NOT COVER THEM. `BLOCKING_CONFIRMATIONS` gates the `blocking` severity
+// only. These were WARNING, and warnings took a different path: a 30-minute per-component debounce
+// measured from the last warning delivered. Roborev recurred roughly HOURLY, so every occurrence fell
+// outside that window and every one was delivered. The debounce works as designed — it simply never
+// asks whether the reading is CONFIRMED.
+//
+// The two compose and are not redundant: CONFIRMATION decides whether a reading is real, the DEBOUNCE
+// decides how often a real one may repeat. N=3 matches the never-wired `ROBOREV_WEDGE_CONFIRMATIONS`
+// prior art and would have suppressed all five with nothing to miss.
+describe("warning confirmation window", () => {
+  /** Drive a warning edge through its confirmation window; returns the sweep that ANNOUNCES it. */
+  async function confirmWarning(from: PipelineHealth, to: PipelineHealth, deps: EscalationDeps) {
+    await escalatePipelineHealth(from, to, deps); // the edge — streak 1
+    for (let i = 2; i < WARNING_CONFIRMATIONS; i++) await escalatePipelineHealth(to, to, deps);
+    return escalatePipelineHealth(to, to, deps); // the confirming reading
+  }
+
+  // THE NUMBER ITSELF, pinned with LITERAL polls rather than a loop over the constant.
+  //
+  // Every other case here drives `confirmWarning`, which reads `WARNING_CONFIRMATIONS` to decide how
+  // many sweeps to run — so it ADAPTS to whatever the constant says and can never fail for a wrong
+  // value. Measured: raising the constant to 5 left all of them green. A test whose setup is derived
+  // from the thing under test is only pinned in one direction, and the narrowing direction is the one
+  // that goes silently missing. These literal counts are what make the threshold falsifiable both
+  // ways: at 1 the two-reading assertion reds, at anything above 3 the third-reading one does.
+  it("announces on exactly the THIRD consecutive reading, and not before", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps); // reading 1 — the edge
+    await escalatePipelineHealth(snap("warning"), snap("warning"), r.deps); // reading 2
+    expect(r.concierge, "two readings are not enough to page").toEqual([]);
+
+    const third = await escalatePipelineHealth(snap("warning"), snap("warning"), r.deps);
+    expect(third.delivered.map((e) => e.severity), "the third confirms it").toEqual(["warning"]);
+    expect(r.concierge.length).toBe(1);
+  });
+
+  it("HOLDS a first warning reading instead of announcing it", async () => {
+    const r = recorder();
+    const res = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+
+    expect(res.delivered, "one reading must never be enough to page").toEqual([]);
+    expect(r.concierge).toEqual([]);
+    expect(r.woke).toEqual([]);
+  });
+
+  it("ANNOUNCES a warning still present on the confirming poll", async () => {
+    const r = recorder();
+    const res = await confirmWarning(snap("healthy"), snap("warning"), r.deps);
+
+    expect(res.delivered.map((e) => e.severity)).toEqual(["warning"]);
+    expect(r.concierge.length, "a confirmed degradation must still reach the reader").toBe(1);
+  });
+
+  it("announces NOTHING for a warning that clears before it is confirmed — the roborev shape", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    const res = await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+
+    expect(res.delivered, "the blip must not page").toEqual([]);
+    expect(r.concierge, "and no all-clear for an alarm nobody heard").toEqual([]);
+  });
+
+  it("does not let a self-healing blip consume the confirmation streak of a later real one", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps); // blip opens
+    await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps); // …and clears
+    const res = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+
+    expect(res.delivered, "the streak must restart, or two blips read as one degradation").toEqual(
+      [],
+    );
+  });
+
+  // ── sparkle-l4bxty: the debounce clock must start when the reader is TOLD, not at the gate ──────
+  //
+  // `passesGate` runs BEFORE routing, so stamping `lastWarningAt` there starts the 30-minute window
+  // for a warning that then reached NO sink at all. The module's own comment says the timestamp is
+  // "measured from the last warning actually DELIVERED"; it was not. Net effect: a lost warning
+  // silences its component for half an hour having told nobody anything — which is plausibly why the
+  // debounce has never behaved the way anyone expected.
+  it("a warning that reached NO sink does not start the debounce window", async () => {
+    const dead: EscalationDeps = {
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+      fileDurableBead: async () => {
+        throw new Error("bd unavailable");
+      },
+    };
+    const lost = await confirmWarning(snap("healthy"), snap("warning"), dead);
+    expect(lost.undelivered, "the warning was confirmed and then reached nothing").toHaveLength(1);
+    expect(lost.delivered).toEqual([]);
+
+    // It clears, then degrades again well INSIDE the debounce window, with working channels. Nobody
+    // has been told anything yet, so this one must be delivered rather than debounced.
+    const r = recorder();
+    await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+    const res = await confirmWarning(snap("healthy"), snap("warning"), r.deps);
+
+    expect(res.delivered.map((e) => e.severity), "nothing was ever announced to debounce against")
+      .toEqual(["warning"]);
+    expect(r.concierge.length).toBe(1);
   });
 });
