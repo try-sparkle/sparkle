@@ -169,12 +169,10 @@ const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
  * What the THREAD (and every prompt-history surface) shows: the typed text plus compact counts —
  * never the raw temp-file paths, which are a user-visible leak.
  *
- * NOT `buildDisplay`. That renders its counts with emoji as icons (`📷 1 image`), which was
- * tolerable inside the old composer's own tile row but is banned in the concierge surfaces —
- * icons come from react-icons/fi (see TerminalDropPill's header), emoji never stand in for them
- * (roborev 46911). `buildDisplay` keeps its glyphs for the Composer, which is the only caller left
- * and no longer renders in any pane (the Sparkle pane's composer was stripped when Improve Sparkle
- * became a mounted build agent); this is the concierge's own glyph-free rendering of the same counts.
+ * The composer's old rendering summarised the same counts with emoji as icons (`📷 1 image`),
+ * which was tolerable inside its own tile row but is banned in the concierge surfaces — icons come
+ * from react-icons/fi (see TerminalDropPill's header), emoji never stand in for them (roborev
+ * 46911). That composer is gone; this is the concierge's own glyph-free rendering of the counts.
  */
 export function attachedDisplay(text: string, attachments: Attachment[]): string {
   const images = attachments.filter((a) => a.kind === "image").length;

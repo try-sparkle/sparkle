@@ -541,8 +541,8 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               THIS BOX SPANS THE WHOLE PANE, and with the pane composer gone it is the pane's ONLY
               drop surface — there is no second surface to divide the pane with, so nothing here
               depends on paint order any more. It used to: the box was deliberately z-ordered just
-              BELOW `COMPOSER_Z` so a drop on the compose box overlaying this strip resolved to the
-              composer rather than pasting a path into the PTY (roborev 55575). That composer was
+              BELOW the composer overlay so a drop on the compose box overlaying this strip resolved
+              to the composer rather than pasting a path into the PTY (roborev 55575). That composer was
               stripped when Improve Sparkle moved to the mounted concierge, and this pane was its
               last render site, so the ordering it was ranked against no longer exists.
 

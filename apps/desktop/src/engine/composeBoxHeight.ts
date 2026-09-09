@@ -7,11 +7,12 @@
 // and the drag arithmetic are unit-tested without rendering anything (the measuring and the pointer
 // handling live in ComposeBox.tsx).
 //
-// NOTE this is deliberately NOT `engine/composerDrag.ts`. That module serves the OTHER composer —
-// the one in the agent pane — and its `resolveComposerRenderHeight` clamps a user-dragged height to
-// the cap. Here the drag must be able to EXCEED the cap: the whole reason to grab the handle is to
-// see more than ten lines at once. Same idea, opposite rule at the one point that matters, so they
-// stay separate rather than growing a flag.
+// NOTE the drag here must be able to EXCEED the cap: the whole reason to grab the handle is to see
+// more than ten lines at once. This was deliberately kept separate from the agent pane's own drag
+// module, whose `resolveComposerRenderHeight` CLAMPED a user-dragged height to the cap — same idea,
+// opposite rule at the one point that matters, so the two never grew a shared flag. That module and
+// the pane composer it served were deleted in PR #2985; the rule above is why this one must not
+// acquire a clamp if the two are ever re-unified.
 
 /** The thread scroller's test id, shared with the ComposeBox that measures against it.
  *

@@ -204,7 +204,8 @@ describe("loadAttachmentPaths", () => {
 });
 
 // What the AGENT reads vs what the THREAD shows are deliberately different renderings of the same
-// message: the removed composer contract, kept (buildSendPayload / buildDisplay).
+// message: the removed composer contract, kept (buildSendPayload for the agent, a glyph-free
+// count summary for the thread).
 describe("payload vs display", () => {
   // A path with whitespace is the case the quoting exists for. The rule is POSIX single-quoting
   // (services/shellQuote), NOT JSON/double quoting: this payload can reach a live `kind: "shell"`
@@ -252,7 +253,7 @@ describe("payload vs display", () => {
 
   // roborev 46911: this string lands in the concierge thread AND the pinned prompt header, both
   // governed by the app-wide "no emoji as icons — icons come from react-icons/fi" rule. It used to
-  // be `buildDisplay`, whose `📷 1 image` glyphs were fine inside the old composer's own tile row
+  // be rendered by the composer's old count summary, whose `📷 1 image` glyphs were fine inside its own tile row
   // and are not fine here. The counts are pinned above; this pins the absence of the glyphs, which
   // is the half that silently regresses.
   it("renders the counts with no emoji", () => {

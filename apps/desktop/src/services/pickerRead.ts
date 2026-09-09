@@ -11,10 +11,11 @@
 //     extraction above line 400 of `terminal.ts` was cut to escape, which failed 16 suites the first
 //     time, and it failed three more (`useSuggestions.{reaim,hook,settle}`) the moment
 //     `suggestions/conciergeHandoff` reached for the reader directly.
-//   • `services/improvementPassLatch.test.ts` asserts the composer's module graph cannot reach
-//     `services/conciergeTools/terminal` at all. That latch is deliberate and it is the boundary
+//   • `services/improvementPassLatch.test.ts` asserts the graph that reaches `services/sparkleBusy`
+//     cannot reach `services/conciergeTools/terminal` at all. (It was rooted at the composer until
+//     PR #2985 deleted that surface; it now roots the same walk at `conciergeTools/lifecycle`.) That latch is deliberate and it is the boundary
 //     being honoured here, not worked around: the READ is a pure query over what is already on the
-//     screen, and it is the WRITES — pressing an option, typing into a pane — that the composer graph
+//     screen, and it is the WRITES — pressing an option, typing into a pane — that this graph
 //     has no business reaching. Splitting the module splits exactly along that line.
 //
 // So the reader lives here, with no dependency of its own beyond the three leaves it genuinely needs,

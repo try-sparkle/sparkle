@@ -7,8 +7,8 @@
 //
 // The box no longer has a mic button, so none of this is driven by a click on it any more. The
 // gestures below are what the REAL surfaces do to the store: the header ring sets voiceSurface
-// "concierge" and arms (LogoWaveform + MicMenu), an agent composer's mic sets "agent"
-// (MicButton.ComposerMic), and the send tray just moves `phase` with no click on a box at all.
+// "concierge" and arms (LogoWaveform), an agent composer's mic historically set "agent", and the
+// send tray just moves `phase` with no click on a box at all.
 // That last one is the case the old click-driven claim could not serve, and is why this file
 // exists in this shape.
 import { act, cleanup, renderHook } from "@testing-library/react";
@@ -49,8 +49,7 @@ function mountBox() {
 }
 
 /** What the header ring does when the user sets it to "Listening": names itself the voice surface,
- *  arms the mic, routes speech. (MicMenu records the surface, useMicActions.setActive does the
- *  rest — see MicButton.) */
+ *  arms the mic, routes speech. (useMicActions.setActive does the work — see MicButton.) */
 function armFromRing() {
   act(() => {
     const s = useDictationStore.getState();

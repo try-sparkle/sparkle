@@ -436,7 +436,6 @@ describe("font families come from the scale, never from a retyped literal", () =
     for (const rel of [
       "components/BoardView.tsx",
       "components/StatusFilterBar.tsx",
-      "components/Composer.tsx",
       "components/ToolsPane.tsx",
       "components/CreditsPanel.tsx",
       "components/OpenPrMenu.tsx",

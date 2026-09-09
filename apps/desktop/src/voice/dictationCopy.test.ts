@@ -7,7 +7,6 @@ import {
   SPEAK_CAPTION_HEADLINE,
   SPEAK_COMPOSER_PLACEHOLDER,
   preparingCaption,
-  preparingPlaceholder,
   modelPercent,
   classifyVoiceError,
   isWatchdogFault,
@@ -132,21 +131,6 @@ describe("modelPercent / preparing copy — the first-run download", () => {
   it("the caption says setting-up, never that the mic is ready", () => {
     expect(preparingCaption(42)).toBe("Setting up voice (42%)");
     expect(preparingCaption(null)).toBe("Setting up voice…");
-  });
-
-  it("the composer placeholder adds the still-typeable reassurance to the same caption", () => {
-    // Built from preparingCaption so the sidebar and composer can't drift apart.
-    expect(preparingPlaceholder(42).startsWith(preparingCaption(42))).toBe(true);
-    expect(preparingPlaceholder(42)).toMatch(/type here meanwhile/);
-  });
-
-  it("never borrows a live-capture sentence (the bug: this state used to invite the wake word)", () => {
-    for (const pct of [null, 0, 50, 100]) {
-      // It must not claim capture is usable while the model is still coming down — so none of the
-      // live-state sentences may leak into this slot.
-      for (const live of LIVE_COPY) expect(preparingPlaceholder(pct)).not.toContain(live);
-      expect(preparingPlaceholder(pct)).not.toMatch(/\bsay\b/i);
-    }
   });
 });
 

@@ -156,19 +156,10 @@ function isBareGlyphChild(trimmed: string): boolean {
   return trimmed.length > 0 && [...trimmed].every((c) => AMBIGUOUS.has(c));
 }
 
-/**
- * `composer/attachments.ts` is exempt BY PATH rather than absorbed into the ceiling. Its
- * `buildDisplay` renders emoji count markers into the composer's transcript string, and that is a
- * DECISION ALREADY TAKEN under earlier review, not drift: `services/conciergeAttach.ts` documents
- * it at its own call site — the concierge deliberately does NOT use `buildDisplay` because of the
- * emoji (roborev 46911), while "buildDisplay keeps its glyphs for the Sparkle-pane Composer".
- * Quietly folding a settled call into a number re-litigates it without saying so.
- */
 const GLYPH_EXEMPT = new Set([
-  "components/composer/attachments.ts",
-  // `services/agentNaming.ts` only exists downstream of the line above: its regex strips the very
-  // display suffix `buildDisplay` produces, so it must name the same emoji. Exempting the producer
-  // and flagging the consumer would be incoherent.
+  // `services/agentNaming.ts`'s regex STRIPS an emoji display suffix (`📷 N screenshots`) out of a
+  // captured name — matching the glyph is the entire point, so it must name it. It never RENDERS a
+  // glyph, so there is no react-icon to reach for (roborev 46911).
   "services/agentNaming.ts",
   // `engine/attention.ts`'s RED_CIRCLE prefixes a PUSH NOTIFICATION title. That is an OS text
   // channel — there is no DOM, so there is no react-icon to reach for. Same category as the key
@@ -249,7 +240,6 @@ describe("affordances are react-icons, never characters", () => {
       "capture/CaptureApp.tsx",
       "components/BoardView.tsx",
       "components/ModelPill.tsx",
-      "components/Composer.tsx",
       "components/PinnedPrompt.tsx",
       "components/SparkleConsentBanner.tsx",
       "components/SettingCheckbox.tsx",

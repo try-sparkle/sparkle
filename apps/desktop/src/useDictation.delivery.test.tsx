@@ -48,7 +48,6 @@ import { useAmbientVoice } from "./useDictation";
 import { voiceErrorNotice } from "./voice/dictationCopy";
 import { deliveryReasonOf } from "./voice/deliveryWatchdog";
 import { deriveMicPresentation, micIsHearing } from "./voice/micPresentation";
-import { useMicToggle } from "./components/MicButton";
 
 const flush = () =>
   act(async () => {
@@ -237,45 +236,6 @@ describe("recognised words dropped by a gate, rather than never produced", () =>
   // DRIVEN THROUGH THE REAL HOOK, not through a re-implementation of the demotion expression: an
   // earlier draft asserted `deriveMicState(enabled, notice ? "idle" : status, …)`, which restates
   // the production line rather than exercising it and stayed green with the call site reverted.
-  it("never leaves the mic button reading active while a notice stands", async () => {
-    await mountListening();
-    useDictationStore.setState({ insertTarget: null, phase: "active", error: null });
-    await emit("dictation://partial", "the words he actually said");
-    expect(deliveryReasonOf(useDictationStore.getState().error)).toBe("no-target");
-    // `status` is untouched, so a glyph reading it alone would still say "listening".
-    expect(useDictationStore.getState().status).toBe("listening");
-
-    const { result } = renderHook(() => useMicToggle());
-    // What is PAINTED is demoted…
-    expect(result.current.glyphState).not.toBe("active");
-  });
-
-  // ── AND THE CONTROL STILL DOES WHAT IT SAYS (roborev 71168) ─────────────────────────────────
-  // The demotion must change only what is painted. An earlier draft demoted the single shared
-  // value, which also drives `onClick` and the labels: over a genuinely live mic the button read
-  // "Turn off" and one click DISARMED capture instead of pausing it — and since `no-transcript` is
-  // cleared only by a delivered segment, the control could never reach "Pause" again for the rest
-  // of a session on a dead transcription leg. `state !== "active"` alone passes under that bug,
-  // which is why this asserts the ACTION.
-  it("still pauses rather than disarms while a notice stands", async () => {
-    await mountListening();
-    useDictationStore.setState({ insertTarget: null, phase: "active", error: null });
-    await emit("dictation://partial", "the words he actually said");
-    expect(deliveryReasonOf(useDictationStore.getState().error)).toBe("no-target");
-
-    const { result } = renderHook(() => useMicToggle());
-    expect(result.current.state).toBe("active");
-    expect(result.current.title).toBe("Pause");
-    expect(result.current.ariaLabel).toBe("Pause listening");
-
-    await act(async () => {
-      result.current.onClick();
-    });
-
-    expect(useDictationStore.getState().phase).toBe("passive");
-    expect(useDictationStore.getState().enabled).toBe(true);
-  });
-
   // A blank or noise-only segment is not something the user said, so it must not raise a notice
   // about words that never existed. The empty guard sits above the phase gate for this.
   it("says nothing about an empty segment", async () => {

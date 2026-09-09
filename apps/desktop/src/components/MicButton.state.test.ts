@@ -12,8 +12,8 @@ const me = (balanceCents: number): Me => ({
 });
 
 // deriveMicState is THE single source of truth for the mic tri-state. Both mic surfaces (the top
-// ring in LogoWaveform and the composer-left ComposerMic) render from it via useMicToggle, so if
-// this derivation is right the two controls can never disagree within a window. This pins every
+// ring in LogoWaveform and, historically, the composer-left mic) render from it, so if this
+// derivation is right the two controls can never disagree within a window. This pins every
 // (enabled × status × phase) combination so a future refactor can't silently fork the two mics.
 type Status = "idle" | "listening" | "error";
 const STATUSES: Status[] = ["idle", "listening", "error"];

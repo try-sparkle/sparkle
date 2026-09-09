@@ -5,7 +5,6 @@ import {
   isImagePath,
   basename,
   buildSendPayload,
-  buildDisplay,
   rangeSelect,
   collapseText,
   composeBody,
@@ -151,7 +150,7 @@ describe("collapsing is lossless", () => {
 
   it("still trims text the user actually TYPED around a pill", () => {
     // The trim is right for a human's stray whitespace — `verbatimTyped` narrows it, it does not
-    // remove it. (buildDisplay/buildSendPayload's existing rows pin the no-pill case.)
+    // remove it. (buildSendPayload's existing rows pin the no-pill case.)
     expect(composeBody([collapseText("b1", original)], "  typed  ")).toBe(`${original}\n\ntyped`);
   });
 
@@ -293,35 +292,6 @@ describe("buildSendPayload", () => {
     expect(
       buildSendPayload({ attachments: [img({ path: '/tmp/a"b.png' })], textBlocks: [], typed: "" }),
     ).toBe(`'/tmp/a"b.png'`);
-  });
-});
-
-describe("buildDisplay", () => {
-  it("summarizes pills and attachments without leaking temp paths", () => {
-    const display = buildDisplay({
-      attachments: [img(), img({ id: "a2" }), file()],
-      textBlocks: [block("a\nb\nc\nd\ne\nf")],
-      typed: "ship it",
-    });
-    expect(display).toContain("ship it");
-    expect(display).toContain("📄 1 text block");
-    expect(display).toContain("📷 2 images");
-    expect(display).toContain("📎 1 file");
-    expect(display).not.toContain("/tmp");
-  });
-  it("is just the typed text when nothing is attached", () => {
-    expect(buildDisplay({ attachments: [], textBlocks: [], typed: "hello" })).toBe("hello");
-  });
-  it("singularizes counts", () => {
-    const display = buildDisplay({
-      attachments: [img()],
-      textBlocks: [block("a\nb")],
-      typed: "",
-    });
-    expect(display).toContain("📄 1 text block");
-    expect(display).toContain("📷 1 image");
-    expect(display).not.toContain("images");
-    expect(display).not.toContain("blocks");
   });
 });
 

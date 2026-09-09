@@ -299,7 +299,7 @@ const TERMINAL_PHRASES: Record<TerminalOp, OpPhrase> = {
 /** The file-attachment ops. Every one names the AGENT, never the file: a path is not a name the
  *  human recognises, and the compose box's own chips are where they see what is attached. Saying
  *  the path aloud here would also put a filesystem path in the same column the temp-path leak was
- *  removed from (see `buildDisplay` in components/composer/attachments). */
+ *  removed from (the composer's old count-summary rendering). */
 const ATTACHMENTS_PHRASES: Record<AttachmentsOp, OpPhrase> = {
   list_attachments: phrase("Checking what's attached for %s", "Checked what's attached for %s", AGENT),
   attach_to_message: phrase("Attaching a file for %s", "Attached a file for %s", AGENT),

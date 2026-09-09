@@ -4,9 +4,9 @@
 // socially from Sparkle. So I had request to have the ability next to the screenshot button. To
 // create a post that would post out socially."*
 //
-// THE SUBJECT IS THE LIVE BOX. `components/Composer` also has a screenshot button and would be the
-// obvious place to read that ask literally — but nothing mounts it (`Composer.unreachable.test.ts`
-// asserts that mechanically), so a button added there would be a feature no user can reach and a
+// THE SUBJECT IS THE LIVE BOX. The old build composer also had a screenshot button and would have
+// been the obvious place to read that ask literally — but nothing mounted it, and PR #2985 deleted
+// that surface outright. A button added there would have been a feature no user can reach and a
 // suite that looks like coverage. The screenshot button the founder presses is
 // `AttachControl`'s, in this box.
 //

@@ -32,7 +32,7 @@
 // ══ WHY A PATH NEVER APPEARS IN A PHRASE ════════════════════════════════════════════════════════
 // This column is 360px wide and it is a SHARED SURFACE — whatever it says is on screen next to the
 // human's own conversation. A filesystem path leaked into a concierge surface once already and had
-// to be stripped out (see `buildDisplay` in components/composer/attachments). A path is also not a
+// to be stripped out (the composer's old count-summary rendering). A path is also not a
 // name a reader recognises at a glance, so it costs the width and buys nothing. Phrases here name
 // the KIND of thing ("Reading a file"), never the thing itself — no home directory, no env var, no
 // token, no URL, and no echo of the raw command.

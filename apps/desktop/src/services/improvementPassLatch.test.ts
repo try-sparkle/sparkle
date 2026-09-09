@@ -59,13 +59,21 @@ describe("the in-flight latch", () => {
 //     -> services/sparkleBusy -> services/improvementPass
 //     -> services/sparkleTranscript -> services/conciergeTools/terminal
 //
-// So `services/sparkleBusy` sits under an ordinary composer component, and anything it imports is
-// acquired by that whole slice of the component tree. When it took `isPassRunning` from
+// THE FIRST TWO HOPS NO LONGER EXIST: PR #2985 deleted `components/Composer` and, with it,
+// `components/composer/ApprovalNudge`. The rest of that chain is untouched and still live, so the
+// walk below is rooted at `services/conciergeTools/lifecycle` — the deepest SURVIVING node of the
+// very chain above, and still a direct importer of `sparkleBusy`. The boundary being asserted is
+// unchanged; only the entry point moved, because the old one was deleted. Do NOT re-root it at a
+// component that merely looks like a composer: `Concierge/ComposeBox` reaches none of these
+// modules, so the positive controls would fail and the negative ones would go vacuous.
+//
+// So `services/sparkleBusy` sits under an ordinary consumer slice, and anything it imports is
+// acquired by that whole slice. When it took `isPassRunning` from
 // `improvementPass` itself, the slice grew to include the pass, `sparkleTranscript`, and
 // `conciergeTools/terminal`. The failure that produced named none of those:
-// `Composer.suggestionDeadPty.test.tsx` died at COLLECTION on a missing `SNAPSHOT_MAX_LINES` export
-// of a `terminalScrollback` mock it had written long before, because `conciergeTools/terminal` reads
-// that symbol at module scope. A test file the change never touched, over a symbol it never
+// a dead-PTY suggestion test in the old Composer suite (deleted with that surface in PR #2985) died
+// at COLLECTION on a missing `SNAPSHOT_MAX_LINES` export of a `terminalScrollback` mock it had
+// written long before, because `conciergeTools/terminal` reads that symbol at module scope. A test file the change never touched, over a symbol it never
 // mentions — the module graph was the entire link, which is why a comment asking people not to do it
 // again is not enough.
 //
@@ -328,9 +336,10 @@ describe("the resolver only hands TypeScript to the parser", () => {
   });
 });
 
-describe("the composer graph does not reach the improvement pass", () => {
-  // Rooted at the module that ACTUALLY broke, not at a store that only looked like the entry point.
-  const composer = resolve(SRC, "components/Composer.tsx");
+describe("the sparkleBusy consumer graph does not reach the improvement pass", () => {
+  // Rooted at the surviving head of the chain that ACTUALLY broke (see the header), not at a store
+  // or a component that only looks like the entry point.
+  const consumer = resolve(SRC, "services/conciergeTools/lifecycle.ts");
   const pass = resolve(SRC, "services/improvementPass.ts");
   const latch = resolve(SRC, "services/improvementPassLatch.ts");
   const terminal = resolve(SRC, "services/conciergeTools/terminal.ts");
@@ -339,28 +348,28 @@ describe("the composer graph does not reach the improvement pass", () => {
     // Without this the negative assertions below would pass just as well against a walker that
     // returns null for everything. `sparkleBusy` is the module whose imports are being bounded, so
     // if the walk cannot even get THERE, it is bounding nothing.
-    const known = importPath(composer, resolve(SRC, "services/sparkleBusy.ts"));
+    const known = importPath(consumer, resolve(SRC, "services/sparkleBusy.ts"));
     expect(known).not.toBeNull();
-    expect(known![0]).toBe("components/Composer.tsx");
+    expect(known![0]).toBe("services/conciergeTools/lifecycle.ts");
     expect(known![known!.length - 1]).toBe("services/sparkleBusy.ts");
   });
 
   it("cannot reach services/improvementPass", () => {
-    const found = importPath(composer, pass);
+    const found = importPath(consumer, pass);
     expect(found === null ? null : found.join(" -> ")).toBeNull();
   });
 
   it("cannot reach services/conciergeTools/terminal", () => {
     // The consequence rather than the cause — and the one that actually broke a suite. Asserted
     // separately so a future edge that reaches terminal by some OTHER route is caught too.
-    const found = importPath(composer, terminal);
+    const found = importPath(consumer, terminal);
     expect(found === null ? null : found.join(" -> ")).toBeNull();
   });
 
   it("still reaches the LATCH — the boundary bounds dependencies, it does not sever the feature", () => {
     // The write gate must keep working. If this ever goes null, `sparkleBusy` has stopped consulting
     // the latch at all and the two assertions above have become trivially true.
-    const found = importPath(composer, latch);
+    const found = importPath(consumer, latch);
     expect(found).not.toBeNull();
   });
 });

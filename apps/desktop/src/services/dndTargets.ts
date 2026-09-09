@@ -26,11 +26,8 @@ export const CONCIERGE_COLUMN_DND_TARGET = "concierge-column";
 /** The terminal stage — the box in Workspace that every agent pane is stacked inside. Dropping
  *  files here pastes their paths into the VISIBLE agent's own terminal (hooks/useTerminalDrop).
  *
- *  DELIBERATELY NOT in FILE_DROP_TARGETS below, even though it does own its drops. That list is
- *  "surfaces the two window-global listeners must stand DOWN over", and the Sparkle pane's
- *  Composer renders INSIDE this stage — listing it here would make that composer refuse drops on
- *  its own box. The stage doesn't need the carve-out anyway: useTerminalDrop only listens while an
- *  agent pane is visible, and no agent pane is visible while the Sparkle pane is. */
+ *  It owns its own drops: useTerminalDrop only listens while an agent pane is visible, pasting a
+ *  dropped path into that agent's PTY. */
 export const TERMINAL_STAGE_DND_TARGET = "terminal-stage";
 
 /** The SPARKLE pane's terminal — the box the Sparkle self-improve agent's CLI renders in, ABOVE
@@ -153,34 +150,10 @@ export function isOverDndTarget(position: { x: number; y: number }, target: stri
   return el?.closest("[data-dnd-target]")?.getAttribute("data-dnd-target") === target;
 }
 
-/** Surfaces a window-global listener must stand DOWN over, because something else owns the drop.
- *  One shared list rather than a private copy per listener (roborev 46911/49294): Composer.tsx
- *  reads it so a file can't double-attach, and a target added here reaches every consumer at once
- *  instead of silently regressing whichever copy was forgotten.
- *
- *  NOT every drop target belongs here — TERMINAL_STAGE_DND_TARGET owns its drops and is
- *  deliberately absent; see its comment above for why adding it would break the Sparkle pane's
- *  composer. SPARKLE_TERMINAL_DND_TARGET is the narrow region that CAN be listed: it covers the
- *  Sparkle pane's terminal box only, never the compose box below it, so standing down over it
- *  hands the terminal its own drops without the composer refusing drops on itself. */
-export const FILE_DROP_TARGETS = [
-  NEW_BUILD_AGENT_DND_TARGET,
-  CONCIERGE_COLUMN_DND_TARGET,
-  SPARKLE_TERMINAL_DND_TARGET,
-] as const;
-
-/** True when the drag position is over ANY surface that accepts the file itself. */
-export function isOverFileDropTarget(position: { x: number; y: number } | undefined): boolean {
-  if (!position) return false;
-  return FILE_DROP_TARGETS.some((t) => isOverDndTarget(position, t));
-}
-
-/** Every surface that HANDLES a drop. Deliberately wider than FILE_DROP_TARGETS, which is the
- *  narrower "surfaces the window-global listeners must stand DOWN over" — the terminal stage owns
- *  its drops without anyone standing down. It ALSO used to cover the Sparkle pane's catch-all
- *  Composer, which rendered inside that stage; that composer is gone (Improve Sparkle mounts the
- *  concierge instead), so no catch-all is registered today and a drop outside these targets really
- *  is dead — see registerCatchAllDropTarget. */
+/** Every surface that HANDLES a drop. The terminal stage owns its drops without anyone standing
+ *  down. It ALSO used to cover the Sparkle pane's catch-all Composer, which rendered inside that
+ *  stage; that composer is gone (Improve Sparkle mounts the concierge instead), so a drop outside
+ *  these targets really is dead. */
 const ALL_DND_TARGETS = [
   NEW_BUILD_AGENT_DND_TARGET,
   CONCIERGE_COLUMN_DND_TARGET,
@@ -194,39 +167,6 @@ const ALL_DND_TARGETS = [
  *  is that a second dead drop on the very same pixel goes unlogged, which is fine for a diagnostic
  *  whose whole job is to appear at least once. */
 let lastDeadDropKey: string | null = null;
-
-/** How many window-global CATCH-ALL drop listeners are live. See registerCatchAllDropTarget. */
-let catchAllDropTargets = 0;
-
-/**
- * Declare a window-global listener that accepts ANY drop not claimed by a `data-dnd-target`
- * surface, and get back its deregister fn.
- *
- * The Sparkle pane's Composer was exactly that: while it was the active pane it took drops on the
- * sidebar, the tab strip, the top bar — anywhere outside FILE_DROP_TARGETS. NOTHING REGISTERS ONE
- * TODAY: that composer was stripped when Improve Sparkle became a mounted build agent, so the
- * counter sits at 0 and reportDropWithNoTarget's warning is once again telling the truth. Kept
- * because the false-alarm shape below is a property of the mechanism, not of that one caller. `ALL_DND_TARGETS`
- * cannot see it, because a catch-all HAS no marked region; it only lists the terminal stage the
- * composer happens to render inside, which covers the drops that were never at risk anyway. So
- * without this, every successful catch-all drop outside the stage made
- * {@link reportDropWithNoTarget} warn that the drop was dead while the composer was attaching the
- * files — a false alarm on the SUCCESS path, diluting the one signal that helper exists to produce
- * (roborev 53893).
- *
- * A counter rather than a boolean: mounts and unmounts can overlap (StrictMode double-invokes
- * effects), and a boolean would be cleared by the first teardown while a live listener remained.
- * The returned fn is idempotent for the same reason.
- */
-export function registerCatchAllDropTarget(): () => void {
-  catchAllDropTargets += 1;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    catchAllDropTargets -= 1;
-  };
-}
 
 /** Last drop position already noted by {@link noteDropArrived}, so the four listeners that each see
  *  the same event emit ONE line between them. Same mechanism and caveat as {@link lastDeadDropKey}:
@@ -277,13 +217,6 @@ export function noteDropArrived(
  *
  * Silent when the position DOES match a known target — a listener declining a drop that another
  * one owns is the normal carve-out, not a failure.
- *
- * When a CATCH-ALL is live the line is DOWNGRADED to info, not dropped (roborev 53914/53929).
- * Suppressing it outright would turn off the alarm for the whole time the Sparkle pane is visible —
- * and under a future coordinate-space regression every hit test breaks together, so the concierge
- * would miss its own column while the composer swallowed the file, with zero log output. That
- * trades a false positive on the success path for total blindness on the failure path. Same payload
- * either way; only the level, and the claim the message makes, differ.
  */
 export function reportDropWithNoTarget(position: { x: number; y: number }): void {
   if (ALL_DND_TARGETS.some((t) => isOverDndTarget(position, t))) return;
@@ -299,14 +232,5 @@ export function reportDropWithNoTarget(position: { x: number; y: number }): void
     innerHeight: window.innerHeight,
     devicePixelRatio: window.devicePixelRatio,
   };
-  if (catchAllDropTargets > 0) {
-    // log.INFO, not debug. `debugForwardEnabled` defaults to `Boolean(import.meta.env.DEV)` and
-    // nothing in the app ever flips it, so a debug line in a shipped build reaches devtools and
-    // NOWHERE ELSE — under the very regression this branch exists to stay diagnosable through, the
-    // user reports "drops do nothing", support pulls the log, and it is empty. info/warn/error
-    // always forward. Downgrading the ALARM must not mean discarding the RECORD.
-    log.info("composer", "file drop matched no marked target; the catch-all composer takes it", detail);
-    return;
-  }
   log.warn("composer", "file drop landed on no drop target", detail);
 }

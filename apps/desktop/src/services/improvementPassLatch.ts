@@ -6,16 +6,19 @@
 //   • the pass itself (services/improvementPass) — which owns the child process, and is a heavy
 //     module: it reaches the worktree/park stack, the transcript registry, and through that
 //     `conciergeTools/terminal`; and
-//   • the SHARED busy rule (services/sparkleBusy) — which sits under an ordinary composer
-//     component. The measured chain (see improvementPassLatch.test.ts, which asserts it) is
+//   • the SHARED busy rule (services/sparkleBusy) — which sits under an ordinary consumer slice.
+//     The measured chain (see improvementPassLatch.test.ts, which asserts it) was
 //     `components/Composer -> components/composer/ApprovalNudge -> services/configActions
-//     -> conciergeTools/policy -> conciergeTools/lifecycle -> services/sparkleBusy`.
+//     -> conciergeTools/policy -> conciergeTools/lifecycle -> services/sparkleBusy`. PR #2985
+//     deleted the first two hops with the dead composer surface; the rest is live, so the test
+//     now roots the same walk at `conciergeTools/lifecycle`.
 //
 // When the second reader imported the FIRST module for this one boolean, every component in that
 // slice pulled the entire pass stack in behind it. That is not a theoretical cost:
-// it broke `Composer.suggestionDeadPty.test.tsx` at COLLECTION, because the newly-reachable
-// `conciergeTools/terminal` reads `SNAPSHOT_MAX_LINES` at module scope from a `terminalScrollback`
-// that the Composer test mocks with one export. The failure named a file the change never touched
+// it broke a dead-PTY suggestion test in the old Composer suite (deleted with that surface in
+// PR #2985) at COLLECTION, because the newly-reachable `conciergeTools/terminal` reads
+// `SNAPSHOT_MAX_LINES` at module scope from a `terminalScrollback` that suite mocked with one
+// export. The failure named a file the change never touched
 // and a symbol it never mentions — the module graph was the only link. Keeping the latch in a leaf
 // with NO imports of its own means a reader of the boolean can never acquire the pass's dependencies.
 //

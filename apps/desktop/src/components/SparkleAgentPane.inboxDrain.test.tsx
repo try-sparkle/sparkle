@@ -44,7 +44,6 @@ vi.mock("./Terminal", () => ({
     return null;
   },
 }));
-vi.mock("./Composer", () => ({ Composer: () => null }));
 vi.mock("./Onboarding", () => ({ Onboarding: () => null }));
 vi.mock("./PinnedPrompt", () => ({ PinnedPrompt: () => null }));
 vi.mock("./SparkleConsentBanner", () => ({ SparkleConsentBanner: () => null }));

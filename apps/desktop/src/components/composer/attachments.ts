@@ -215,24 +215,6 @@ export function buildSendPayload({
   return [...paths, body].filter(Boolean).join(" ");
 }
 
-const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
-
-/** What the transcript shows: the typed text plus compact counts of what's attached —
- *  never the raw temp-file paths (an ugly user-visible leak) and never a wall of pasted
- *  text. The agent's terminal still receives the full payload. */
-export function buildDisplay({ attachments, textBlocks, typed }: ComposeInput): string {
-  const images = attachments.filter((a) => a.kind === "image").length;
-  const files = attachments.filter((a) => a.kind === "file").length;
-  return [
-    typed.trim(),
-    textBlocks.length ? `📄 ${plural(textBlocks.length, "text block")}` : "",
-    images ? `📷 ${plural(images, "image")}` : "",
-    files ? `📎 ${plural(files, "file")}` : "",
-  ]
-    .filter(Boolean)
-    .join("  ");
-}
-
 /** The contiguous id range between `anchorId` and `targetId` (inclusive), in display
  *  order — for Shift-click range selection. Falls back to just the target when the
  *  anchor is unknown (e.g. the anchored tile was removed). */

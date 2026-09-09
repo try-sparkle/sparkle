@@ -29,7 +29,7 @@
 // The counter is kept alongside the tag for the synchronous case, where it is the cheaper answer,
 // and because nesting must not clear the flag early.
 
-import { isEditableElement, isTypingInProgress } from "../engine/focusGuard";
+import { isTypingInProgress } from "../engine/focusGuard";
 // `services/terminalMidCommand` reaches `voice/dictationFocus` (imports nothing) and
 // `stores/terminalOverlayStore` (imports zustand and nothing else), so depending on it here cannot
 // cycle — the same property that makes `engine/focusGuard` safe to depend on above.
@@ -123,27 +123,11 @@ export function resetProgrammaticFocusForTest(): void {
   depth = 0;
 }
 
-/** True for an element the user TYPES INTO: a text `<input>`, a `<textarea>`, or any contentEditable
- *  host (the xterm terminal's key sink is a `<textarea class="xterm-helper-textarea">`, so it
- *  qualifies).
- *
- *  This DELEGATES to `engine/focusGuard`'s `isEditableElement` rather than re-deriving the rule.
- *  It used to be a local copy that answered `true` for EVERY `<input>` — including `type="checkbox"`
- *  / `"radio"` / `"range"` / `"button"`, and including `disabled` / `readOnly` fields — none of which
- *  own a caret. The guard below reads this as "the user is typing over there, leave them alone", so
- *  a caret parked on a settings checkbox permanently suppressed the dictation caret-return: every
- *  segment still landed in the composer, but focus stayed on the checkbox, so the user's next Enter
- *  toggled the checkbox instead of sending (roborev 54718/54719). Three near-copies of this DOM
- *  predicate existed; `isEditableElement` is the one with `NON_TEXT_INPUT_TYPES`, `disabled` and
- *  `readOnly` handling and its own unit tests, so it is now the only one. `focusGuard` imports
- *  nothing, so depending on it here cannot cycle. */
-export const isEditableTarget = isEditableElement;
-
 /** Shared core for the two guarded variants below: focus `el` quietly UNLESS `veto` says the element
  *  that currently holds the caret has to be left alone.
  *
- *  One implementation rather than two near-copies, for the reason the `isEditableTarget` note above
- *  gives: three copies of a DOM predicate had drifted, and the drift is what shipped the bug. The
+ *  One implementation rather than two near-copies: three copies of a DOM predicate had drifted, and
+ *  the drift is what shipped the bug. The
  *  variants differ ONLY in their veto, so that is the only thing either of them states.
  *
  *  `active !== el` is part of the core, not of a veto: a box must never veto its OWN refocus on the
@@ -164,7 +148,7 @@ function focusQuietlyUnless(
  *  different editable element holding unsent text, or a terminal.
  *
  *  The variant to reach for on a focus pull whose callers are MOSTLY the user asking for the caret but
- *  not provably all of them. `focusQuietlyUnlessTypingElsewhere` is too strict for that job and the
+ *  not provably all of them. A veto on mere editable-focus is too strict for that job and the
  *  difference is not a nuance: in a terminal-first shell the xterm key sink holds focus whenever the
  *  user is not typing into something else, so vetoing on mere editable-focus would decline nearly
  *  every legitimate pull — spawning an empty agent, the drop pill's "go to compose" — and delete the
@@ -179,7 +163,7 @@ function focusQuietlyUnless(
  *  as `isTypingInProgress() === false`, and a guard resting on that predicate alone declines nothing
  *  and steals the caret anyway. A test can only make such a guard look correct by hand-setting a
  *  `value` the real terminal never has, which is the same vacuity this whole guard was moved off
- *  `Composer.tsx` to escape (roborev 59595, High).
+ *  the old build composer to escape (roborev 59595, High) — a surface deleted in PR #2985.
  *
  *  ══ BUT THE TERM IS UNSENT INPUT, NOT FOCUS ═══════════════════════════════════════════════════
  *  The first attempt at that vetoed on terminal FOCUS, and over-corrected into the very failure the
@@ -201,22 +185,4 @@ export function focusQuietlyUnlessMidMessage(el: HTMLElement | null | undefined)
     el,
     (active, doc) => terminalHoldsUnsentInput(active) || isTypingInProgress(doc ?? undefined),
   );
-}
-
-/** {@link focusQuietly}, but a NO-OP when the caret currently sits in a DIFFERENT editable element.
- *
- *  Use for a BACKGROUND focus pull — one driven by a timer or an incoming event rather than by the
- *  user's own gesture — where bringing the caret back to `el` must never YANK it out of a field the
- *  user is actively typing in. The motivating case is dictation (sparkle-d2ec): the composer pulled
- *  focus to itself on EVERY committed segment, so while the mic was live a user typing in the
- *  terminal (or any other box) had focus ripped away every couple of seconds — the terminal and the
- *  composer both went dead to the keyboard while the mouse still worked, and only a restart (which
- *  stops dictation) recovered. Skipping the pull when another editable element holds focus keeps
- *  dictation from stealing the keyboard, while still refocusing when focus sits on a non-editable
- *  surface (a mic button, the body) — the legitimate "the mic UI took focus, bring the caret back"
- *  flow this function was added for.
- *
- *  Returns whether it actually focused. Safe on null. */
-export function focusQuietlyUnlessTypingElsewhere(el: HTMLElement | null | undefined): boolean {
-  return focusQuietlyUnless(el, (active) => isEditableTarget(active));
 }

@@ -3,9 +3,8 @@
 // The window-global drag hit test. Tauri's onDragDropEvent carries a cursor position but no
 // element, and with dragDropEnabled on there are no HTML5 drop events to lean on — so every drag
 // listener in the app hit-tests these helpers itself. That makes them the one place where
-// "who owns this drop?" is decided, and the reason FILE_DROP_TARGETS is shared rather than copied:
-// Composer stands down over those surfaces, and a target added there has to reach every consumer
-// at once (roborev 52362).
+// "who owns this drop?" is decided — the one shared place a target is added so every drag listener
+// reaches it at once rather than each keeping a private copy (roborev 52362).
 //
 // It is also where drag-and-drop was BROKEN for every target at once: the helper divided the
 // reported position by devicePixelRatio on every platform, but only Windows reports physical
@@ -16,15 +15,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONCIERGE_COLUMN_DND_TARGET,
-  FILE_DROP_TARGETS,
   NEW_BUILD_AGENT_DND_TARGET,
   SPARKLE_TERMINAL_DND_TARGET,
   TERMINAL_STAGE_DND_TARGET,
   dragPositionScale,
   isOverDndTarget,
-  isOverFileDropTarget,
   OUT_OF_VIEWPORT_SLACK_PX,
-  registerCatchAllDropTarget,
   reportDropWithNoTarget,
 } from "./dndTargets";
 import { log } from "../logger";
@@ -291,92 +287,4 @@ describe("reportDropWithNoTarget", () => {
     expect(log.warn).toHaveBeenCalledTimes(2);
   });
 
-  // A CATCH-ALL MAKES EVERY DROP LIVE (roborev 53893). The Sparkle pane's Composer accepts any drop
-  // outside FILE_DROP_TARGETS — sidebar, tab strip, top bar — and no `data-dnd-target` region
-  // describes that, so the other listeners' miss paths were warning "dead drop" about drops the
-  // composer was successfully attaching. A false alarm on the SUCCESS path is worse than no alarm:
-  // it makes a genuinely dead drop indistinguishable from routine noise.
-  it("DOWNGRADES rather than silences while a catch-all listener is registered", () => {
-    // Not suppressed outright: that would turn the alarm off for the whole time the Sparkle pane is
-    // visible, and under a coordinate regression every hit test breaks together — the concierge
-    // misses its own column while the composer swallows the file, with zero log output. The
-    // diagnostic payload survives at INFO — debug does not forward to the persistent log in a
-    // shipped build, so it would be no record at all (53914, 53929).
-    const release = registerCatchAllDropTarget();
-    try {
-      reportDropWithNoTarget({ x: 994, y: 0 });
-      expect(log.warn).not.toHaveBeenCalled();
-      expect(log.info).toHaveBeenCalledTimes(1);
-      const detail = vi.mocked(log.info).mock.calls[0]?.[2] as Record<string, unknown>;
-      expect(detail).toMatchObject({ position: { x: 994, y: 0 } });
-      // The same fields a dead-drop warn carries, so a support capture loses nothing.
-      expect(detail).toHaveProperty("scale");
-      expect(detail).toHaveProperty("hitTest");
-      expect(detail).toHaveProperty("innerWidth");
-      expect(detail).toHaveProperty("devicePixelRatio");
-    } finally {
-      release();
-    }
-  });
-
-  it("reports again once the catch-all goes away", () => {
-    registerCatchAllDropTarget()();
-    reportDropWithNoTarget({ x: 993, y: 0 });
-    expect(log.warn).toHaveBeenCalledTimes(1);
-  });
-
-  it("counts catch-alls, so overlapping mount/unmount can't un-suppress early", () => {
-    // Effects double-invoke under StrictMode, so a boolean would be cleared by the first teardown
-    // while a live listener remained.
-    const first = registerCatchAllDropTarget();
-    const second = registerCatchAllDropTarget();
-    first();
-    reportDropWithNoTarget({ x: 992, y: 0 });
-    expect(log.warn).not.toHaveBeenCalled();
-    second();
-    reportDropWithNoTarget({ x: 991, y: 0 });
-    expect(log.warn).toHaveBeenCalledTimes(1);
-  });
-
-  it("survives a release fn being called twice", () => {
-    const release = registerCatchAllDropTarget();
-    release();
-    release(); // idempotent — a double teardown must not drive the count negative
-    const other = registerCatchAllDropTarget();
-    try {
-      reportDropWithNoTarget({ x: 990, y: 0 });
-      expect(log.warn).not.toHaveBeenCalled();
-    } finally {
-      other();
-    }
-  });
-});
-
-describe("isOverFileDropTarget", () => {
-  it("is true over EITHER surface that owns its drops", () => {
-    expect(isOverFileDropTarget(at(100))).toBe(true);
-    expect(isOverFileDropTarget(at(200))).toBe(true);
-  });
-
-  it("is false over anything else", () => {
-    expect(isOverFileDropTarget(at(999))).toBe(false);
-  });
-
-  it("is false with NO position rather than throwing", () => {
-    // `over` events are position-only and `leave` carries nothing; a listener passing undefined
-    // must get a plain "not over a target", not an exception inside a drag handler.
-    expect(isOverFileDropTarget(undefined)).toBe(false);
-  });
-
-  it("covers exactly the surfaces that own their drops, so a new one can't be half-added", () => {
-    // The Sparkle pane's TERMINAL is the third: it pastes a dropped path into its own PTY
-    // (hooks/useTerminalDrop), so the catch-all composer rendered directly below it must stand
-    // down. Dropping it from this list is what re-creates the bug — the composer takes the file,
-    // loads it, and the loader's refusal makes it disappear.
-    expect([...FILE_DROP_TARGETS]).toEqual([
-      NEW_BUILD_AGENT_DND_TARGET,
-      CONCIERGE_COLUMN_DND_TARGET,
-      SPARKLE_TERMINAL_DND_TARGET,
-    ]);
-  });
 });

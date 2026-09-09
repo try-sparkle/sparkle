@@ -163,40 +163,11 @@ const TRANSIENT_UI_KEYS = [
 ] as const satisfies readonly (keyof UiState)[];
 
 export const COMPOSER_MIN = 64;
-// Smallest usable textarea height (≈ one line + its vertical padding). Used as the floor's
-// reserved input space when screenshot thumbnails push the composer's chrome taller, so an
-// attachment can never squeeze the input box to a sliver. See resolveComposerFloor.
-export const COMPOSER_MIN_TEXTAREA = 36;
 // The rest height: tall enough that, as a bottom overlay, the composer just covers Claude's
 // terminal input line — so the user types here by default, never into the terminal beneath.
 // Drag-snaps land here (see composerDrag.ts), so it doubles as the restore target.
 export const COMPOSER_SNAP = 72;
 export const COMPOSER_DEFAULT = COMPOSER_SNAP;
-// Slim bar shown when minimized: enough for the grab handle + a "bring it back" hint, while
-// the terminal input underneath is fully exposed for answering Claude's menus.
-export const COMPOSER_BAR = 22;
-// Drag tuning (shared with composerDrag.ts via the Composer): a magnet around the snap
-// height, the raw height a downward drag must reach to minimize, and the upward distance
-// needed to restore from the minimized bar.
-export const COMPOSER_SNAP_THRESHOLD = 24;
-export const COMPOSER_MINIMIZE_THRESHOLD = 40;
-export const COMPOSER_RESTORE_THRESHOLD = 24;
-/**
- * Stacking order of the composer overlay, and WHO ELSE DEPENDS ON IT.
- *
- * The composer is an absolutely-positioned strip across the bottom of its pane, and in the Sparkle
- * pane the terminal's drop region is a sibling box spanning the WHOLE pane — so the two overlap
- * completely along that strip and only paint order decides which one a drop lands on
- * (`document.elementFromPoint` returns the topmost element, and the drop hooks resolve ownership by
- * walking up from it). That made "the compose box keeps its own drops" an accident of two literals
- * in two files: raise the terminal box above this and a file dropped on the compose box would paste
- * a shell-quoted path into the PTY instead of becoming a tile, silently (roborev 55575).
- *
- * So the number is shared and the dependency is written down: SparkleAgentPane derives its
- * terminal region's z-index from this and must stay BELOW it. `SparkleAgentPane.drop.test.tsx`
- * asserts that ordering against the rendered DOM.
- */
-export const COMPOSER_Z = 5;
 
 // Text-size factor for ONE COLUMN (Cmd +/- and the ⋯ menu "Text size"). It used to be a single
 // global number read only by Terminal.tsx, which is why the shortcut worked in a terminal and

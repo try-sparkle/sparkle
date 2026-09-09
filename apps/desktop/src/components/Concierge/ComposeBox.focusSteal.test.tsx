@@ -6,10 +6,10 @@
 // itself on a BACKGROUND event, over and over, so every few seconds the keystrokes the user was
 // typing somewhere else went to a box they were not looking at.
 //
-// That regression class was already pinned — on `components/Composer.tsx`, which the app has not
-// mounted since the pane composer was retired and which has no non-test importer anywhere in the
-// monorepo. So the pin was green against code that never runs. THIS file pins it on the surface the
-// app actually ships: `Concierge/ComposeBox`.
+// That regression class was already pinned — on the old build composer, which the app had not
+// mounted since the pane composer was retired and which had no non-test importer anywhere in the
+// monorepo. So the pin was green against code that never ran, and PR #2985 deleted that surface.
+// THIS file pins it on the surface the app actually ships: `Concierge/ComposeBox`.
 //
 // The seam is `composeFocusSeq`. `uiStore.requestComposeFocus()` documents itself as "the user asking
 // for the caret", but that invariant is unenforced and already stretched — `ConciergeHost`'s

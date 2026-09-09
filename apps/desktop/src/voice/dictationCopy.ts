@@ -191,11 +191,6 @@ export const PREPARING_SUFFIX = " — you can type here meanwhile.";
 export function preparingCaption(pct: number | null): string {
   return `${PREPARING_PREFIX}${pct !== null ? ` (${pct}%)` : "…"}`;
 }
-/** The composer's version: the same status plus the reassurance that the box still works.
- *  Built FROM preparingCaption so the two surfaces can't drift. */
-export function preparingPlaceholder(pct: number | null): string {
-  return `${preparingCaption(pct)}${PREPARING_SUFFIX}`;
-}
 
 /** Percent complete of the voice-model download, or null when the total is unknown.
  *  NOTE: progress is measured over the COMPRESSED tarball stream (~482 MB), which is what the

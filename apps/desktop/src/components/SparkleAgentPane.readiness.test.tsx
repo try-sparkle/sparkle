@@ -33,7 +33,6 @@ vi.mock("./Terminal", async (importOriginal) => {
     },
   };
 });
-vi.mock("./Composer", () => ({ Composer: () => null }));
 // The PTY, for the end-to-end queue case at the bottom. `submitPrompt` rejects while the pane is
 // still coming up (there is no process yet — the real failure mode) and succeeds afterwards, which is
 // exactly the sequence the pane's readiness publication has to make legible to conciergeDispatch.

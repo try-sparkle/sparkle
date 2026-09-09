@@ -14,8 +14,8 @@
 // moment the compose box is aimed at it and turns the paths into chips
 // (hooks/useConciergeAttachments.attachPaths → services/conciergeAttach → the same `load_attachment`
 // the human's own drop uses). From there the existing send path takes over: `buildSendPayload`
-// shell-quotes the paths in front of the message body, and `buildDisplay` shows counts rather than
-// temp paths, which is the leak an earlier branch spent three roborev rounds closing. Nothing here
+// shell-quotes the paths in front of the message body, and conciergeAttach's own display renders
+// counts rather than temp paths — the leak an earlier branch spent three roborev rounds closing. Nothing here
 // re-implements any of that, and nothing here sends: a staged file rides along with the NEXT message
 // that agent is sent, and a human still presses send.
 //

@@ -44,14 +44,16 @@
 // plain textbox may replace it, and the consent surface must NOT be gone — with the terminal's own
 // presence guarded next door.
 //
-// WHY THE COMPOSER IS MOCKED AS A STAND-IN RATHER THAN OMITTED. The absence assertions have to be
-// about "the old composer, however it comes back", not about one import path — otherwise re-adding
-// the row by inlining it would sail past. So `./Composer` is replaced by a stand-in rendering the
-// affordances the founder actually pointed at, matching the real component's own markup:
+// WHY THESE ASSERTIONS NAME AFFORDANCES AND NOT AN IMPORT PATH. `./Composer` no longer exists —
+// the module was deleted — so there is nothing left to mock and no import path left to assert on.
+// That is exactly why the affordance assertions are the ones that survive: they are about "the old
+// composer, however it comes back", not about one import path, so re-adding the row by INLINING it
+// into this pane is caught just as a re-added import would be. They name the real component's own
+// markup:
 //   the screenshot button titled "Capture a region of your screen" (Composer.tsx ~1806), the mic's
 //   "I'm listening" placeholder, and a <textarea> (~1628).
-// Every assertion below therefore FAILS if `<Composer>` comes back (the stand-in renders) AND fails
-// if an equivalent box is hand-rolled in the pane (the title/placeholder appear either way).
+// Every assertion below therefore fails if an equivalent box is hand-rolled in the pane, which is
+// now the only way it can come back.
 //
 // Terminal is mocked because mounting the real one drags in xterm and a PTY — but its REAL
 // `composerFocusRequest` action map is kept, because the ⌘J case below has to route through the same
@@ -87,26 +89,11 @@ vi.mock("./Terminal", async (importOriginal) => {
     },
   };
 });
-// The stand-in for the OLD BESPOKE compose surface. See the header. It renders the affordances the
-// founder pointed at on 2026-07-29 — the mic placeholder and the screenshot button — plus its own
-// textarea, so a returning composer is caught by three INDEPENDENT tells. The bare textbox is one
-// of them and is asserted below in its own case; the other two matter because an inlined
-// replacement that reworded or dropped the textarea would still carry the affordances.
-vi.mock("./Composer", () => ({
-  Composer: () => (
-    <div data-testid="pane-composer">
-      <textarea aria-label="Message the Sparkle agent" placeholder="I'm listening…" />
-      <button data-hint="screenshot" title="Capture a region of your screen">
-        Screenshot
-      </button>
-      <button>Send</button>
-    </div>
-  ),
-}));
 vi.mock("./Onboarding", () => ({ Onboarding: () => null }));
-// A STAND-IN THAT RENDERS ITS PROMPT, not a null mock — same reasoning as the Composer stand-in
-// above. The pinned header is also gone from this pane (see below), and a `() => null` mock would
-// make that absence assertion vacuous: it would pass just as well with the element still there.
+// A STAND-IN THAT RENDERS ITS PROMPT, not a null mock — same reasoning as the affordance
+// assertions in the header. The pinned header is also gone from this pane (see below), and a
+// `() => null` mock would make that absence assertion vacuous: it would pass just as well with the
+// element still there.
 vi.mock("./PinnedPrompt", () => ({
   PinnedPrompt: ({ prompt }: { prompt: string }) => <div data-testid="pane-pinned-prompt">{prompt}</div>,
 }));
@@ -175,10 +162,9 @@ async function readyPane() {
 describe("SparkleAgentPane — the OLD bespoke composer is gone", () => {
   it("renders none of the affordances the founder pointed at", async () => {
     await readyPane();
-    // The import path…
-    expect(screen.queryByTestId("pane-composer")).toBeNull();
-    // …and the affordances, so an inlined replacement that never imports `./Composer` is caught
-    // too. The bare "no textbox" assertion is a SEPARATE case below (`has NO text box at all`),
+    // The affordances the founder pointed at. `./Composer` is deleted, so an inlined replacement
+    // that never imports it is now the only way the surface can come back — and these two catch it.
+    // The bare "no textbox" assertion is a SEPARATE case below (`has NO text box at all`),
     // deliberately: these two tells survive a rewording of the box, and that one survives a
     // composer whose affordances were renamed. Its own comment records why it has been reverted
     // twice; and neither is safe to read without `SparkleAgentPane.terminal.test.tsx`, which is
