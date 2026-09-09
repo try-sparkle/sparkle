@@ -21,13 +21,16 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { roborevRemediation } from "./pipelineHealthEscalation";
+import { knightwatchRemediation, roborevRemediation } from "./pipelineHealthEscalation";
 
 // fileURLToPath, never `new URL(...).pathname`: every worktree on this machine lives under a path
 // containing a space ("Application Support"), which a URL pathname percent-encodes into a directory
 // that does not exist. AGENTS.md records this as the only case here, not an edge case.
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const CLASSIFIER = join(HERE, "..", "..", "..", "..", "scripts", "lib", "pipeline-health.sh");
+// The RUST classifier is what actually produces the detail the app reads at runtime (the shell
+// twin serves the CLI). `restart_remedy` there owns the reviewer phrases keyed on below.
+const RUST_CLASSIFIER = join(HERE, "..", "..", "src-tauri", "src", "pipeline_health.rs");
 
 /** The phrases `roborevRemediation` discriminates on, paired with the arm each one selects. */
 const KEYED_PHRASES: ReadonlyArray<readonly [string, string]> = [
@@ -73,5 +76,65 @@ describe("the roborev remedy's coupling to the shell classifier", () => {
     for (const [i, r] of remedies.entries()) {
       expect(r, `"${KEYED_PHRASES[i]![0]}" fell through to the default`).not.toBe(fallback);
     }
+  });
+});
+
+// ── The reviewer remedy keys on phrases owned by `restart_remedy` in pipeline_health.rs ─────────
+//
+// Same coupling, same silent failure, one component over (bead `sparkle-0wb6zp`).
+// `knightwatchRemediation()` cannot see `[review].pr_reviewer` — the health component carries no
+// reviewer field — so it reads which reviewer is configured out of the RESTART SENTENCE the Rust
+// classifier already appended to the detail. If that sentence is reworded, every arm falls through
+// to the reviewer-agnostic default: nothing throws, nothing reds, and the operator silently stops
+// being told which reviewer to trigger. That is safe (the default names no reviewer) but it is a
+// capability quietly lost, which is precisely the shape this file exists to catch.
+describe("the reviewer remedy's coupling to the Rust classifier", () => {
+  const rust = readFileSync(RUST_CLASSIFIER, "utf8");
+  // Read again in this block: the first describe's `source` is scoped to that block.
+  const shell = readFileSync(CLASSIFIER, "utf8");
+
+  /** The phrases `knightwatchRemediation` discriminates on, paired with the arm each selects. */
+  const REVIEWER_PHRASES: ReadonlyArray<readonly [string, string]> = [
+    ["/srosro-update-review", "knightwatch — another machine, nothing here to restart"],
+    ["scripts/pr-review.sh", "sparkle-reviewer — the local sweep, which IS the thing to check"],
+  ];
+
+  // Anti-vacuity: a truncated or wrong read would let every `toContain` below pass.
+  it("actually read pipeline_health.rs, not an empty or unrelated file", () => {
+    expect(rust.length, `suspiciously small read of ${RUST_CLASSIFIER}`).toBeGreaterThan(2000);
+    expect(rust, "this is not classify_knightwatch's file").toContain("fn restart_remedy(");
+  });
+
+  it.each(REVIEWER_PHRASES)("the Rust still emits %s — selecting %s", (phrase, _why) => {
+    expect(
+      rust,
+      `knightwatchRemediation() matches on "${phrase}", but pipeline_health.rs no longer contains ` +
+        `it. Nothing breaks loudly: that arm falls through to the reviewer-agnostic default and the ` +
+        `operator stops being told which reviewer to trigger. Re-key the regex in ` +
+        `pipelineHealthEscalation.ts to the new wording, or restore the phrase.`,
+    ).toContain(phrase);
+  });
+
+  // The other half: a phrase present in the Rust must still SELECT a distinct arm here.
+  it("each phrase still selects a distinct remedy on the TS side", () => {
+    const remedies = REVIEWER_PHRASES.map(([p]) => knightwatchRemediation(`... ${p} ...`));
+    expect(new Set(remedies).size, "two arms collapsed to the same remedy").toBe(
+      REVIEWER_PHRASES.length,
+    );
+    const fallback = knightwatchRemediation("");
+    for (const [i, r] of remedies.entries()) {
+      expect(r, `"${REVIEWER_PHRASES[i]![0]}" fell through to the default`).not.toBe(fallback);
+    }
+  });
+
+  // Both classifiers are documented as keeping these sentences byte-identical, so the CLI twin must
+  // carry them too — otherwise `scripts/pipeline-health-scan.sh` and the app disagree about the
+  // remedy for the same reading.
+  it.each(REVIEWER_PHRASES)("the shell twin still emits %s as well", (phrase, _why) => {
+    expect(
+      shell,
+      `pipeline_health.rs and scripts/lib/pipeline-health.sh are documented as byte-identical on ` +
+        `the restart sentence, but the shell no longer contains "${phrase}".`,
+    ).toContain(phrase);
   });
 });

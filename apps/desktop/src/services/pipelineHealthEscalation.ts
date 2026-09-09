@@ -217,6 +217,81 @@ export function roborevRemediation(detail?: string): string {
 }
 
 /**
+ * The PR-reviewer remedy, DERIVED FROM THE READING rather than hard-coded (bead `sparkle-0wb6zp`).
+ *
+ * TWO THINGS WERE WRONG WITH THE PREVIOUS STRING, and both are the kind AGENTS.md warns about
+ * (a remedy is an instruction someone will follow).
+ *
+ *   1. IT NAMED A RETIRED REVIEWER. It said "The PR reviewer (sparkle-reviewer) … review one
+ *      manually with `scripts/pr-review.sh <PR#> --post`". `[review].pr_reviewer` flipped to
+ *      `knightwatch` on 2026-09-03, and knightwatch runs on another machine — the babysit sweep
+ *      does not dispatch it and `scripts/pr-review.sh` reviews nothing it is waiting on. The
+ *      Rust side was keyed to the configured reviewer on 2026-09-08 (`restart_remedy` in
+ *      `pipeline_health.rs`, bead `sparkle-9hs48d`) and so was `scripts/lib/pipeline-health.sh`;
+ *      this string was left behind, so the alert CONTRADICTED ITS OWN EVIDENCE — the detail said
+ *      knightwatch and `/srosro-update-review`, and the `Remediation:` line under it said
+ *      sparkle-reviewer and the sweep.
+ *   2. IT COULD NOT FOLLOW THE CONFIG. Swapping one hard-coded name for the other reintroduces the
+ *      identical defect the next time `pr_reviewer` moves, which is exactly how this arrived.
+ *
+ * So it keys on the RESTART SENTENCE the classifier already put in the detail — the same
+ * derive-from-detail shape `roborevRemediation` uses, and the only reviewer signal that reaches
+ * this module (the component carries no reviewer field). Both phrases are owned by
+ * `restart_remedy` in `pipeline_health.rs` and `restart` in `scripts/lib/pipeline-health.sh`, and
+ * `pipelineHealthRemedyDrift.test.ts` pins them so a reword cannot silently fall through.
+ *
+ * THE DEFAULT IS THE SAFETY PROPERTY, exactly as in `roborevRemediation`: an unrecognised reading
+ * names NEITHER reviewer and prescribes neither trigger. Naming the wrong one is worse than naming
+ * none, because the reader acts on it and concludes the reviewer is fine.
+ *
+ * AND NO ARM DIAGNOSES A CAUSE THE READING CANNOT SUPPORT (bead `sparkle-gazo4a`). "its access is
+ * gone" after a 15-minute non-observation is an ABSENCE CLAIM, and this component cannot make one:
+ * a QUOTA-BLOCKED knightwatch is perfectly healthy and posts `\u23f8 knightwatch paused` every ~2
+ * minutes, and those lifecycle posts are deliberately excluded from `last_review_age_secs` (see
+ * the marker note in `pipeline_health.rs`) — so a paused reviewer is exactly what drives
+ * `classify_knightwatch` into the Warning arm this remedy is appended to. An operator following an
+ * unqualified "access is gone" repoints the repo's reviewer away from one that is fine, which is
+ * the destructive direction. So the arm keeps the OBSERVATION and the TOOL and drops the verdict:
+ * it says what would settle the question and conditions the config change on that read.
+ */
+export function knightwatchRemediation(detail?: string): string {
+  const d = detail ?? "";
+
+  // knightwatch — someone else's machine, reachable only over GitHub. NOTHING HERE TO RESTART, and
+  // saying otherwise is what sent the reader to the babysit sweep for a reviewer it never drives.
+  if (/srosro-update-review/i.test(d)) {
+    return (
+      "The PR reviewer (knightwatch) has not posted a review recently while PRs are waiting. It runs " +
+      "on another machine and is reachable only through GitHub, so there is nothing on this side to " +
+      "restart: comment `/srosro-update-review` on a waiting PR and watch for ~15 minutes. If no " +
+      "review lands, this reading still cannot say whether it is paused, quota-blocked or has lost " +
+      "access — `scripts/reviewer-liveness-check.sh` reports whether it has produced any review at " +
+      "all, and knightwatch's own `\u23f8 knightwatch paused` posts on a waiting PR tell a pause " +
+      "apart from silence. Repoint `[review].pr_reviewer` in `.sparkle/config.toml` only once that " +
+      "read shows it is genuinely no longer posting."
+    );
+  }
+
+  // The local reviewer, dispatched by the app's own sweep — here the sweep IS the thing to check.
+  if (/pr-review\.sh/i.test(d)) {
+    return (
+      "The PR reviewer (sparkle-reviewer) has not posted a review recently while PRs are waiting — it " +
+      "is dispatched by the app's babysit sweep, so review one manually with `scripts/pr-review.sh " +
+      "<PR#> --post` and check why the sweep is not dispatching."
+    );
+  }
+
+  // DEFAULT — see the block comment: name no reviewer, prescribe no trigger, point at the one tool
+  // that resolves the reviewer from config itself.
+  return (
+    "The PR reviewer has not posted a review recently while PRs are waiting. The reading above names " +
+    "the configured reviewer and how to trigger it — follow that, and confirm with " +
+    "`scripts/reviewer-liveness-check.sh`, which resolves the reviewer from `[review].pr_reviewer` " +
+    "and reports whether it has produced any review at all."
+  );
+}
+
+/**
  * The codified remediation per component id (mirrors the ids in `pipeline_health.rs`). Returns the
  * concrete next action so the alert is actionable, not just a notification. `null` for an unknown id
  * — the message still names the component and severity, it simply has no canned fix to append.
@@ -243,23 +318,7 @@ export function remediationFor(componentId: string, detail?: string): string | n
     case "release_runner":
       return "The release runner (DMG build) is offline — wake the founder's Mac, and repair the runner with `sudo scripts/runner/setup-self-hosted-runner.sh` if it does not re-register.";
     case "knightwatch":
-      // TWO THINGS WERE WRONG WITH THE PREVIOUS STRING, and both are the kind AGENTS.md warns about
-      // (a remedy is an instruction someone will follow).
-      //
-      //   1. IT NAMED A DEAD PATH. It said "reprovision it with `scripts/knightwatch/provision-vm.sh`",
-      //      but the configured reviewer is `sparkle-reviewer` — a local `claude` call dispatched per
-      //      push by the app's babysit sweep, not a VM. `pipeline_health.rs`'s own RESTART constant,
-      //      attached to the very detail this remedy is appended to, says `scripts/pr-review.sh
-      //      <PR#> --post`. The alert contradicted its own evidence.
-      //   2. IT OVERCLAIMED. "is unavailable" is an ABSENCE CLAIM (bead `sparkle-gazo4a`), and the
-      //      reading behind this component is a freshness heuristic over a comment window — it can
-      //      say the reviewer has not posted lately, never that it is down. It said "unavailable" at
-      //      the exact moment the reviewer was posting a substantive review on a live PR.
-      //
-      // Note the component now reports `unknown` rather than `warning` whenever that window could
-      // not be read back far enough to judge, so this string is only reached on a reading that DID
-      // cover the question — and it still only claims what such a reading supports.
-      return "The PR reviewer (sparkle-reviewer) has not posted a review recently while PRs are waiting — it is dispatched by the app's babysit sweep, so review one manually with `scripts/pr-review.sh <PR#> --post` and check why the sweep is not dispatching.";
+      return knightwatchRemediation(detail);
     case "release_publication":
       // NEVER SAY "RE-DISPATCH" HERE. This string used to end "…and the tagged commit's CI gate
       // before re-dispatching", and re-dispatching a HELD tag is the one action release.yml

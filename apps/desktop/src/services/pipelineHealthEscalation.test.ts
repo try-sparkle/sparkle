@@ -270,6 +270,110 @@ describe("composeEscalationMessage + remediationFor", () => {
     expect(msg).toMatch(/one poll of one component/i);
     expect(msg).toMatch(/confirm against that reading before closing/i);
   });
+
+  // ── The reviewer remedy must follow the CONFIGURED reviewer (bead `sparkle-0wb6zp`) ──────────
+  //
+  // `[review].pr_reviewer` flipped to `knightwatch` on 2026-09-03. `pipeline_health.rs` was keyed to
+  // the configured reviewer on 2026-09-08 (`restart_remedy`, bead `sparkle-9hs48d`) and so was
+  // `scripts/lib/pipeline-health.sh` — but THIS file's canned remedy stayed hard-coded to
+  // `sparkle-reviewer` and to `scripts/pr-review.sh`, the babysit-sweep path. Under a knightwatch
+  // config that produced an alert CONTRADICTING ITS OWN EVIDENCE: the detail said knightwatch and
+  // `/srosro-update-review`, and the `Remediation:` line appended directly under it named the
+  // retired reviewer and prescribed a command that reviews nothing knightwatch is waiting on.
+  //
+  // AGENTS.md: a remedy string is an instruction someone will follow, so it must be safe under the
+  // conditions that produced the alarm. These cases are PAIRED so the fix cannot be satisfied by
+  // swapping one hard-coded reviewer for the other.
+
+  /** The real `classify_knightwatch` Warning details, verbatim — the strings this keys on. */
+  const REVIEWER_DETAIL = {
+    knightwatch:
+      "no recent 'knightwatch' review was found and open PR(s) are waiting — the reviewer may not " +
+      "be running. Reviews are posted by knightwatch on another machine; trigger one by commenting " +
+      "`/srosro-update-review` on a waiting PR and confirm the review lands.",
+    sparkle:
+      "no recent 'sparkle-reviewer' review was found and open PR(s) are waiting — the reviewer may " +
+      "not be running. Reviews are dispatched by the app's babysit sweep; run " +
+      "`scripts/pr-review.sh <PR#> --post` to review manually.",
+  } as const;
+
+  it("the reviewer remedy follows a KNIGHTWATCH reading — never naming the retired reviewer", () => {
+    const remedy = remediationFor("knightwatch", REVIEWER_DETAIL.knightwatch)!;
+    expect(remedy, `remedy for a knightwatch reading:\n${remedy}`).not.toMatch(/sparkle-reviewer/i);
+    expect(remedy, "prescribes the babysit-sweep path knightwatch does not use").not.toContain(
+      "scripts/pr-review.sh",
+    );
+    expect(remedy, "says nothing about the reviewer the reading is actually about").toMatch(
+      /knightwatch/i,
+    );
+  });
+
+  it("the reviewer remedy follows a SPARKLE-REVIEWER reading — the paired half", () => {
+    // Without this half the case above is satisfied by swapping one hard-code for the other, which
+    // breaks again the moment `pr_reviewer` moves back — exactly how this defect was introduced.
+    const remedy = remediationFor("knightwatch", REVIEWER_DETAIL.sparkle)!;
+    expect(remedy, `remedy for a sparkle-reviewer reading:\n${remedy}`).toContain(
+      "scripts/pr-review.sh",
+    );
+    expect(remedy, "prescribes knightwatch's trigger for a sparkle-reviewer reading").not.toContain(
+      "/srosro-update-review",
+    );
+  });
+
+  it("an unrecognised reviewer reading names NEITHER reviewer — the safety default", () => {
+    // Mirrors `roborevRemediation`'s default: an arm this function has never seen degrades to "go
+    // and look", never to a confident instruction about a reviewer the reading never mentioned.
+    for (const detail of ["", undefined, "some future classifier arm nobody has written yet"]) {
+      const remedy = remediationFor("knightwatch", detail)!;
+      expect(remedy, `named a reviewer it has no evidence for:\n${remedy}`).not.toMatch(
+        /sparkle-reviewer|srosro-update-review|scripts\/pr-review\.sh/i,
+      );
+    }
+  });
+
+  it("the knightwatch remedy never DIAGNOSES a cause the reading cannot support", () => {
+    // bead `sparkle-gazo4a`: "is unavailable" is an ABSENCE CLAIM, and this component cannot make
+    // one. A QUOTA-BLOCKED knightwatch is perfectly healthy and posts `\u23f8 knightwatch paused`
+    // every ~2 minutes, and those lifecycle posts are deliberately excluded from
+    // `last_review_age_secs` — so a paused reviewer is exactly what drives classify_knightwatch
+    // into the Warning arm this remedy is appended to. An operator following an unqualified
+    // "its access is gone" repoints the repo's configured reviewer away from one that is fine.
+    const remedy = remediationFor("knightwatch", REVIEWER_DETAIL.knightwatch)!;
+    expect(remedy, `asserts a cause this reading cannot establish:\n${remedy}`).not.toMatch(
+      /access is gone|is down\b|is unavailable|has stopped|no longer has access/i,
+    );
+
+    // THE PAIRED POSITIVE HALF — a negative alone is green over a remedy trimmed to silence, which
+    // is the AGENTS.md negative-only-ratchet trap. Dropping the verdict must not drop the guidance:
+    // the arm still has to name what WOULD settle it, and condition the config change on that read
+    // rather than on a timeout.
+    expect(remedy, "dropped the tool that would actually settle it").toContain(
+      "scripts/reviewer-liveness-check.sh",
+    );
+    expect(remedy, "repointing must be conditioned on a read, not on a 15-minute silence").toMatch(
+      /only once/i,
+    );
+  });
+
+  it("the composed alert never contradicts the reading it is attached to", () => {
+    // The side effect that actually reached the founder: detail and Remediation in ONE message,
+    // naming two different reviewers and two mutually useless remedies.
+    const ev: EscalationEvent = {
+      componentId: "knightwatch",
+      name: "PR reviewer",
+      from: "healthy",
+      to: "warning",
+      severity: "warning",
+      detail: REVIEWER_DETAIL.knightwatch,
+      remediation: remediationFor("knightwatch", REVIEWER_DETAIL.knightwatch),
+    };
+    const msg = composeEscalationMessage(ev);
+    expect(msg, "the remedy was dropped entirely").toContain("Remediation:");
+    expect(
+      msg,
+      `the alert names the retired reviewer beside a knightwatch reading:\n${msg}`,
+    ).not.toMatch(/sparkle-reviewer/i);
+  });
 });
 
 describe("escalatePipelineHealth — an alarm that reached NO sink is not `delivered`", () => {
