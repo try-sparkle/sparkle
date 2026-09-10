@@ -154,13 +154,26 @@ const resolvedCardAgentIds = (): string[] =>
 /** The agent's own Claude Code session — the one its hook events carry. */
 const MAIN = "sess-main";
 
-const acted = (event: string, atMs: number, sessionId: string | null = MAIN): MovementEvidence => ({
+const acted = (
+  event: string,
+  atMs: number,
+  sessionId: string | null = MAIN,
+  over: Partial<MovementEvidence> = {},
+): MovementEvidence => ({
   lastEvent: event,
   lastEventMs: atMs,
   sessionId,
   // Retraction reads the event NAME and its instant; the digest's tool COUNT is carried for
   // engine/goalContinuation and is deliberately absent from these fixtures.
   toolsRecent: null,
+  // THE DISCRIMINANT DEFAULTS TO ABSENT, and absent resolves to NO verdict at all for the two
+  // events whose meaning depends on it — never to "not asking". So these fixtures are fail-closed
+  // by default, and one standing for a SPECIFIC block has to say which it is.
+  lastEventTool: null,
+  lastEventMessage: null,
+  lastTurnOpenMs: atMs,
+  lastTurnCloseMs: null,
+  ...over,
 });
 
 beforeEach(() => {
@@ -335,27 +348,83 @@ describe("the BLOCKED pill retracts on evidence of movement, with no dismissal",
     expect(resolvedCardAgentIds()).toEqual([]);
   });
 
-  // Claude fires a `Notification` idle ping roughly a minute into any unanswered wait. It is the
-  // sound of the question NOT being answered, so it must never read as the agent moving past it —
-  // otherwise every genuine ask would erase itself on a timer.
-  it("does NOT clear on the idle Notification ping of an unanswered question", () => {
+  // ── THE IDLE PING OF AN UNANSWERED QUESTION (roborev job 82349) ──────────────────────────────
+  //
+  // Claude fires a non-permission `Notification` — "Claude is waiting for your input" — when the
+  // prompt has sat idle. MID-TURN that is the sound of the question NOT being answered, so it must
+  // never read as the agent moving past it: otherwise a genuine ask erases itself ON A TIMER, on
+  // the weakest evidence there is.
+  //
+  // THIS TEST WAS VACUOUS ON TWO INDEPENDENT COUNTS and roborev caught both. Its first render
+  // passed NO evidence, so nothing was adopted and the second render's event hit the adoption
+  // branch and returned before any classification — the assertion was satisfied by the one-tick
+  // adoption cost alone and would have passed whatever the notification said. And its fixture
+  // carried no `lastEventMessage`, so once the discriminant gate landed it passed through the
+  // CANNOT-TELL path instead of the idle path, and stopped testing the case its title names. It
+  // went green through the very change that broke the behaviour it guards.
+  //
+  // Both are fixed: a prior tick adopts the session on the picker that IS the ask, and the fixture
+  // carries the real ping message with the turn still OPEN.
+  it("does NOT clear on the mid-turn idle Notification ping of an unanswered question", () => {
     const p = projectOf("p1", "sparkle-desktop", [tab("asker")]);
     const ledger = emptyLedger();
     const asking: Record<string, AgentTabStatus> = { asker: "waiting" };
 
-    const { rerender } = render(<ConciergeHost feed={tickAt([p], asking, T0, ledger)} />);
+    const { rerender } = render(
+      <ConciergeHost
+        feed={tickAt([p], asking, T0, ledger, {
+          // The picker that IS the ask — this adopts the session, so the ping below is judged
+          // rather than swallowed by adoption.
+          asker: acted("PreToolUse", T0 - 1_000, MAIN, { lastEventTool: "AskUserQuestion" }),
+        })}
+      />,
+    );
     expect(cardAgentIds()).toEqual(["asker"]);
 
     rerender(
       <ConciergeHost
         feed={tickAt([p], asking, T0 + 65_000, ledger, {
-          asker: acted("Notification", T0 + 60_000),
+          asker: acted("Notification", T0 + 60_000, MAIN, {
+            lastEventMessage: "Claude is waiting for your input",
+          }),
         })}
       />,
     );
     expect(cardAgentIds()).toEqual(["asker"]);
     // Same both-halves rule as above: an unanswered question must be neither withdrawn NOR greyed.
     expect(resolvedCardAgentIds()).toEqual([]);
+  });
+
+  // THE PAIRED POSITIVE, and this file needs it: every assertion above is a "does NOT clear", which
+  // deleting the contradiction axis outright would satisfy. The SAME ping after the turn has CLOSED
+  // is the honest "finished, your move" — 2,544 of the 2,906 real idle pings on this machine — and
+  // is `d5d7056e`'s actual shape, one of the three agents bead sparkle-xndaze is named after.
+  it("DOES clear on the same ping once the turn has closed", () => {
+    const p = projectOf("p1", "sparkle-desktop", [tab("asker")]);
+    const ledger = emptyLedger();
+    const asking: Record<string, AgentTabStatus> = { asker: "waiting" };
+
+    const { rerender } = render(
+      <ConciergeHost
+        feed={tickAt([p], asking, T0, ledger, {
+          asker: acted("PreToolUse", T0 - 1_000, MAIN, { lastEventTool: "AskUserQuestion" }),
+        })}
+      />,
+    );
+    expect(cardAgentIds()).toEqual(["asker"]);
+
+    rerender(
+      <ConciergeHost
+        feed={tickAt([p], asking, T0 + 65_000, ledger, {
+          asker: acted("Notification", T0 + 60_000, MAIN, {
+            lastEventMessage: "Claude is waiting for your input",
+            lastTurnOpenMs: T0 - 20_000,
+            lastTurnCloseMs: T0 + 30_000,
+          }),
+        })}
+      />,
+    );
+    expect(cardAgentIds()).toEqual([]);
   });
 
   // A red that recurs must be able to raise itself again: the second block is a NEW episode, and the
@@ -391,12 +460,17 @@ describe("the BLOCKED pill retracts on evidence of movement, with no dismissal",
 
   // ── THE PROBE'S CASE: THE PILL MUST NOT GO OUT ON THE EVENT THAT RAISED IT ──────────────────
   //
-  // `hookEvents` maps an `AskUserQuestion` PreToolUse to `waiting` and an `ExitPlanMode` one to
+  // `hookEvents` maps an `AskUserQuestion` PreToolUse to `questions` and an `ExitPlanMode` one to
   // `approval` — those tools fire their PreToolUse and then Claude SITS THERE, with no Stop and no
-  // Notification to follow. `fleet.rs` reduces a tick to the LAST event only and carries no tool
-  // name for it, so a burst of tool calls that ends on a picker arrives here as one bare
-  // `PreToolUse` — and counting that as movement retracted the pill at the exact moment the agent
-  // was waiting on the human. The whole feature inverted, silently, in its worst case.
+  // Notification to follow. So a burst of tool calls ending on a picker must not read as the agent
+  // moving on: counting it as movement retracted the pill at the exact moment the agent was waiting
+  // on the human. The whole feature inverted, silently, in its worst case.
+  //
+  // THIS TEST'S PREMISE CHANGED AND ITS VERDICT DID NOT. It used to read "`fleet.rs` reduces a tick
+  // to the LAST event only and carries no tool name for it, so a picker arrives here as one BARE
+  // `PreToolUse`". It carries one now (`HookFacts.lastEventTool`), so the fixture NAMES the tool —
+  // which is what this test's title always claimed and could not express before. The bare case is
+  // still covered, and is now a "cannot tell" that also fails closed.
   it("does NOT clear on the AskUserQuestion PreToolUse that IS the block", () => {
     const p = projectOf("p1", "sparkle-desktop", [tab("asker")]);
     const ledger = emptyLedger();
@@ -414,7 +488,7 @@ describe("the BLOCKED pill retracts on evidence of movement, with no dismissal",
     rerender(
       <ConciergeHost
         feed={tickAt([p], asking, T0 + 10_000, ledger, {
-          asker: acted("PreToolUse", T0 + 8_000),
+          asker: acted("PreToolUse", T0 + 8_000, MAIN, { lastEventTool: "AskUserQuestion" }),
         })}
       />,
     );

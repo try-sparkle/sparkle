@@ -1216,7 +1216,16 @@ describe("publishing artifact movement", () => {
     // worktree — including the human, in the very scenario this feature is written around — so it is
     // not attributable to the agent. See engine/movementRetraction's header.
     expect(spies.publishMovement).toHaveBeenCalledWith({
-      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "s1", toolsRecent: 4 },
+      a1: {
+        lastEvent: "PostToolUse",
+        lastEventMs: NOW - 1_000,
+        sessionId: "s1",
+        toolsRecent: 4,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
+      },
     });
   });
 
@@ -1242,7 +1251,16 @@ describe("publishing artifact movement", () => {
     const tick = await pollFleetOnce(deps);
     expect(tick.delivered).toEqual([]);
     expect(spies.publishMovement).toHaveBeenCalledWith({
-      a1: { lastEvent: "PreToolUse", lastEventMs: NOW - 2_000, sessionId: "s1", toolsRecent: 4 },
+      a1: {
+        lastEvent: "PreToolUse",
+        lastEventMs: NOW - 2_000,
+        sessionId: "s1",
+        toolsRecent: 4,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
+      },
     });
   });
 
@@ -1264,7 +1282,16 @@ describe("publishing artifact movement", () => {
     });
     await pollFleetOnce(deps);
     expect(spies.publishMovement).toHaveBeenCalledWith({
-      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "bg-oneshot", toolsRecent: 4 },
+      a1: {
+        lastEvent: "PostToolUse",
+        lastEventMs: NOW - 1_000,
+        sessionId: "bg-oneshot",
+        toolsRecent: 4,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
+      },
     });
   });
 

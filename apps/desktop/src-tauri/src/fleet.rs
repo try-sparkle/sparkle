@@ -89,6 +89,10 @@ struct HookLine {
     ts: Option<i64>,
     event: Option<String>,
     tool: Option<String>,
+    /// The `Notification` payload's text. Dropped at deserialization until 2026-09-09, which is why
+    /// `HookFacts` could not tell a permission prompt from Claude's idle ping — see
+    /// `last_event_message`.
+    message: Option<String>,
     session_id: Option<String>,
     transcript_path: Option<String>,
 }
@@ -102,6 +106,37 @@ pub struct HookFacts {
     pub last_event: Option<String>,
     /// Wall-clock the emitter observed the most recent event, epoch ms.
     pub last_event_ms: Option<i64>,
+    /// The most recent event's OWN `tool`, and the most recent event's OWN `message`.
+    ///
+    /// SCOPED TO `last_event`, WHICH IS WHY THEY ARE NOT GUARDED LIKE THE LAST-WINS FIELDS BELOW.
+    /// Every other field here answers "the newest value anyone told us", so it is guarded against a
+    /// later line that simply omits it. These two answer "what did THAT event carry", so a later
+    /// event MUST be able to clear them: a `Notification`'s message lingering onto the following
+    /// `PreToolUse` would say the tool call carried prose it never had.
+    ///
+    /// WHY THEY EXIST: `engine/hookEvents.hookEventToStatus` decides red-vs-not from exactly these
+    /// two — `PreToolUse` is a blocking picker only for `AskUserQuestion`/`ExitPlanMode` (the tool),
+    /// and a `Notification` is an approval prompt only when its message matches `PERMISSION_RE`
+    /// (79.5% of them on this machine do NOT). Without them a digest consumer can only classify by
+    /// event NAME, which is wrong for two of the three agents in bead sparkle-xndaze.
+    pub last_event_tool: Option<String>,
+    /// See `last_event_tool`.
+    pub last_event_message: Option<String>,
+    /// Most recent turn OPENER (`SessionStart`/`UserPromptSubmit`) and turn CLOSER (`Stop`/
+    /// `SessionEnd`), epoch ms. Raw timestamps, deliberately NOT reduced to a verdict here.
+    ///
+    /// `HookStatusEngine` carries one piece of history the pure classifier cannot: once the turn has
+    /// closed, a trailing `PreToolUse`/`PostToolUse` from a background subagent leaves the status
+    /// UNCHANGED rather than flipping it to `working`. A consumer holding only `last_event` cannot
+    /// replay that and would read a post-`Stop` tool call as the agent working. These two let it
+    /// derive `turnClosed` — `close > open` — from the same stream, so there is still exactly ONE
+    /// classifier and it lives in TypeScript.
+    ///
+    /// `last_turn_close_ms` is NOT `last_turn_end_ms` below: that one is `Stop` alone and has other
+    /// readers (delivery, goal continuation) whose meaning must not change under them.
+    pub last_turn_open_ms: Option<i64>,
+    /// See `last_turn_open_ms`.
+    pub last_turn_close_ms: Option<i64>,
     /// Claude Code session id, needed to correlate with a transcript.
     pub session_id: Option<String>,
     /// Absolute path to the session transcript JSONL. Arrives free on `Stop` lines and is the
@@ -267,6 +302,22 @@ pub fn parse_hook_tail(bytes: &[u8], truncated: bool, now_ms: i64, window_ms: i6
     let text = String::from_utf8_lossy(bytes);
     let cutoff = now_ms.saturating_sub(window_ms);
 
+    // THE TURN BOUNDARY IS TRACKED PER SESSION, because the log is keyed by WORKTREE.
+    //
+    // Folding it last-wins over every line would let ANY other `claude` process sharing this
+    // worktree move the boundary the UI reads — and a background one-shot emits `SessionEnd` BY
+    // CONSTRUCTION, so it would routinely stamp a newer "close" over a main session whose turn is
+    // genuinely still open. The consumer uses `close > open` to decide whether an idle
+    // `Notification` is trustworthy, and its TRUE branch RETRACTS a red, so a foreign boundary
+    // there silences a live ask. Every other fact this digest carries about the last event is
+    // scoped to that event's own session; this must be too.
+    let mut open_by_session: HashMap<Option<String>, i64> = HashMap::new();
+    let mut close_by_session: HashMap<Option<String>, i64> = HashMap::new();
+    // Which session the LAST event belongs to — scoped to `last_event` exactly like
+    // `last_event_tool` / `last_event_message`, and deliberately NOT `facts.session_id`, which is
+    // last-NON-EMPTY-wins and so can name a different session than the final line.
+    let mut last_event_session: Option<String> = None;
+
     for (i, line) in text.lines().enumerate() {
         // A truncated read begins mid-line; that fragment is not a record.
         if truncated && i == 0 {
@@ -289,6 +340,27 @@ pub fn parse_hook_tail(bytes: &[u8], truncated: bool, now_ms: i64, window_ms: i6
         facts.last_event = Some(event.clone());
         if let Some(ts) = parsed.ts {
             facts.last_event_ms = Some(ts);
+        }
+        // ASSIGNED UNCONDITIONALLY, unlike every guarded field around them — these belong to
+        // `last_event`, so a newer event with no tool/message must CLEAR them rather than inherit
+        // the previous event's. See the field docs.
+        facts.last_event_tool = parsed.tool.clone().filter(|s| !s.is_empty());
+        facts.last_event_message = parsed.message.clone().filter(|s| !s.is_empty());
+        let line_session = parsed.session_id.clone().filter(|s| !s.is_empty());
+        last_event_session = line_session.clone();
+        // Turn boundary, for the `turnClosed` rule `HookStatusEngine` applies — recorded AGAINST
+        // THIS LINE'S OWN SESSION, never folded across the worktree. A line with no `ts` cannot
+        // move a boundary.
+        if let Some(ts) = parsed.ts {
+            match event.as_str() {
+                "SessionStart" | "UserPromptSubmit" => {
+                    open_by_session.insert(line_session, ts);
+                }
+                "Stop" | "SessionEnd" => {
+                    close_by_session.insert(line_session, ts);
+                }
+                _ => {}
+            }
         }
         if let Some(sid) = parsed.session_id.filter(|s| !s.is_empty()) {
             facts.session_id = Some(sid);
@@ -323,6 +395,13 @@ pub fn parse_hook_tail(bytes: &[u8], truncated: bool, now_ms: i64, window_ms: i6
             _ => {}
         }
     }
+    // Publish only the boundary belonging to the SAME session as `last_event`. A background
+    // one-shot's `Stop`/`SessionEnd` therefore cannot tell the consumer that the main agent's turn
+    // has closed — which would re-open exactly the silencing the consumer's mid-turn gate exists to
+    // close.
+    facts.last_turn_open_ms = open_by_session.get(&last_event_session).copied();
+    facts.last_turn_close_ms = close_by_session.get(&last_event_session).copied();
+
     facts
 }
 
@@ -2032,6 +2111,152 @@ mod tests {
         assert_eq!(f.lines_scanned, 1, "it is still a record");
         assert_eq!(f.tools_recent, 0, "but it cannot be placed in the window");
         assert_eq!(f.last_event_ms, None);
+    }
+
+    /// The discriminant `hookEventToStatus` actually reads. Classifying by event NAME alone is
+    /// wrong for two of the three agents in bead sparkle-xndaze: a `PreToolUse` is a blocking
+    /// picker only for `AskUserQuestion`/`ExitPlanMode`, and a `Notification` is an approval prompt
+    /// only when its message says so.
+    #[test]
+    fn carries_the_last_events_own_tool_and_message() {
+        let now = 1_000_000i64;
+        let log = [
+            line(now - 3_000, "PreToolUse", r#""tool":"Bash""#),
+            line(now - 1_000, "Notification", r#""message":"Claude needs your permission""#),
+        ]
+        .join("\n");
+
+        let f = parse_hook_tail(log.as_bytes(), false, now, 10_000);
+
+        assert_eq!(f.last_event.as_deref(), Some("Notification"));
+        assert_eq!(f.last_event_message.as_deref(), Some("Claude needs your permission"));
+        // The EARLIER event's tool must not ride along on the Notification.
+        assert_eq!(
+            f.last_event_tool, None,
+            "a Notification carries no tool; inheriting the previous event's would make a picker \
+             out of a prompt"
+        );
+    }
+
+    /// THE ANTI-LINGER ASSERTION. Every other field on `HookFacts` is guarded so a later line that
+    /// omits it cannot erase what an earlier one said. These two are the exception, and this is the
+    /// test that fails if someone "fixes" them to match their neighbours: they are scoped to
+    /// `last_event`, so a newer event with no message MUST clear the old one — otherwise a stale
+    /// "needs your permission" makes every subsequent tool call read as an approval prompt.
+    #[test]
+    fn a_newer_event_clears_the_previous_events_tool_and_message() {
+        let now = 1_000_000i64;
+        let log = [
+            line(now - 3_000, "Notification", r#""message":"Claude needs your permission""#),
+            line(now - 2_000, "PreToolUse", r#""tool":"AskUserQuestion""#),
+            line(now - 1_000, "Stop", ""),
+        ]
+        .join("\n");
+
+        let f = parse_hook_tail(log.as_bytes(), false, now, 10_000);
+
+        assert_eq!(f.last_event.as_deref(), Some("Stop"));
+        assert_eq!(f.last_event_tool, None, "the AskUserQuestion tool must not survive the Stop");
+        assert_eq!(f.last_event_message, None, "the permission message must not survive the Stop");
+    }
+
+    /// The turn boundary a consumer needs to replay `HookStatusEngine`'s `turnClosed` rule, under
+    /// which a trailing `PreToolUse` leaves the status unchanged instead of reading as work.
+    #[test]
+    fn tracks_the_turn_boundary_separately_from_last_turn_end() {
+        let now = 1_000_000i64;
+        let log = [
+            line(now - 5_000, "UserPromptSubmit", ""),
+            line(now - 4_000, "Stop", ""),
+            line(now - 3_000, "SessionEnd", ""),
+        ]
+        .join("\n");
+
+        let f = parse_hook_tail(log.as_bytes(), false, now, 10_000);
+
+        assert_eq!(f.last_turn_open_ms, Some(now - 5_000));
+        // SessionEnd closes the turn...
+        assert_eq!(f.last_turn_close_ms, Some(now - 3_000));
+        // ...but must NOT move `last_turn_end_ms`, which is `Stop` alone and has other readers.
+        assert_eq!(
+            f.last_turn_end_ms,
+            Some(now - 4_000),
+            "last_turn_end_ms is the most recent Stop; widening it would change delivery's meaning"
+        );
+    }
+
+    /// A turn REOPENED after closing: `close > open` is false, so a consumer reads the turn as open
+    /// and a following tool call as genuine work.
+    /// THE BOUNDARY BELONGS TO THE LAST EVENT'S OWN SESSION, never to whatever else shares the
+    /// worktree's log (roborev job 82352).
+    ///
+    /// The consumer decides from `close > open` whether an idle `Notification` is trustworthy, and
+    /// its TRUE branch RETRACTS a red — so a foreign boundary there silences a LIVE ask. A
+    /// background one-shot `claude` emits `SessionEnd` BY CONSTRUCTION, which makes this the
+    /// routine case rather than an exotic one: main session A opens a picker mid-turn, a one-shot
+    /// finishes beside it, and A's own later idle ping must still read as MID-TURN.
+    #[test]
+    fn the_turn_boundary_is_scoped_to_the_last_events_session() {
+        let now = 1_000_000i64;
+        let log = [
+            // Session A starts a turn and blocks on a picker — A's turn is OPEN.
+            line(now - 9_000, "UserPromptSubmit", r#""session_id":"A""#),
+            line(now - 8_000, "PreToolUse", r#""tool":"AskUserQuestion","session_id":"A""#),
+            // A background one-shot runs and exits in the SAME worktree log.
+            line(now - 7_000, "SessionStart", r#""session_id":"B""#),
+            line(now - 6_000, "SessionEnd", r#""session_id":"B""#),
+            // ~60s into the unanswered wait, A pings. This is the last event, and it is A's.
+            line(now - 1_000, "Notification", r#""message":"Claude is waiting for your input","session_id":"A""#),
+        ]
+        .join("\n");
+
+        let f = parse_hook_tail(log.as_bytes(), false, now, 100_000);
+
+        assert_eq!(f.last_event.as_deref(), Some("Notification"));
+        assert_eq!(f.last_turn_open_ms, Some(now - 9_000), "A's own prompt opened its turn");
+        assert_eq!(
+            f.last_turn_close_ms, None,
+            "the one-shot's SessionEnd is session B's; borrowing it would tell the consumer A's \
+             turn had closed, and a mid-turn idle ping would then retract A's live picker"
+        );
+    }
+
+    /// The paired POSITIVE: the SAME shape once the close really is the last event's own session.
+    #[test]
+    fn the_turn_boundary_is_taken_when_it_is_the_same_session() {
+        let now = 1_000_000i64;
+        let log = [
+            line(now - 9_000, "UserPromptSubmit", r#""session_id":"A""#),
+            line(now - 6_000, "Stop", r#""session_id":"A""#),
+            line(now - 1_000, "Notification", r#""message":"Claude is waiting for your input","session_id":"A""#),
+        ]
+        .join("\n");
+
+        let f = parse_hook_tail(log.as_bytes(), false, now, 100_000);
+
+        assert_eq!(f.last_turn_open_ms, Some(now - 9_000));
+        assert_eq!(f.last_turn_close_ms, Some(now - 6_000), "A's own Stop DID close A's turn");
+        assert!(f.last_turn_close_ms > f.last_turn_open_ms, "so the ping is the honest idle case");
+    }
+
+    #[test]
+    fn a_new_prompt_reopens_the_turn() {
+        let now = 1_000_000i64;
+        let log = [
+            line(now - 5_000, "Stop", ""),
+            line(now - 4_000, "UserPromptSubmit", ""),
+            line(now - 3_000, "PreToolUse", r#""tool":"Bash""#),
+        ]
+        .join("\n");
+
+        let f = parse_hook_tail(log.as_bytes(), false, now, 10_000);
+
+        assert_eq!(f.last_turn_close_ms, Some(now - 5_000));
+        assert_eq!(f.last_turn_open_ms, Some(now - 4_000));
+        assert!(
+            f.last_turn_open_ms > f.last_turn_close_ms,
+            "the prompt reopened the turn, so the Bash call is work rather than a trailing subagent"
+        );
     }
 
     #[test]

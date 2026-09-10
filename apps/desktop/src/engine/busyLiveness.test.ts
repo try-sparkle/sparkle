@@ -11,7 +11,17 @@ const NOW = 1_000_000_000_000;
 
 /** A movement snapshot whose last event fired `ageMs` before NOW. */
 function ev(ageMs: number, over: Partial<MovementEvidence> = {}): MovementEvidence {
-  return { lastEvent: "PostToolUse", lastEventMs: NOW - ageMs, sessionId: "s", toolsRecent: 1, ...over };
+  return {
+    lastEvent: "PostToolUse",
+    lastEventMs: NOW - ageMs,
+    sessionId: "s",
+    toolsRecent: 1,
+    lastEventTool: null,
+    lastEventMessage: null,
+    lastTurnOpenMs: null,
+    lastTurnCloseMs: null,
+    ...over,
+  };
 }
 
 const agents = (...ids: string[]) => ids.map((id) => ({ id }));

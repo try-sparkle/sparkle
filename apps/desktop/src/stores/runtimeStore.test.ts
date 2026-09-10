@@ -1369,7 +1369,15 @@ describe("setAgentMovement — the equality gate must see every field it carries
   // working agent from a stalled one, and freezing it restores the false-escalation flood it fixes.
   it("stores a tick where ONLY the tool count moved", async () => {
     const useRuntimeStore = await freshStore();
-    const base = { lastEvent: "Stop", lastEventMs: 1_000, sessionId: "s1" };
+    const base = {
+      lastEvent: "Stop",
+      lastEventMs: 1_000,
+      sessionId: "s1",
+      lastEventTool: null,
+      lastEventMessage: null,
+      lastTurnOpenMs: null,
+      lastTurnCloseMs: null,
+    };
 
     useRuntimeStore.getState().setAgentMovement({ a1: { ...base, toolsRecent: 4 } });
     useRuntimeStore.getState().setAgentMovement({ a1: { ...base, toolsRecent: 41 } });
@@ -1381,7 +1389,18 @@ describe("setAgentMovement — the equality gate must see every field it carries
     // The pair. Without it the test above is satisfied by deleting the comparison entirely, which
     // would re-render every subscriber on every poll — the cost this gate exists to avoid.
     const useRuntimeStore = await freshStore();
-    const reading = { a1: { lastEvent: "Stop", lastEventMs: 1_000, sessionId: "s1", toolsRecent: 4 } };
+    const reading = {
+      a1: {
+        lastEvent: "Stop",
+        lastEventMs: 1_000,
+        sessionId: "s1",
+        toolsRecent: 4,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
+      },
+    };
 
     useRuntimeStore.getState().setAgentMovement(reading);
     const first = useRuntimeStore.getState().agentMovement;

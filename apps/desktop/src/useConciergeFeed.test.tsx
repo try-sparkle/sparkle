@@ -9,7 +9,10 @@ import { useConciergeFeed, selectAndOpen } from "./useConciergeFeed";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSparklePrefsStore } from "./stores/sparklePrefsStore";
-import { resetRetractionLedgerForTests } from "./engine/movementRetraction";
+import {
+  resetRetractionLedgerForTests,
+  type MovementEvidence,
+} from "./engine/movementRetraction";
 import { __setAuthRecoveryDeps, pollNudgeFlags } from "./services/authRecovery";
 import { noteThrashEvent, resetThrashTracking, NUDGE_LOOP_LIMIT } from "./engine/agentThrash";
 import type { AgentTab, Project } from "./types";
@@ -102,12 +105,47 @@ describe("movement retraction is wired through the hook", () => {
    *  mounted pane behaves — AgentPane is the only writer of `status`. */
   const frozenBlocked = () => useRuntimeStore.setState({ status: { a1: "blocked", b1: "working" } });
 
-  const moved = (atMs: number) =>
+  const digest = (over: Partial<MovementEvidence>) =>
     act(() => {
       useRuntimeStore.getState().setAgentMovement({
-        a1: { lastEvent: "PostToolUse", lastEventMs: atMs, sessionId: null, toolsRecent: null },
+        a1: {
+          lastEvent: "PostToolUse",
+          lastEventMs: T0,
+          // THE SESSION IS NAMED, and it must be: `noteMovement` refuses evidence that cannot
+          // POSITIVELY NAME the session the episode adopted (roborev job 82275) — being let past
+          // the permissive session gate is not proof of ownership. These fixtures used to pass
+          // `null`, which reached the movement capture WITHOUT adopting anything, and that
+          // fail-open is what made a single tick enough below. A real digest always carries a
+          // session (0 of 112,628 hook lines on this machine omit one), so the null was expressing
+          // a state the wire does not produce.
+          sessionId: "sess-a1",
+          toolsRecent: null,
+          lastEventTool: null,
+          lastEventMessage: null,
+          lastTurnOpenMs: T0,
+          lastTurnCloseMs: null,
+          ...over,
+        },
       });
     });
+
+  /**
+   * The agent acted at `atMs` — as TWO digest ticks, because that is what the wire does.
+   *
+   * ADOPTION COSTS ONE TICK, by design (`movementRetraction` header: the episode adopts the first
+   * session it sees and the adopting evidence never also counts as movement, so a background
+   * one-shot cannot take the lock and retract in the same pass). So the first tick here is the
+   * agent's own ask — what its log actually holds at the instant the red goes up — and the second
+   * is the work. A single tick would only ever have retracted through the fail-open above.
+   */
+  const moved = (atMs: number) => {
+    digest({
+      lastEvent: "Notification",
+      lastEventMs: T0 - 1_000,
+      lastEventMessage: "Claude needs your permission",
+    });
+    digest({ lastEvent: "PostToolUse", lastEventMs: atMs });
+  };
 
   it("de-escalates a frozen red once the digest shows the agent acted after it", () => {
     frozenBlocked();

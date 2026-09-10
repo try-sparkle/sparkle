@@ -452,8 +452,26 @@ describe("controlListener", () => {
     // ago. Live worker: last hook 20 s ago.
     const now = Date.now();
     useRuntimeStore.getState().setAgentMovement({
-      [deadId]: { lastEvent: "PostToolUse", lastEventMs: now - 30 * 60_000, sessionId: "s1", toolsRecent: 3 },
-      [liveId]: { lastEvent: "PostToolUse", lastEventMs: now - 20_000, sessionId: "s2", toolsRecent: 3 },
+      [deadId]: {
+        lastEvent: "PostToolUse",
+        lastEventMs: now - 30 * 60_000,
+        sessionId: "s1",
+        toolsRecent: 3,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
+      },
+      [liveId]: {
+        lastEvent: "PostToolUse",
+        lastEventMs: now - 20_000,
+        sessionId: "s2",
+        toolsRecent: 3,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
+      },
     });
     fire({ reqId: "live1", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
     await flush();

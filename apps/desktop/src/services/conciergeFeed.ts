@@ -671,6 +671,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   // cannot un-retract it (the `Stop`-overwrites-the-work-event case).
   const ledger = input.retraction;
   const nowMs = input.nowMs ?? Date.now();
+  const evidenceOf = (id: string): MovementEvidence | undefined => input.agentMovement?.[id];
   if (ledger !== undefined) {
     noteRedEpochs(
       ledger,
@@ -679,7 +680,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       nowMs,
       allAgents.map((a) => a.id),
     );
-    noteMovement(ledger, (id) => input.agentMovement?.[id], nowMs);
+    noteMovement(ledger, evidenceOf, nowMs);
   }
   const retractedStatus =
     ledger === undefined

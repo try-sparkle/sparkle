@@ -482,6 +482,12 @@ export function movementFrom(agents: readonly FleetAgentFacts[]): Record<string,
     out[f.agentId] = {
       lastEvent: f.hooks.lastEvent,
       lastEventMs: f.hooks.lastEventMs,
+      // NORMALISED TO null HERE, once, so the engine never has to ask whether a field was absent
+      // (an older backend) or explicitly null (this one). Both mean "we did not look".
+      lastEventTool: f.hooks.lastEventTool ?? null,
+      lastEventMessage: f.hooks.lastEventMessage ?? null,
+      lastTurnOpenMs: f.hooks.lastTurnOpenMs ?? null,
+      lastTurnCloseMs: f.hooks.lastTurnCloseMs ?? null,
       sessionId: f.hooks.sessionId,
       // Carried for `engine/goalContinuation.progressMark`, not for retraction — see the field's
       // note on MovementEvidence. This is the ONLY place the digest's tool count can cross into the

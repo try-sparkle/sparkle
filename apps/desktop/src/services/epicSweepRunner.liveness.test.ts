@@ -356,6 +356,10 @@ describe("against the real stores", () => {
         lastEventMs: NOW - 121 * HOUR,
         sessionId: "s1",
         toolsRecent: 0,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
       },
     });
     const s = scenario({ alive: undefined, useRealSeams: true });
@@ -364,7 +368,7 @@ describe("against the real stores", () => {
 
   it("…and does not restart when that same map says the orchestrator just acted", async () => {
     useRuntimeStore.getState().setAgentMovement({
-      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 30_000, sessionId: "s1", toolsRecent: 4 },
+      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 30_000, sessionId: "s1", toolsRecent: 4, lastEventTool: null, lastEventMessage: null, lastTurnOpenMs: null, lastTurnCloseMs: null, }
     });
     const s = scenario({ alive: undefined, useRealSeams: true });
     expect(forEpic(await s.run())?.reason).toBe("orchestrator-alive");
@@ -390,6 +394,10 @@ describe("against the real stores", () => {
         lastEventMs: NOW - 121 * HOUR,
         sessionId: "s1",
         toolsRecent: 0,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
       },
     });
     const s = scenario({ alive: true, status: "waiting", useRealSeams: true });
@@ -417,6 +425,10 @@ describe("against the real stores", () => {
         lastEventMs: NOW - 121 * HOUR,
         sessionId: "s1",
         toolsRecent: 0,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
       },
     });
     // No grid entry at all, so the death record is the only witness — and it is read from the real
@@ -438,6 +450,10 @@ describe("against the real stores", () => {
         lastEventMs: NOW - 121 * HOUR,
         sessionId: "s1",
         toolsRecent: 0,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
       },
     });
     noteAgentDeath("a1", "transport-transient");
@@ -453,6 +469,10 @@ describe("against the real stores", () => {
         lastEventMs: NOW - 121 * HOUR,
         sessionId: "s1",
         toolsRecent: 0,
+        lastEventTool: null,
+        lastEventMessage: null,
+        lastTurnOpenMs: null,
+        lastTurnCloseMs: null,
       },
     });
     noteAgentDeath("a1", "wall-spend");

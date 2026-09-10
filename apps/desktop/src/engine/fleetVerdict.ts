@@ -44,6 +44,28 @@
 export interface HookFacts {
   lastEvent: string | null;
   lastEventMs: number | null;
+  /**
+   * The most recent event's OWN tool and message — the discriminant `hookEventToStatus` reads.
+   * Classifying by event NAME alone is wrong: a `PreToolUse` blocks only for `AskUserQuestion` /
+   * `ExitPlanMode`, and a `Notification` is an approval prompt only when its message matches
+   * `PERMISSION_RE` (79.5% of them on this machine do not).
+   *
+   * OPTIONAL AND NULLABLE, unlike their neighbours, because they are newer than the oldest build
+   * that can be talking to this frontend: a digest from before 2026-09-09 omits them, and absent
+   * must read the same as null — "we did not look" — never as "there was no tool".
+   */
+  lastEventTool?: string | null;
+  /** See {@link HookFacts.lastEventTool}. */
+  lastEventMessage?: string | null;
+  /**
+   * Most recent turn opener / closer, epoch ms. Together they give `turnClosed` (`close > open`),
+   * the one piece of history `hookEventToStatus` cannot carry: after the turn closes, a trailing
+   * background-subagent `PreToolUse`/`PostToolUse` leaves the status UNCHANGED rather than reading
+   * as work. Same optionality, and for the same reason, as the two fields above.
+   */
+  lastTurnOpenMs?: number | null;
+  /** See {@link HookFacts.lastTurnOpenMs}. NOT `lastTurnEndMs`, which is `Stop` alone. */
+  lastTurnCloseMs?: number | null;
   sessionId: string | null;
   transcriptPath: string | null;
   lastTurnEndMs: number | null;
