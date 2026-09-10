@@ -126,6 +126,8 @@ import {
   noteConfirmedAnswerDelivery,
 } from "../engine/blockedPromptGrace";
 import { pickerFingerprint } from "./pickerFingerprint";
+// The `person:` namespace test. See the R3 outbound guard in `routeConciergeAnswer`.
+import { isPersonAgentId } from "../engine/social";
 import {
   screenBlocksWrite,
   screenIsCredentialField,
@@ -166,6 +168,8 @@ export type ConciergeDispatchPath =
                      // `alternate-screen` because the remedy is different: answer what is on screen,
                      // rather than quit the full-screen app.
   | "unauthorized" // no valid DispatchAuthority — nobody declared why this may be sent (NOT delivered)
+  | "person-not-promptable" // the target is a PERSON, not an agent — R3's outbound mirror. See the
+                            // guard in routeConciergeAnswer (NOT delivered, and never will be)
   | "pty-gone"; // the agent's PTY was dead (answer NOT delivered)
 
 export interface ConciergeDispatchResult {
@@ -295,6 +299,7 @@ export function wasSubmitted(r: Pick<ConciergeDispatchResult, "ok" | "path">): b
     case "alternate-screen":
     case "blocked-prompt":
     case "unauthorized":
+    case "person-not-promptable":
     case "pty-gone":
       return false;
     default: {
@@ -860,6 +865,33 @@ async function routeConciergeAnswer(
   if (!isDispatchAuthority(opts.authority)) {
     log.warn("concierge", "refused an un-authorized dispatch", { agentId });
     return { ok: false, path: "unauthorized", agentId };
+  }
+  // ══ R3's OUTBOUND MIRROR: A PERSON IS NEVER A PROMPT TARGET (bead sparkle-6baj6s) ══════════════
+  // Design §8 R3 states the INBOUND rule — a peer's chat text must never reach an agent's stdin,
+  // because shipped defaults auto-approve every permission category including bash, so that path is
+  // remote code execution on the recipient's Mac delivered by a stranger from the public directory.
+  // R3's own wording names the shape of the reverse: "so a future contributor wiring @mentions
+  // cannot do it accidentally."
+  //
+  // THIS IS THAT REVERSE. `socialStore.roster()` publishes people into the mention picker in the
+  // MentionAgent shape, carrying `canAcceptInput: true` — correct on its own terms, because a person
+  // can always RECEIVE a message (delivery is persist-then-fan-out, so availability is not a routing
+  // gate). But to the concierge that field means "can receive a PROMPT", and this function is the
+  // single door into a local PTY. Without this line the moment @Ada resolves to `person:<socialId>`
+  // she is handed to that door, and a message meant for a human is typed into an agent's terminal.
+  //
+  // IT IS KEYED ON THE ID, NEVER ON A `kind` FIELD — the same rule `mentions.ts` states for beads
+  // ("deriving the safety-critical answer from the id means a row that loses this field cannot
+  // become addressable by accident"). `isPersonAgentId` is false for a bare agent UUID and for
+  // `__sparkle_self__`, so the three id spaces stay disjoint by construction.
+  //
+  // AND IT LIVES AT THE CHOKEPOINT, NOT IN A CALLER. sparkle-6baj6s says so explicitly, from
+  // measurement: the screen guard was built in a caller twice and inherited by neither of the next
+  // two callers. A person route belongs in ConciergeHost — which sends her a DM instead — and this
+  // is the belt for every caller that has not been taught the difference.
+  if (isPersonAgentId(agentId)) {
+    log.warn("concierge", "refused a dispatch aimed at a person", { agentId });
+    return { ok: false, path: "person-not-promptable", agentId };
   }
   // The audit line the union exists to make possible: a "why did it type that?" complaint resolves
   // to the gesture that permitted the write, not to a guess. `debug` because it is per-send and

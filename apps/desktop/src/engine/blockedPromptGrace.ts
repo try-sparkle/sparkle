@@ -229,6 +229,7 @@ export function answerOutcomeForPath(path: ConciergeDispatchPath): PromptAnswerO
     case "trial-spent": // the server refused before delivery
     case "cloud-agent": // must be answered in its own pane, where the question is readable
     case "empty": // nothing to send
+    case "person-not-promptable": // the target is a human, not an agent — R3's outbound mirror
       return "declined";
     // COULD NOT REACH IT. No decision was made; the write had nowhere to go, or going there would
     // have been unsafe. This is the arm the founder called out — it is common, and it must never be

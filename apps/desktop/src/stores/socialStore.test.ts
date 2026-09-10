@@ -224,6 +224,11 @@ describe("socialStore — selectors", () => {
         projectName: "",
         band: "running",
         canAcceptInput: true,
+        // The UNIQUE key, carried so `withMentionLabels` can tell two people with the same DISPLAY
+        // NAME apart: `personName` is `displayName || username` and only the username is unique
+        // (roborev 82277). Asserted as part of the exact shape, so dropping it reds here rather
+        // than surfacing as `@Dan` silently reaching the wrong human.
+        handle: "ada",
       },
     ]);
     // The id is the mount id, NOT the raw social id — every downstream mention consumer routes on it.

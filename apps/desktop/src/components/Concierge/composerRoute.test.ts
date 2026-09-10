@@ -23,6 +23,7 @@ import {
   rosterFromMentions,
 } from "./mentions";
 import type { ConciergeMention } from "./mentions";
+import { personAgentId } from "../../engine/social";
 
 const KRAKEN: ConciergeMention = { agentId: "ag2", name: "Kraken Auth" };
 const BLUEPRINT: ConciergeMention = { agentId: "ag1", name: "Blueprint UI/UX" };
@@ -295,5 +296,83 @@ describe("classifyComposerRoute — clause 5: a bead is a subject, in every posi
     const wire = mentionFreeText(text, rosterFromMentions([BEAD]));
     expect(wire).toBe("RE: Chat button on every bead card (sparkle-1cpomd) what is left here?");
     expect(carriesSigil(wire)).toBe(false);
+  });
+});
+
+// ══ CLAUSE 5: AN ADDRESSED PERSON IS A CHAT MESSAGE, NOT A PROMPT ═════════════════════════════
+// (bead sparkle-6baj6s; design line 41, "`@mention`ing a username TO SEND A MESSAGE".)
+//
+// WHY A DEGENERATE IMPLEMENTATION WOULD PASS HALF OF THIS. `agent` is the DEFAULT arm — everything
+// that is not the concierge sentinel falls into it — so before the person arm existed a leading
+// `@Ada` produced `{kind: "agent", agentId: "person:soc-ada"}`, which typechecks, reads plausibly
+// in a debugger, and hands a human's id to the one door into a local PTY. So every row below is
+// stated as a PAIR against the agent arm: the same shaped input with a person id and with an
+// ordinary id, which no single-arm implementation can satisfy at once.
+describe("classifyComposerRoute — clause 5: a person is routed to chat, never to a terminal", () => {
+  const ADA: ConciergeMention = { agentId: personAgentId("soc-ada"), name: "Ada" };
+
+  it("routes a leading @person to the person arm, where the same shape with an agent id routes to the terminal", () => {
+    expect(route("@Ada can you look at this?", [ADA], null)).toEqual({
+      kind: "person",
+      agentId: "person:soc-ada",
+      socialId: "soc-ada",
+      via: "address",
+    });
+    // THE OTHER HALF OF THE PAIR. An implementation returning `person` for everything passes the
+    // row above; this is what it cannot also satisfy.
+    expect(route("@Kraken Auth can you look at this?", [KRAKEN], null)).toEqual({
+      kind: "agent",
+      agentId: "ag2",
+      via: "address",
+    });
+  });
+
+  // THE SOCIAL ID IS CARRIED, NOT RE-DERIVED. The transport addresses `socialId` while every mention
+  // surface keys on the `person:` mount id, and a consumer slicing one out of the other is how two
+  // surfaces come to disagree about who a message went to.
+  it("carries both ids, and the socialId is the mount id without its namespace", () => {
+    const r = route("@Ada hi", [ADA], null);
+    expect(r).toMatchObject({ kind: "person", socialId: "soc-ada", agentId: "person:soc-ada" });
+  });
+
+  // POSITION STILL DECIDES, exactly as it does for an agent: a name that does not LEAD is the
+  // sentence's subject, not its envelope. Without this the rule would divert any message merely
+  // MENTIONING a person, which is the "Why is @Kraken Auth just sitting there?" case one clause up.
+  it("does not route a mid-sentence person mention", () => {
+    expect(route("what did @Ada say about this?", [ADA], null)).toEqual({
+      kind: "sparkle",
+      via: "default",
+    });
+  });
+
+  // THE MOUNT ARM ASKS THE SAME QUESTION. Nothing puts a person on the cable pin today, so this is
+  // unreachable in the shipping app — but "unreachable" is a property of a DIFFERENT file, and the
+  // failure if that ever changes is a silent write into a terminal rather than a crash. Pinned so
+  // the two arms cannot drift apart.
+  it("routes a MOUNTED person to the person arm too", () => {
+    expect(route("plain text", [], personAgentId("soc-ada"))).toEqual({
+      kind: "person",
+      agentId: "person:soc-ada",
+      socialId: "soc-ada",
+      via: "mount",
+    });
+    // The pair: an ordinary mounted id is untouched by the person arm.
+    expect(route("plain text", [], MOUNT)).toEqual({
+      kind: "agent",
+      agentId: MOUNT,
+      via: "mount",
+    });
+  });
+
+  // THE BARE PREFIX NAMES NOBODY (`isPersonAgentId` is false for it), so it must NOT take the person
+  // arm — this pins that the rule reads the namespace helper rather than doing its own `startsWith`,
+  // which would hand the transport an empty socialId to address.
+  it("does not treat the bare prefix as a person", () => {
+    const BARE: ConciergeMention = { agentId: "person:", name: "Nobody" };
+    expect(route("@Nobody hi", [BARE], null)).toEqual({
+      kind: "agent",
+      agentId: "person:",
+      via: "address",
+    });
   });
 });

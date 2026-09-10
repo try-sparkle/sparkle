@@ -26,6 +26,7 @@
 import { create } from "zustand";
 
 import { personAgentId, type Availability, type Visibility } from "../engine/social";
+import { personMentionName } from "../components/Concierge/mentions";
 import type { MentionAgent } from "../components/Concierge/mentions";
 
 /** How the viewer stands to a person. `stranger` is a real, addressable state (§6.1 `state='none'`),
@@ -364,11 +365,22 @@ export function personName(person: Pick<Person, "username" | "displayName">): st
 export function roster(people: Record<string, Person>): MentionAgent[] {
   return peopleList(people).map((p) => ({
     id: personAgentId(p.socialId),
-    name: personName(p),
+    // NOT `personName(p)` — an ADDRESS, not a display name (roborev 82360). `personName` returns the
+    // peer's own free-form `displayName` verbatim, and `labelOf` makes that string the thing the
+    // composer matches on, so a name like `Dan @ Acme` puts a second sigil inside the address and
+    // breaks `mentionQuery`'s backward scan exactly as the disambiguation suffix did. Normalised at
+    // this seam, on the same rules `beadMentionLabel` applies to the other free-form roster kind.
+    // `personName` stays what it is for every surface that wants the name to READ as the peer wrote
+    // it; only the address is normalised.
+    name: personMentionName(p.displayName, p.username),
     projectId: "",
     projectName: "",
     band: "running" as const,
     canAcceptInput: true,
+    // THE UNIQUE KEY, carried so `withMentionLabels` can tell two people with the same DISPLAY NAME
+    // apart. `personName` is `displayName || username` and only the username is unique; without
+    // this, `@Dan` silently resolves to whichever of two Dans sorted first (roborev 82277).
+    handle: p.username,
   }));
 }
 

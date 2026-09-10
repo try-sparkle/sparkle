@@ -43,6 +43,8 @@
 // an intent and counts down in the banner with a Cancel, exactly like a router-decided one (see
 // ConciergeHost's `deliver`). Explicitness buys the user a skipped classify, never a skipped gate.
 import type { StatusBand } from "../../engine/buildSections";
+// A person's rows disambiguate on their unique username — see `withMentionLabels`.
+import { isPersonAgentId, socialIdFromPersonAgentId } from "../../engine/social";
 
 /** One agent the picker can offer. A projection of `ConciergeAgent` (services/conciergeFeed), not
  *  that record itself: this module is pure, and the picker needs four fields out of thirty. */
@@ -76,7 +78,21 @@ export interface MentionAgent {
    *
    *  This exists for the surfaces that DRAW a row (the picker's copy and icon), where re-deriving
    *  bead-ness from a string prefix at paint time would be coupling that drifts. */
-  kind?: "agent" | "bead";
+  kind?: "agent" | "bead" | "person";
+  /**
+   * A GLOBALLY UNIQUE handle for a row that has one — today, a person's `username`.
+   *
+   * It exists because {@link withMentionLabels} disambiguates an AGENT with its `projectName`, and a
+   * person has none. Without this, two people whose DISPLAY NAMES match are both relabelled to the
+   * identical string, `findMentionSpans` claims whichever sorted first, and `@Dan` silently DMs the
+   * wrong human — availability ordering means the winner even FLIPS when one goes offline. A display
+   * name is not unique; a username is (the registry enforces it, §S1), which is what makes this the
+   * disambiguator rather than a nicety.
+   *
+   * OPTIONAL, so every existing construction of this shape is untouched. A person row without one
+   * simply keeps its bare name — the same degradation a project-less agent gets.
+   */
+  handle?: string;
 }
 
 /** The text that addresses this agent. See {@link MentionAgent.label}. */
@@ -131,6 +147,147 @@ function labelOf(a: MentionAgent): string {
  * addressable. Exempting it from the count instead would leave both rows reading `Sparkle`, which is
  * the ambiguity this function exists to remove.
  */
+/**
+ * A PERSON'S ADDRESS MUST BE UNIQUE ACROSS THE ROSTER, not merely free of characters we thought to
+ * ban (roborev 82366 — the THIRD sighting of one class, so this is the seam rather than the next
+ * character).
+ *
+ * ══ WHY A DENYLIST OVER THE NAME CANNOT WORK ════════════════════════════════════════════════════
+ * The two rounds before this one each removed something a display name may contain: 82346 the sigil
+ * in the disambiguation JOINER, 82360 the sigil and the unbounded length in the OPERAND. Both are
+ * denylists over peer-controlled text, and a denylist is only ever correct for the cases its author
+ * thought of — which is why there was a third round. `display_name` is free-form text bounded only
+ * by 40 characters and NOTHING on the write path checks it, so the next round would have been the
+ * parentheses, and the one after that whatever spells an address next.
+ *
+ * The forgery it stops: `withMentionLabels` counts collisions on `a.name` alone and never looks at
+ * the FINAL addresses, so a peer who sets their display name to another pair's assigned label —
+ * `Dan (dana)`, where `dana` is somebody else's username — has a UNIQUE name, draws no suffix, and
+ * lands an address byte-identical to the real `Dan (dana)`. `findMentionSpans` orders spans by label
+ * LENGTH only (a stable sort), so equal-length labels keep roster order, `peopleList` sorts on
+ * availability first, and the overlap check discards the loser in silence. `@Dan (dana) ` then
+ * reaches whichever of the two is online, the aim FLIPS when one goes offline, and the receipt reads
+ * `Sent to Dan.` either way. That is roborev 82277's wrong-human DM, re-entered one door along.
+ *
+ * So uniqueness is made a property of the ROSTER. Any person sharing a final address with another
+ * row falls back to their USERNAME, which `USERNAME_FORMAT_RE` constrains to `[a-z0-9_]` and the
+ * registry keeps unique among people. Only the rows actually in a collision move, so the ordinary
+ * `@Ada` is untouched; and only PEOPLE are rewritten, because an agent and a bead reach their
+ * addresses by rules of their own.
+ *
+ * ══ THE PASS MUST VERIFY THE SET IT PRODUCES, NOT THE ONE IT WAS GIVEN (roborev 82369, 82370) ═══
+ * A first version counted addresses once and rewrote a colliding person onto their username without
+ * ever asking whether that username was free — so it could move a VICTIM onto a string another row
+ * already held, against somebody who cannot see or prevent it. RESERVED HANDLES fixed that among
+ * PEOPLE. They did not fix it against every other kind in the roster, and the next round showed the
+ * gap was not merely unfixed but newly EXPLOITABLE:
+ *
+ *   • The rewrite trigger is peer-controlled. Before reserved handles a person only moved when their
+ *     address was already shared, which needed a forged label. After them, a peer can force their
+ *     OWN rewrite by setting `display_name` to any other connection's username — so they choose the
+ *     moment they land on a string of their own picking.
+ *   • And `mentionRoster` puts people, agents, beads AND the concierge in ONE roster. The concierge
+ *     is deliberately exempt from suffixing, so its address is the bare `Sparkle`. A peer whose
+ *     username is `sparkle` could therefore be rewritten onto it — and this module's own header
+ *     calls that the one unrecoverable direction: *the way OUT of a mount must not be shadowed by
+ *     the thing being mounted to*. `@Sparkle` is what the founder types and what
+ *     `dictatedSparkleAddress` produces from speech.
+ *
+ * So the target is read out of the SAME occupancy map, and the concierge's address is reserved
+ * unconditionally. Two candidates are tried, each checked against every row of every kind, and a row
+ * MOVES ONLY ONTO A FREE STRING — otherwise it is left exactly as it was. Leaving an existing
+ * ambiguity in place is recoverable and is what the picker is for; MANUFACTURING a new one, or
+ * shadowing the way back to the concierge, is not.
+ *
+ * A SECOND HOP WOULD CHANGE NOTHING, which is why there is no loop: every move lands on a string
+ * this pass has already proved unoccupied, so it cannot create the collision another hop would have
+ * to clean up. An earlier draft did iterate to a fixed point; mutation showed no roster reaches the
+ * second hop, and a branch that cannot fail is untested code that reads like a guard, so it was
+ * deleted rather than kept — the same call this repo made about the `--path-format` fallback.
+ *
+ * WHAT REMAINS, stated rather than hidden: a person whose username is ALSO taken by a non-person row
+ * keeps whatever address they had. That is a registration-time question about who may hold a name,
+ * and no client-side rewrite can answer it — see the escalation on PR #3068 about constraining
+ * `display_name` where it is WRITTEN.
+ */
+function personHandleOf(r: MentionAgent): string | null {
+  return isPersonAgentId(r.id) && r.handle ? r.handle : null;
+}
+
+/** A short, stable tail of the person's own social id — used ONLY as a second candidate when the
+ *  username is occupied. Not claimed to be unforgeable: it is CHECKED for occupancy like the first
+ *  candidate, which is what makes it safe. */
+function personIdSuffix(r: MentionAgent): string | null {
+  const socialId = socialIdFromPersonAgentId(r.id);
+  return socialId === null || socialId === "" ? null : socialId.slice(-6);
+}
+
+function withUniquePersonAddresses(rows: MentionAgent[]): MentionAgent[] {
+  const reserved = new Map<string, string>();
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const addr = labelOf(r).toLowerCase();
+    counts.set(addr, (counts.get(addr) ?? 0) + 1);
+    const h = personHandleOf(r);
+    if (h !== null) reserved.set(h.toLowerCase(), r.id);
+  }
+  // THE CONCIERGE'S ADDRESS IS RESERVED WHETHER OR NOT ITS ROW IS PRESENT. `mentionRoster` appends
+  // it, but this function is also called on rosters that do not, and the reservation must not depend
+  // on which caller you came through.
+  reserved.set(SPARKLE_MENTION_NAME.toLowerCase(), SPARKLE_MENTION_ID);
+
+  const mustMove = (r: MentionAgent): boolean => {
+    if (personHandleOf(r) === null) return false;
+    const addr = labelOf(r).toLowerCase();
+    const owner = reserved.get(addr);
+    return (counts.get(addr) ?? 0) > 1 || (owner !== undefined && owner !== r.id);
+  };
+
+  const movers = rows.filter(mustMove);
+  if (movers.length === 0) return rows;
+
+  // ══ OCCUPANCY IS WHAT STAYS PUT, NOT WHAT IS THERE NOW ══════════════════════════════════════════
+  // Note what this deliberately does NOT do: claim each assigned string as it goes. Two movers can
+  // never choose the same one — every candidate is built from the mover's OWN username, which is
+  // unique among people and `[a-z0-9_]`, so it contains neither the space nor the parens the
+  // id-tailed form adds. A claim step was written first and mutation showed deleting it reddened
+  // nothing, because no roster can reach it.
+  // A pre-rewrite snapshot answers the WRONG question: it reports a string as taken by a row that is
+  // itself about to vacate it, so the victim of a forgery is refused their own username by the very
+  // impostor who forced them off it. Seeded from the rows that are NOT moving — plus the concierge,
+  // always — and then each assignment CLAIMS its string, so two movers cannot pick the same one.
+  // The concierge is NOT added here: `reserved` already holds its address and the candidate test
+  // reads both, so adding it would be one rule written twice — and mutation showed the duplicate
+  // could be deleted with nothing going red, which is how two lines drift into disagreeing.
+  const occupied = new Set<string>();
+  for (const r of rows) if (!mustMove(r)) occupied.add(labelOf(r).toLowerCase());
+
+  const assigned = new Map<string, string>();
+  for (const r of movers) {
+    const handle = personHandleOf(r);
+    if (handle === null) continue;
+    const tail = personIdSuffix(r);
+    // The username first, because it is the key that is genuinely theirs. The id-tailed form is the
+    // fallback for the case where somebody else holds their username — CHECKED, not assumed free.
+    const candidates = tail === null ? [handle] : [handle, `${handle} (${tail})`];
+    for (const candidate of candidates) {
+      const key = candidate.toLowerCase();
+      const owner = reserved.get(key);
+      if (occupied.has(key) || (owner !== undefined && owner !== r.id)) continue;
+      assigned.set(r.id, candidate);
+      break;
+    }
+    // NOTHING FREE. The row keeps the address it had, which leaves an ambiguity the picker can still
+    // resolve — never a NEW one, and never the concierge's. Manufacturing a collision to satisfy a
+    // rewrite is the defect this whole pass exists to stop.
+  }
+
+  return rows.map((r) => {
+    const next = assigned.get(r.id);
+    return next === undefined || labelOf(r) === next ? r : { ...r, label: next };
+  });
+}
+
 export function withMentionLabels(agents: readonly MentionAgent[]): MentionAgent[] {
   // TWO COUNTS, because the two kinds collide on different terms — see the block above.
   const agentCounts = new Map<string, number>();
@@ -141,7 +298,7 @@ export function withMentionLabels(agents: readonly MentionAgent[]): MentionAgent
     if (isBeadMentionId(a.id)) continue;
     agentCounts.set(key, (agentCounts.get(key) ?? 0) + 1);
   }
-  return agents.map((a) => {
+  const labelled = agents.map((a) => {
     const key = a.name.toLowerCase();
     // A BEAD IS DISAMBIGUATED AGAINST EVERYTHING, AND ITS ID ALWAYS SUCCEEDS. Two beads can share a
     // title far more easily than two agents share a name — the backlog is thousands of sentences,
@@ -158,10 +315,49 @@ export function withMentionLabels(agents: readonly MentionAgent[]): MentionAgent
     // the bead took the suffix above, so the pair is already unambiguous without touching this side.
     // Same reasoning as the concierge exemption below, generalised: the side that can always
     // disambiguate itself is the side that yields.
-    return (agentCounts.get(key) ?? 0) > 1 && a.id !== SPARKLE_MENTION_ID
-      ? { ...a, label: `${a.name} (${a.projectName})` }
-      : a;
+    const collides = (agentCounts.get(key) ?? 0) > 1 && a.id !== SPARKLE_MENTION_ID;
+    if (!collides) return a;
+    // ══ A PERSON DISAMBIGUATES ON THE ONE FIELD THAT IS UNIQUE (roborev 82277) ═══════════════════
+    // `personName()` is `displayName || username`, and only the SECOND of those is unique — the
+    // registry enforces a unique username, nothing enforces a unique display name. A person carries
+    // no `projectName`, so the agent form below rendered two people called "Dan" as the IDENTICAL
+    // string `Dan ()`. `findMentionSpans` claims the first equal-length label in
+    // `longestLabelFirst` order and discards the overlapping second, so `@Dan` resolved to whichever
+    // `peopleList` happened to sort first — a rank that FLIPS when one of them goes offline, since
+    // it sorts on availability before name. The founder would have DM'd the wrong human and the
+    // receipt would read `Sent to Dan.`, indistinguishable from the right send.
+    //
+    // That is the same silent misdelivery the `person` route arm exists to prevent, reintroduced one
+    // layer up — and beads already solve it the same way, by appending the key that cannot collide.
+    //
+    // THE SUFFIX CARRIES NO SIGIL (roborev 82346). `beadMentionLabel`'s own contract already states
+    // it — *"SIGILS ARE STRIPPED. A `@` inside a label puts a second sigil offset inside a matched
+    // span"* — and the cost here is worse than the overlap that sentence names, because
+    // `mentionQuery` scans BACKWARDS from the caret for the first `@` and rejects it only when the
+    // preceding character is a NAME_CHAR or another `@`. A `(` is neither. So `@Dan (@dan2) `
+    // anchored the query on the INNER sigil, `isCompletedMention("dan2) ")` was false, the countdown
+    // never resumed (the `sparkle-14dtu` regression, re-entered through another door), the picker
+    // re-opened over the pill it had just inserted, and Enter chose a row instead of sending —
+    // rewriting the draft to `@Dan (@Dan (@dan2) ` and destroying the address. The username alone is
+    // the disambiguator; the sigil was never doing any of that work.
+    if (isPersonAgentId(a.id)) {
+      if (!a.handle) return a;
+      // THE SUFFIX IS BUDGETED INSIDE THE CEILING, NOT ADDED TO IT — the same rule, and the same
+      // reason, as `beadDisambiguatedLabel`: appending it to an already-maximal name is how a
+      // disambiguated address grows past `MAX_MENTION_QUERY` and falls out of the picker's reach,
+      // in precisely the case where being addressable matters most.
+      const suffix = ` (${a.handle})`;
+      return { ...a, label: `${ellipsize(a.name, MAX_PERSON_MENTION_NAME - suffix.length)}${suffix}` };
+    }
+    // AND AN EMPTY SUFFIX IS NOT A DISAMBIGUATOR. A blank `projectName` produced `Name ()` — two
+    // such rows are still identical, so the label did nothing but make the ambiguity look resolved.
+    // Returning the row unlabelled is honest: the picker shows both, and neither claims the address.
+    return a.projectName ? { ...a, label: `${a.name} (${a.projectName})` } : a;
   });
+  // THE LAST WORD ON A PERSON'S ADDRESS — see `withUniquePersonAddresses`. It runs over the FINAL
+  // labels because that is the only place a forged address is visible: every count above is taken on
+  // `a.name`, before any suffix exists.
+  return withUniquePersonAddresses(labelled);
 }
 
 /** A resolved mention, as carried on a sent message so the thread can draw the pill. Deliberately
@@ -253,6 +449,19 @@ export function isBeadMentionId(id: string): boolean {
  */
 export const MAX_BEAD_MENTION_LABEL = MAX_MENTION_QUERY;
 
+/**
+ * The ceiling on a PERSON's address, one character under {@link MAX_MENTION_QUERY}.
+ *
+ * THE MISSING CHARACTER IS THE TERMINATING SPACE, and leaving it out makes a maximal address
+ * unreachable rather than merely long. `insertMention` writes `@<label> ` and `isCompletedMention`
+ * REQUIRES that trailing whitespace, so the query a completed mention presents is always
+ * `label + " "` — one longer than the label. At exactly `MAX_MENTION_QUERY` that query trips
+ * `mentionQuery`'s own bound and it returns null, which reads to every caller as "the caret is not
+ * in a mention at all": the picker will not open on it, `isComposingMention` is false while the user
+ * is still typing the name, and the address resolves to nobody.
+ */
+export const MAX_PERSON_MENTION_NAME = MAX_MENTION_QUERY - 1;
+
 /** Cut `base` down to `room` characters, marking the cut with an ellipsis.
  *
  *  The ellipsis is deliberately NOT a name character (see NAME_CHAR), so a truncated address still
@@ -281,8 +490,49 @@ function ellipsize(base: string, room: number): string {
  * A title that normalises to nothing falls back to the id, so every bead has an address.
  */
 export function beadMentionLabel(title: string, beadId: string): string {
-  const flat = title.replace(/\s+/g, " ").split(MENTION_SIGIL).join("").trim();
+  const flat = flattenAddress(title);
   return ellipsize(flat === "" ? beadId : flat, MAX_BEAD_MENTION_LABEL);
+}
+
+/** The two normalisations an ADDRESS must satisfy whatever kind of thing it names — strip the
+ *  sigils, then flatten the whitespace — in ONE place, because every caller that got them from
+ *  memory got one of them wrong. The length bound is deliberately NOT here: each kind budgets its
+ *  own ceiling around its own suffix (see {@link beadDisambiguatedLabel}), so folding it in would
+ *  hide that.
+ *
+ *  ORDER MATTERS, and it is the opposite of the obvious one. Flattening first leaves the sigil's own
+ *  surrounding spaces behind, so `Dan @ Acme` came out as `Dan  Acme` — a DOUBLE space, which is a
+ *  different string from the one anybody would type when trying to address them, so the address is
+ *  unreachable by hand. Stripping first makes the two spaces adjacent and the flatten then collapses
+ *  them. */
+function flattenAddress(raw: string): string {
+  return raw.split(MENTION_SIGIL).join("").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * What a PERSON is ADDRESSED as: their display name, normalised the same way a bead title is.
+ *
+ * ══ A DISPLAY NAME IS PEER-CONTROLLED TEXT, AND IT LANDS IN AN ADDRESS (roborev 82360) ══════════
+ * `personName()` is `displayName?.trim() || username` and NOTHING between the profile route and
+ * here removes a sigil or bounds the length. `labelOf` returns `a.label ?? a.name`, so for an
+ * uncollided person that raw string IS the address — which reopens, through the OPERAND, the exact
+ * defect roborev 82346 closed in the JOINER. A connection who calls themselves `Dan @ Acme` gives
+ * the draft `@Dan @ Acme `, whose inner sigil is preceded by a SPACE — not a `NAME_CHAR`, not a
+ * sigil — so `mentionQuery` anchors there, `isCompletedMention("Acme ")` is false, the auto-send
+ * countdown never resumes, the picker re-opens over the pill, and Enter rewrites the draft to
+ * `@Dan @Dan @ Acme `. A private message to a human, aimed somewhere the sender did not aim it.
+ * An unbounded name is the other half: past {@link MAX_MENTION_QUERY} the address stops matching at
+ * all, which is what {@link MAX_BEAD_MENTION_LABEL} already exists to prevent for the one other
+ * roster kind carrying free-form text.
+ *
+ * So a person is normalised at this seam rather than trusted from the wire, on the same three rules
+ * and for the same reasons {@link beadMentionLabel} lists. A name that normalises to nothing falls
+ * back to the username, which `USERNAME_FORMAT_RE` already constrains to `[a-z0-9_]` — so every
+ * person has an address, and no address carries a sigil.
+ */
+export function personMentionName(displayName: string | null | undefined, username: string): string {
+  const flat = flattenAddress(displayName ?? "");
+  return ellipsize(flat === "" ? username : flat, MAX_PERSON_MENTION_NAME);
 }
 
 /**

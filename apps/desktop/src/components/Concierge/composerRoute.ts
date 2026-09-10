@@ -80,6 +80,9 @@ import {
   type ConciergeMention,
   type MentionSpan,
 } from "./mentions";
+// The `person:` namespace, read through its own helpers rather than sliced here — see
+// `engine/social`, which owns both directions so no caller ever cuts the string itself.
+import { socialIdFromPersonAgentId } from "../../engine/social";
 
 /** How the destination was decided. Carried on the verdict rather than re-derived, because the
  *  caller's downstream behaviour genuinely differs per arm — see {@link ComposerRoute}. */
@@ -105,6 +108,28 @@ export type ComposerRouteVia =
  */
 export type ComposerRoute =
   | { kind: "sparkle"; via: Extract<ComposerRouteVia, "address" | "default"> }
+  /**
+   * A HUMAN, reached by a chat message and never by a prompt (bead sparkle-6baj6s).
+   *
+   * Its own arm rather than an `agent` with a `person:` id, and that is the whole point: `agent` is
+   * the DEFAULT arm — everything that is not the concierge sentinel falls into it — so without this
+   * a leading `@Ada` produces `{kind: "agent", agentId: "person:<socialId>"}` and the founder's
+   * words are handed to `dispatchConciergeAnswer`, the one door into a local PTY. That is design
+   * §8 R3's outbound mirror, and it is the exact shape the bead's own three defects describe for
+   * beads: the mount escapes, the box paints terminal metrics for a destination that has no
+   * terminal, and the receipt names an agent that does not exist.
+   *
+   * The dispatcher refuses a `person:` id outright, so nothing can reach a PTY even if this arm is
+   * deleted — but a refusal is a DEAD END, and the user's intent here is good and achievable. This
+   * arm is what turns that dead end into the send the founder actually asked for (spec line 41:
+   * "`@mention`ing a username to send a message").
+   *
+   * Carries BOTH ids deliberately. `agentId` is the `person:` mount id every mention surface keys
+   * on — the pill, the draft key, the receipt — and `socialId` is what the transport addresses.
+   * Deriving one from the other at each consumer is how two surfaces come to disagree about who a
+   * message was sent to.
+   */
+  | { kind: "person"; agentId: string; socialId: string; via: Extract<ComposerRouteVia, "address" | "mount"> }
   | { kind: "agent"; agentId: string; via: Extract<ComposerRouteVia, "address" | "mount"> };
 
 export interface ComposerRouteInput {
@@ -239,12 +264,30 @@ function fitsText(
 export function classifyComposerRoute(i: ComposerRouteInput): ComposerRoute {
   const address = addressingSpan(i.text, i.mentions, i.spans);
   if (address) {
-    return address.agentId === SPARKLE_MENTION_ID
-      ? { kind: "sparkle", via: "address" }
-      : { kind: "agent", agentId: address.agentId, via: "address" };
+    if (address.agentId === SPARKLE_MENTION_ID) return { kind: "sparkle", via: "address" };
+    const person = personRoute(address.agentId, "address");
+    return person ?? { kind: "agent", agentId: address.agentId, via: "address" };
   }
-  if (i.mountedAgentId) return { kind: "agent", agentId: i.mountedAgentId, via: "mount" };
+  if (i.mountedAgentId) {
+    // THE MOUNT ARM ASKS THE SAME QUESTION, and it is asked here rather than assumed away. Nothing
+    // in `ConciergeHost` puts a `person:` id on the cable pin today, so this is unreachable in the
+    // shipping app — but "unreachable" is a property of a FILE THIS ONE DOES NOT OWN, and the
+    // failure if it ever changes is silent misdelivery into a terminal rather than a crash. One
+    // predicate, both arms, so the two can never disagree about what a person is.
+    const person = personRoute(i.mountedAgentId, "mount");
+    return person ?? { kind: "agent", agentId: i.mountedAgentId, via: "mount" };
+  }
   return { kind: "sparkle", via: "default" };
+}
+
+/** The person arm for `id`, or null when `id` names no person. One place the `person:` namespace is
+ *  read, so the address and mount arms above cannot drift apart. */
+function personRoute(
+  id: string,
+  via: Extract<ComposerRouteVia, "address" | "mount">,
+): Extract<ComposerRoute, { kind: "person" }> | null {
+  const socialId = socialIdFromPersonAgentId(id);
+  return socialId === null ? null : { kind: "person", agentId: id, socialId, via };
 }
 
 /**

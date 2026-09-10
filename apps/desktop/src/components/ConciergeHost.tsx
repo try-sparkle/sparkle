@@ -330,6 +330,9 @@ import {
 // docstring for what the three modes are and which one the handoff needs.
 import type { ComposeInsert } from "./Concierge/ComposeBox";
 import { classifyComposerRoute } from "./Concierge/composerRoute";
+// An addressed PERSON is a chat message, never a prompt — see the person arm in `send`.
+import { sendDirectMessage } from "../services/personMessaging";
+import { useSocialStore, personName, roster as socialRoster } from "../stores/socialStore";
 import {
   mountRefusalCause,
   mountRefusalTail,
@@ -1817,6 +1820,15 @@ export function ConciergeHost({
   // Nothing is FETCHED here: this reads what the store already holds, and `BeadPillHost` is what
   // keeps it polling.
   const beadsByProject = useBeadsStore((s) => s.byProject);
+  // ══ THE PEOPLE (bead sparkle-xnjil.17 / sparkle-6baj6s) ════════════════════════════════════════
+  // `socialStore.roster()` was landed as an inert SEAM — it returns exactly the `MentionAgent` shape
+  // this picker consumes, keyed on the `person:` mount id, and until now nothing read it but its own
+  // test. This is the line that wires it up, and the founder's own words are what it implements:
+  // "`@mention`ing a username TO SEND A MESSAGE" (design line 41). An addressed person is routed to
+  // a DM by `classifyComposerRoute`'s person arm and never to a PTY — `dispatchConciergeAnswer`
+  // refuses a `person:` id at the chokepoint, so the two paths cannot be confused even by a caller
+  // that has not been taught the difference.
+  const socialPeople = useSocialStore((s) => s.people);
   const mentionAgents = useMemo(() => {
     const rows: MentionAgent[] = allAgents(feed).map((a) => ({
       id: a.id,
@@ -1863,8 +1875,17 @@ export function ConciergeHost({
         }
       }
     }
+    // APPENDED AFTER the agents and the beads, so no person can displace a build destination from
+    // the default ordering — `orderMentionAgents` sorts by band, and a person carries the synthetic
+    // `running` the seam gives them rather than a real one.
+    //
+    // `kind: "person"` is for the surfaces that DRAW a row and for nothing else. Every routing and
+    // safety answer about these ids is read off the ID (`isPersonAgentId`), exactly as bead-ness is
+    // read off `isBeadMentionId` — see this field's own doc in `mentions.ts`: a row that loses the
+    // field must not thereby become promptable.
+    for (const p of socialRoster(socialPeople)) rows.push({ ...p, kind: "person" as const });
     return rows;
-  }, [feed, beadsByProject]);
+  }, [feed, beadsByProject, socialPeople]);
   // …and the same list for the handlers, which are memoized on stable deps and run after render
   // (the feedRef/targetRef pattern above). `send` resolves a mention off this rather than closing
   // over a render-time value, so a message submitted after the fleet changed resolves against the
@@ -6363,6 +6384,95 @@ export function ConciergeHost({
         mentions: mentions ?? [],
         mountedAgentId: mountedAgentIdRef.current,
       });
+      // ══ AN ADDRESSED PERSON IS A CHAT MESSAGE, NOT A PROMPT (bead sparkle-6baj6s) ═══════════════
+      // FIRST, ahead of every branch below, and that ordering is the whole of it. Each test below is
+      // a boolean `route.kind === "agent"` / `=== "sparkle"`, so a `person` route satisfies NONE of
+      // them and falls through to the ordinary unaddressed path — which sends the founder's words to
+      // the CONCIERGE BRAIN. That is silent misdelivery to a recipient he did not choose, the
+      // failure this file calls the most expensive one it can have, and it is what makes this arm
+      // mandatory rather than a nicety: the type system cannot catch it, because none of those
+      // tests is exhaustive.
+      //
+      // It is also why the arm lives HERE rather than beside the agent dispatch further down.
+      // Nothing has been consumed yet at this point — the same property the unresolvable-mount
+      // refusal below depends on — so a refusal costs the founder neither his words nor his files.
+      if (route.kind === "person") {
+        // MEDIA TO A PERSON IS DEFERRED BY DESIGN, and refused out loud rather than dropped.
+        // `lib/messagePolicy`'s ACCEPTED_BLOCK_KINDS is `["text"]` and the server rejects an
+        // image/file block loudly, so a staged screenshot could never arrive. Silently sending the
+        // words and swallowing the picture is the worse failure: the founder would believe Ada had
+        // seen it. Taken and RESTORED synchronously, exactly as the refusals below do it, so the
+        // files are still staged when he reads this sentence.
+        const carried = takeAttachments();
+        if (carried.length > 0) {
+          restoreAttachments(carried);
+          // The sentence is built ABOVE the call, not interpolated inside `line`. A template literal
+          // nested inside `line`'s own template terminates `noticeRecipient.invariant`'s
+          // parenthesis scanner early — it skips template literals wholesale — after which commas in
+          // the prose read as argument separators and the guard reports a phantom third argument.
+          // Every working call site in this file passes a precomputed string for the same reason.
+          const noun = carried.length === 1 ? "file is" : "files are";
+          const why = `Sending files to a person isn't wired up yet, so I didn't send that — your message and your ${noun} still here.`;
+          postSparkle(line`${plain(why)}`);
+          return Promise.resolve(false);
+        }
+        // The address is the ENVELOPE, so it is consumed rather than sent — the same strip the agent
+        // path makes, through the same function, so the span that chose the destination is the span
+        // that gets removed. A BARE address strips to nothing, which is not a message: say so and
+        // keep the draft, mirroring the addressed-agent line roborev 55418 added for exactly this.
+        const body = mentionFreeText(text, rosterFromMentions(mentions ?? []));
+        // NAMED AS PLAIN TEXT, NOT AS AN AGENT PILL. `ref(asAgent(...))` is the idiom for the
+        // sentences beside this one, and it is wrong here: `AgentPill` resolves an id against the
+        // LIVE AGENT ROSTER, which a `person:` id misses by construction — so the pill would fall
+        // back to a remembered name and, worse, offer an agent's affordances for a human. What a
+        // person's pill should DO is a product question nobody has answered; this arm does not need
+        // it answered to deliver the message, so it does not invent one.
+        const person = useSocialStore.getState().people[route.socialId];
+        const to = person ? personName(person) : "them";
+        if (body.trim() === "") {
+          const ask = `You've got ${to} in mind — what should I send over?`;
+          postSparkle(line`${plain(ask)}`);
+          return Promise.resolve(false);
+        }
+        // HIS OWN WORDS GO INTO THE THREAD FIRST, exactly as they do for every other send in this
+        // column. Without this the founder types a message, watches the box empty, and sees only a
+        // one-line receipt — his sentence rendered nowhere, which reads as having lost it. The
+        // bubble carries `mentions` so the pills paint, and `text` rather than the stripped `body`
+        // because the bubble is the record of WHAT HE TYPED.
+        //
+        // PURELY VISUAL, AND SAFE: this arm returns before `deliver`, so no concierge turn is
+        // billed and the brain never sees it. `setChat` paints the thread; it does not address it.
+        setChat((prev) => [
+          ...prev,
+          {
+            id: nextId("you"),
+            kind: "you" as const,
+            text,
+            mentions: mentions?.length ? mentions : undefined,
+          },
+        ]);
+        // `send` is not `async`, so the promise is returned rather than awaited — the same shape
+        // every other deferred outcome in this function uses.
+        return sendDirectMessage(route.socialId, body).then((r) => {
+          if (!r.ok) {
+            // The reason is already a founder-facing sentence resolved against the failure (see
+            // personMessaging.failureSentence) — posted verbatim so this call site cannot render a
+            // raw status code, and `false` keeps his words in the box.
+            postSparkle(line`${plain(r.reason)}`);
+            return false;
+          }
+          // SAY WHAT THIS BUILD CANNOT SHOW (sparkle-reviewer probe 2). The send is real — the
+          // server holds the message — but `Workspace` renders `<ChatPane>` with no `useThread`,
+          // so the pane runs `useUnwiredChatThread` and no conversation is displayable anywhere in
+          // this build. A bare `Sent to X.` is byte-identical in SHAPE to the agent receipt below,
+          // where the destination IS openable, so a non-technical builder reads it as
+          // delivered-and-awaiting-reply and then waits for a reply no surface can paint. The
+          // unfinished half is `sparkle-xnjil.6`; this is the copy that ships until it lands.
+          const receipt = `Sent to ${to}. Sparkle can't show this conversation yet, so a reply won't appear here.`;
+          postSparkle(line`${plain(receipt)}`);
+          return true;
+        });
+      }
       const conciergeAddressed = route.kind === "sparkle" && route.via === "address";
       // Resolved against the LIVE roster, so an address naming an agent that has since closed simply
       // fails to resolve and the message falls back to the auto-router — the recoverable direction,
@@ -6757,7 +6867,7 @@ export function ConciergeHost({
     // `postSparkle` and `noteMounted` are the unresolvable-mount refusal's two voices. Both are
     // `useCallback(…, [])`, so naming them cannot churn this callback's identity — and desktop lint
     // requires every referenced value in the array regardless.
-    [deliver, enqueue, takeAttachments, postSparkle, noteMounted],
+    [deliver, enqueue, takeAttachments, restoreAttachments, postSparkle, noteMounted],
   );
 
   /** Send an already-routed message the OTHER way. Additive: the first delivery stands (see

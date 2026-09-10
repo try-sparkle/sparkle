@@ -251,6 +251,27 @@ export function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, 
       return approving
         ? line`Something went wrong on my side, so I didn't send the approval to ${a}.`
         : line`Something went wrong on my side, so I didn't send that to ${a}. Try again.`;
+    // ── A PERSON IS NOT AN AGENT (bead sparkle-6baj6s) ────────────────────────────────────────
+    // R3's outbound mirror, refused at `dispatchConciergeAnswer`. Reachable only when a caller
+    // hands this door a `person:` id, which ConciergeHost does not do — it routes an addressed
+    // person to a DM. So, like `unauthorized`, this is a wiring bug rather than a user error.
+    //
+    // BUT ITS REMEDY IS REAL WHERE `unauthorized`'s IS NOT, and that is why it does not share that
+    // arm: the user's INTENT here is perfectly good and perfectly achievable — they wanted to say
+    // something to a human. What must never be suggested is a rephrase: no wording makes a human's
+    // name address a PTY.
+    //
+    // THE REMEDY NAMES THE COMPOSER, NOT THE CHAT PANE (sparkle-reviewer probe 2). It used to read
+    // "open your chat with ${a}" — and `Workspace` renders `<ChatPane>` with no `useThread`, so
+    // that pane runs `useUnwiredChatThread` and its composer answers every send with
+    // `no_transport`. AGENTS.md's remedy-string rule is exactly this: an alternative that cannot be
+    // carried out under the same condition that triggered the refusal means the refusal
+    // accomplished nothing. Addressing the person with `@` in the concierge composer is the path
+    // this PR built and the one that actually delivers, so that is what the line says.
+    case "person-not-promptable":
+      return approving
+        ? line`${a} is a person, not an agent, so there was no approval to send — address ${a} with @ in the composer instead.`
+        : line`${a} is a person, not an agent, so I didn't type that into a terminal — address ${a} with @ in the composer and it goes as a message.`;
     case "queue-full":
       // A full hold queue is NOT a dead terminal — the agent is starting normally, there are simply
       // already MAX_PER_AGENT prompts waiting on it. Falling through to the generic line (or worse,

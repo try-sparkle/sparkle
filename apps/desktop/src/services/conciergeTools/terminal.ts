@@ -1124,6 +1124,12 @@ export function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // narrated the old behaviour.
     case "blocked-prompt":
       return "Not sent: the agent is waiting on something on screen (a permission dialog, a prompt, or a credential field), which this text would have been submitted into. It's the human's to answer in that agent's own pane; I won't press anything on their behalf.";
+    // A `person:` id reached the one door into a local PTY. Refused at the chokepoint — see
+    // `conciergeDispatch`'s R3 outbound guard (bead sparkle-6baj6s). This string is read by the
+    // MODEL, so it names the alternative rather than only the refusal: there IS a way to reach a
+    // human, it is simply not this tool.
+    case "person-not-promptable":
+      return `Not sent: ${agentId} is a PERSON, not an agent. There is no terminal to type into — a human is reached by a chat message, never through agent input. Do not retry this with a different wording.`;
     case "unknown-agent":
       return `Not sent: there is no open agent with id ${agentId}.`;
     // THE GENERIC FORM. The refusal site passes the LIVE sentence from services/sparkleBusy instead
