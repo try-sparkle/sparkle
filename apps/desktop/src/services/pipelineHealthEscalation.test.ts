@@ -1312,4 +1312,93 @@ describe("warning confirmation window", () => {
       .toEqual(["warning"]);
     expect(r.concierge.length).toBe(1);
   });
+
+  // ── roborev jobs 82754 + 82758: a PARTIAL THAW used to lose a real, lasting warning ──────────
+  //
+  // `detectEscalations` emits NO event for `blocking→warning` (its own doc comment says so), so the
+  // drop branch's claim that a worsened streak "opens its own streak" holds in ONE direction only.
+  // Going up, the worse edge really is emitted and really does re-open. Coming back DOWN there is no
+  // edge at all — so deleting the streak left the component sitting in `warning` with nothing
+  // tracking it and nothing ever announced, and the eventual recovery suppressed on top, because the
+  // drop had flagged it unannounced.
+  //
+  // 82758 is the SECOND half, and it is why `alarmRun` exists rather than a reset to streak 1: a
+  // streak counts readings of ONE state, so a component alternating warning/blocking on every poll
+  // never accumulates three consecutive warnings NOR two consecutive blockings and is silenced just
+  // as permanently. The run counts readings at least as severe, which is the evidence a thaw needs.
+  it("delivers a warning that survives a transient blocking flicker inside its window", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps); // degraded reading 1
+    await escalatePipelineHealth(snap("warning"), snap("blocking"), r.deps); // reading 2 — flicker
+    const res = await escalatePipelineHealth(snap("blocking"), snap("warning"), r.deps); // reading 3
+
+    expect(
+      res.delivered.map((e) => e.severity),
+      "three consecutive degraded readings confirm the warning — the blocking one counts too",
+    ).toEqual(["warning"]);
+    expect(r.concierge.length, "and it must reach the concierge, not just the partition").toBe(1);
+  });
+
+  // THE REPEATING flicker — the shape a per-state streak cannot see however many times it re-opens.
+  // The first thaw here is NOT enough (two degraded readings), a worsening then sits in the middle,
+  // and the second thaw confirms only because the run survived that worsening.
+  it("delivers a warning that flickers to blocking REPEATEDLY, never holding either state", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps); // reading 1
+    const firstThaw = await escalatePipelineHealth(snap("blocking"), snap("warning"), r.deps); // 2
+    expect(
+      firstThaw.delivered,
+      "two degraded readings are not three — the first thaw must NOT confirm the warning",
+    ).toEqual([]);
+
+    await escalatePipelineHealth(snap("warning"), snap("blocking"), r.deps); // reading 3
+    const res = await escalatePipelineHealth(snap("blocking"), snap("warning"), r.deps); // reading 4
+
+    expect(
+      res.delivered.map((e) => e.severity),
+      "a component in alarm on every poll must be announced, whatever it alternates between",
+    ).toEqual(["warning"]);
+    expect(r.concierge.length).toBe(1);
+  });
+
+  // The OTHER direction of the same predicate — the one a fix for the above can silently widen.
+  // Carrying the run forward must not turn an alarm nobody heard into an announced recovery.
+  it("still announces NO all-clear when a thawed warning clears before it is confirmed", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps); // reading 1
+    await escalatePipelineHealth(snap("blocking"), snap("warning"), r.deps); // reading 2 — thaw
+    const res = await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+
+    expect(res.delivered, "two readings never confirmed, so there is no all-clear to give").toEqual(
+      [],
+    );
+    expect(r.concierge, "an all-clear for an unheard alarm is the expensive shape").toEqual([]);
+  });
+
+  // And the WORSENING direction stays as it was: a warning on its way to blocking is never announced
+  // as a warning on the strength of readings that were really about the blocking. A warning reading
+  // is no evidence that a blocking is real, so the run is NOT carried this way.
+  it("does not announce a warning as a warning once it has worsened to blocking", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps); // warning streak 1
+    await escalatePipelineHealth(snap("warning"), snap("blocking"), r.deps); // worsens — blocking s1
+    const res = await escalatePipelineHealth(snap("blocking"), snap("blocking"), r.deps);
+
+    expect(
+      res.delivered.map((e) => e.severity),
+      "the blocking confirms on ITS threshold; no warning may ride along",
+    ).toEqual(["blocking"]);
+  });
+
+  // A run broken by an UNREADABLE meter starts over — the module's standing fail-safe rule.
+  it("does not carry the alarm run across an `unknown` reading", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("blocking"), r.deps); // reading 1
+    await escalatePipelineHealth(snap("blocking"), snap("unknown"), r.deps); // probe timed out
+    const res = await escalatePipelineHealth(snap("unknown"), snap("warning"), r.deps);
+
+    expect(res.delivered, "an unreadable meter is not evidence that anything is degraded").toEqual(
+      [],
+    );
+  });
 });

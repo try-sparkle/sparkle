@@ -603,6 +603,47 @@ function markUnannounced(componentId: string): void {
 const pendingAlarm = new Map<string, { ev: EscalationEvent; streak: number }>();
 
 /**
+ * CONSECUTIVE POLLS THIS COMPONENT HAS BEEN IN *ANY* ALARM STATE — the evidence a thaw carries
+ * forward, kept separately from `pendingAlarm` because it has to survive the streak (roborev job
+ * 82758).
+ *
+ * `pendingAlarm`'s streak counts readings of ONE state, which is the right question for confirming
+ * that state and the wrong one for confirming that the component is degraded at all. A component
+ * that is in alarm on every single poll but alternates `warning`/`blocking` never accumulates three
+ * consecutive warnings NOR two consecutive blockings, so with the streak as the only ledger it is
+ * never announced — and the eventual recovery is suppressed on top, because each drop records it
+ * unheard. That is the same permanent silence roborev job 82754 was about, reached by flickering
+ * more than once: `W(s1) → B(s1) → W(s1) → W(s2) → B(s1) → W(s1) → …` forever.
+ *
+ * A BLOCKING READING IS ALSO EVIDENCE THAT A WARNING-LEVEL ALARM IS REAL, so on a thaw the milder
+ * alarm inherits this count. The reverse does not hold — warning readings say nothing about whether
+ * a blocking is real — so worsening still restarts at the stricter threshold, which is why only the
+ * thaw arm reads this.
+ *
+ * `unknown` and both good states RESET it, keeping this module's standing rule that an unreadable
+ * meter never alarms: a run broken by a timed-out probe starts over, which is the fail-safe
+ * direction.
+ */
+const alarmRun = new Map<string, number>();
+
+/**
+ * Advance `alarmRun` against THIS snapshot. Runs once per sweep, unconditionally — including when
+ * `pendingAlarm` is empty, because the run has to already be counting by the time a later thaw asks
+ * for it, and a ledger maintained only while some streak happens to exist would read zero exactly
+ * when it is needed.
+ */
+function advanceAlarmRun(next: PipelineHealth): void {
+  const seen = new Set<string>();
+  for (const c of next.components) {
+    seen.add(c.id);
+    if (isAlarmState(c.state)) alarmRun.set(c.id, (alarmRun.get(c.id) ?? 0) + 1);
+    else alarmRun.delete(c.id);
+  }
+  // A component that has left the snapshot has no run: it is not reporting an alarm.
+  for (const id of [...alarmRun.keys()]) if (!seen.has(id)) alarmRun.delete(id);
+}
+
+/**
  * Re-evaluate every deferred blocking alarm against THIS snapshot and return the ones now confirmed.
  *
  * MUST RUN BEFORE this sweep's edges are gated: an alarm dropped here records itself in
@@ -621,12 +662,64 @@ function advancePendingAlarm(next: PipelineHealth): EscalationEvent[] {
   for (const [id, pending] of [...pendingAlarm]) {
     const cur = byId.get(id);
     // THE STREAK CONFIRMS ONLY WHILE THE COMPONENT HOLDS THE STATE IT WAS DEFERRED FOR. Anything
-    // else drops it: recovered, thawed, gone `unknown`, absent from the snapshot — or WORSENED,
-    // which is not a loss because the worse edge is emitted by `detectEscalations` and opens its own
-    // streak at its own threshold. A warning on its way to blocking should not be announced as a
-    // warning on the strength of readings that were really about the blocking.
+    // else ends THIS streak: recovered, gone `unknown`, absent from the snapshot, WORSENED, or
+    // THAWED to a milder alarm. Ending the streak is not the same as ending the alarm, and the two
+    // arms below say which happened — a component still in an alarm state re-opens on the state it
+    // now holds, everything else drops and is recorded unheard. A warning on its way to blocking is
+    // still never announced as a warning on the strength of readings that were about the blocking:
+    // the worse edge is emitted by `detectEscalations` and opens its own streak at its own
+    // threshold, overwriting the re-open below on that side.
     if (cur === undefined || cur.state !== pending.ev.to) {
       pendingAlarm.delete(id);
+      // A THAW IS NOT AN END — RE-OPEN THE STREAK ON WHATEVER ALARM THE COMPONENT NOW HOLDS
+      // (roborev job 82754). The "worsened is not a loss" claim above holds in exactly ONE
+      // direction. Going UP the worse edge really is emitted, and the candidate loop below really
+      // does open its own streak at its own threshold — which is why re-opening here is a no-op on
+      // that side, immediately overwritten by the real edge. Coming back DOWN there is no edge at
+      // all: `detectEscalations` documents `blocking→warning` as a partial thaw that emits NOTHING.
+      // So deleting the streak left a component sitting in `warning` with nothing tracking it, never
+      // announced — and the eventual recovery suppressed on top of that, because the drop had
+      // flagged it unheard. One transient blocking reading inside a warning's confirmation window
+      // was enough to silence a real, lasting warning permanently. Measured shape:
+      // healthy→warning (streak 1) → warning→blocking (dropped, blocking held) →
+      // blocking→warning (dropped, NO edge emitted) → warning forever, in silence.
+      //
+      // THE FLAG BELONGS TO THE END OF THE ALARM, NOT TO THE END OF THIS STREAK. A component still
+      // in an alarm state has an alarm outstanding that the re-opened streak is still tracking, so
+      // recording it as unheard here would consume the all-clear for an alarm that may yet be
+      // announced. It is flagged on the sweep the component actually leaves the alarm states —
+      // which is the drop below, reached with `cur` absent, good, or `unknown`.
+      //
+      // ONLY THE THAW RE-OPENS. Worsening needs nothing from here — `detectEscalations` emits that
+      // edge and the candidate loop opens its own streak at the stricter threshold on the same
+      // sweep, so re-opening it here would be written and immediately overwritten. The thaw is the
+      // direction with no edge at all, and so the only one that can lose an alarm.
+      if (cur !== undefined && severityRank(cur.state) < severityRank(pending.ev.to) && isAlarmState(cur.state)) {
+        // DETAIL and remedy come from THIS snapshot for the same reason the confirming push does:
+        // the reader is told about the reading that is true now, and a remedy must be safe under
+        // the conditions that produced it (AGENTS.md, bead sparkle-8bvh).
+        const thawed: EscalationEvent = {
+          ...pending.ev,
+          from: pending.ev.to,
+          to: cur.state,
+          severity: cur.state === "blocking" ? "blocking" : "warning",
+          detail: cur.detail,
+          remediation: remediationFor(id, cur.detail),
+        };
+        // EVERY READING OF THE RUN WAS AT LEAST THIS SEVERE, so all of them are evidence for the
+        // milder alarm — the floor of 1 is this reading itself, for the case where nothing has been
+        // counted yet. Resetting to 1 here instead is what let a REPEATING flicker silence a
+        // component that was in alarm on every poll (roborev job 82758).
+        const carried = Math.max(alarmRun.get(id) ?? 0, 1);
+        if (carried < confirmationsFor(thawed.severity)) {
+          pendingAlarm.set(id, { ev: thawed, streak: carried });
+          continue;
+        }
+        // The run already satisfies the milder threshold, so the thaw itself is the confirming
+        // reading. Waiting another poll would be asking for evidence we are already holding.
+        confirmed.push(thawed);
+        continue;
+      }
       // FLAG THE DROP ONLY WHEN THIS STREAK WAS THE READER'S ONLY ALARM (roborev job 82171).
       // `unannouncedAlarm` means "an alarm is outstanding that nobody was told about", and the
       // recovery gate CONSUMES it — so setting it unconditionally eats the all-clear for a WARNING
@@ -778,6 +871,8 @@ export async function escalatePipelineHealth(
   const now = deps.now();
   // Deferred blocking alarms are re-evaluated FIRST, so one dropped for want of confirmation has
   // already marked itself unannounced by the time this sweep's recovery edge is gated below.
+  // The alarm-run ledger is advanced BEFORE the streaks that read it, and unconditionally.
+  advanceAlarmRun(next);
   const confirmedAlarms = advancePendingAlarm(next);
   const candidates = detectEscalations(prev, next);
   const delivered: EscalationEvent[] = [];
@@ -1053,6 +1148,7 @@ export function __resetPipelineEscalationForTests(): void {
   unannouncedAlarm.clear();
   announcedAlarm.clear();
   pendingAlarm.clear();
+  alarmRun.clear();
 }
 
 /**
