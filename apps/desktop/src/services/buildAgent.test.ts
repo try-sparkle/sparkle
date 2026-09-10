@@ -446,7 +446,26 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     // Fail CLOSED: an unreadable/moved registration must break this test, never silently pass it.
     const reg = serverSrc.indexOf('registerTool(\n    "preview"');
     expect(reg, "could not find the preview tool registration in mcp-control/src/server.ts").toBeGreaterThan(-1);
-    const key = /inputSchema:\s*\{\s*(\w+):/.exec(serverSrc.slice(reg, reg + 4000))?.[1];
+    // BOUNDED BY THE NEXT REGISTRATION, NOT BY A CHARACTER COUNT (bead ``).
+    //
+    // This was `serverSrc.slice(reg, reg + 4000)`, and a magic window is a guard with a rot date
+    // that nothing announces. When the `preview` tool gained its `shipped` sub-op, the prose
+    // documenting it pushed `inputSchema:` to 4234 characters past the registration — so a guard
+    // whose entire subject is ARGUMENT NAMES went red over DESCRIPTION LENGTH, and its message
+    // ("could not read the preview tool's first inputSchema key") pointed at a schema that was
+    // perfectly intact. The next person to hit it would be told to shorten a tool description,
+    // which is exactly the wrong remedy: that description is the ONE place a new argument is
+    // documented to the model (AGENTS.md).
+    //
+    // The cap was only ever there to stop the scan running on into a LATER tool's schema, and the
+    // registration's real extent is where the next `registerTool(` begins. That bound is exact,
+    // cannot be outgrown, and keeps the fail-closed property — a registration that moved or lost
+    // its schema still yields `undefined` and still breaks this test. The sibling test below
+    // already scans forward from `reg` with no cap at all, which is why it survived this and this
+    // one did not.
+    const nextReg = serverSrc.indexOf("registerTool(", reg + 1);
+    const previewReg = serverSrc.slice(reg, nextReg > reg ? nextReg : undefined);
+    const key = /inputSchema:\s*\{\s*(\w+):/.exec(previewReg)?.[1];
     expect(key, "could not read the preview tool's first inputSchema key").toBeTruthy();
 
     // The contract: whatever mcp-control registers is what the brief must tell agents to send.

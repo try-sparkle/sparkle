@@ -186,6 +186,50 @@ export interface PreviewEntry {
   lastActivityAt?: number | null;
 }
 
+/**
+ * A PROVEN, PUBLIC deploy url for one agent's finished work — the "shipped" half of this store
+ * (bead ``).
+ *
+ * ══ WHY IT IS A SEPARATE MAP AND NOT A `PreviewEntry` ═══════════════════════════════════════════
+ * Everything in {@link PreviewEntry} describes a CHILD PROCESS this app supervises: an `id` to stop
+ * it with, a port it bound, a state machine `preview.rs` drives, an idle clock that reclaims it, a
+ * screenshot taken by driving a headless browser at its loopback port. A shipped deploy has NONE of
+ * those. Folding one into `byAgent` would mean synthesising a `ready` status for a server that does
+ * not exist — after which `previewIdleGrace` would count it as a dev server to reclaim,
+ * `resolvePreviewOpenTarget` would ask the supervisor about it and be told it is `gone`, and the
+ * next real `preview:state` event for that agent would overwrite it. That is a lifecycle change
+ * wearing the costume of a UI change, which `services/previewCards`' own header refuses by name.
+ *
+ * ══ THE `provenance` FIELD IS THE POINT, NOT DECORATION ═════════════════════════════════════════
+ * `services/previewCards` admits a card from this map by PROVENANCE — see `SHIPPED_DEPLOY_PROVENANCE`
+ * in `services/shippedDeploy`. The url test alone cannot carry that weight: "is this a public https
+ * url" is true of every url on the internet, including the login-walled Vercel INSPECTOR dashboard
+ * and the branch-alias url a provider keeps alive for a deployment it never built. Both were
+ * measured on a real PR and both are refused by `scripts/deploy-url-for-pr.sh`, which is the only
+ * thing allowed to produce a value for this map. Storing WHERE the url came from is what lets the
+ * projection stay narrow while the url test stays honest about what it can and cannot prove.
+ */
+export interface ShippedDeploy {
+  /** The public, shareable url. Proven live for {@link sha} at the moment it was recorded. */
+  url: string;
+  /**
+   * WHICH resolver produced this. Only `SHIPPED_DEPLOY_PROVENANCE` is ever surfaced as a card; any
+   * other value is stored but never rendered, so a future writer that has not earned the card
+   * cannot get one by accident. A plain `string` rather than a literal union deliberately: the
+   * store must be able to HOLD an unrecognised provenance in order for the projection to be the
+   * thing that refuses it.
+   */
+  provenance: string;
+  /** The pull request this was resolved from, for the card's own caption. Null when unknown. */
+  prNumber: number | null;
+  /** The 40-character head sha the deployment was proven against. Null when unknown. */
+  sha: string | null;
+  /** The provider's environment name ("Preview", "Production"). Null when unknown. */
+  environment: string | null;
+  /** When this app recorded it — the card's arrival instant, and its sort key. */
+  recordedAt: number;
+}
+
 /** The states in which a preview is worth putting in front of the user: it has compiled and is
  *  answering. `listening` is deliberately NOT one — a port is bound before the first build
  *  finishes, so surfacing there shows the framework's own "compiling" page, which is the "several
@@ -225,6 +269,18 @@ interface PreviewStoreState {
    *  fact from `stopped` (a server that ran and has since been stopped) and is why `clearPreview`
    *  deletes rather than writing a tombstone. */
   byAgent: Record<string, PreviewEntry>;
+  /**
+   * agentId -> that agent's PROVEN public deploy url. See {@link ShippedDeploy} for why this is a
+   * map of its own rather than a `PreviewEntry` with a different url in it.
+   *
+   * IN-MEMORY LIKE THE REST OF THIS STORE, and for a reason of its own rather than by symmetry: a
+   * deploy url outlives the app, but the PROOF behind it does not. It was proven against one head
+   * sha at one instant; a branch that has since moved may be serving something else entirely at the
+   * same address. Restoring one at launch would put a card on screen asserting "this is your
+   * finished work" about a page nobody checked. A card that has to be re-recorded is the honest
+   * shape — and it is what makes retirement derived rather than swept, exactly as `byAgent` is.
+   */
+  shippedByAgent: Record<string, ShippedDeploy>;
   /** projectId -> what `preview_capability` said. `undefined` means NOT ASKED YET — deliberately
    *  distinct from `{ previewable: false }`, so a UI that hides an affordance on a false can tell
    *  "we know this project cannot be previewed" from "the probe has not answered". */
@@ -253,6 +309,12 @@ interface PreviewStoreState {
    *  own preview through the control bridge must not forge the returning-user signal that gates an
    *  unasked pane. */
   markPreviewOpenedForProject: (projectId: string) => void;
+  /** Record a proven public deploy url for this agent. The ONLY writer is
+   *  `services/shippedDeploy.recordShippedDeploy`, which validates before calling in. */
+  setShippedDeploy: (agentId: string, deploy: ShippedDeploy) => void;
+  /** Retire this agent's shipped card. Deletes the key rather than writing a tombstone, for the
+   *  reason `clearPreview` states directly above its own definition. */
+  clearShippedDeploy: (agentId: string) => void;
 }
 
 /** True when a wire update says nothing new. Compared field-by-field rather than by object
@@ -269,6 +331,7 @@ function sameUpdate(a: PreviewEntry, b: PreviewUpdate): boolean {
 
 export const usePreviewStore = create<PreviewStoreState>((set) => ({
   byAgent: {},
+  shippedByAgent: {},
   capability: {},
   openedProjects: {},
   // THE UNCHANGED-VALUE BAIL IS LOAD-BEARING, not a micro-optimisation. `preview:state` is emitted
@@ -350,6 +413,18 @@ export const usePreviewStore = create<PreviewStoreState>((set) => ({
         ? s
         : { openedProjects: { ...s.openedProjects, [projectId]: true } },
     ),
+  // NO UNCHANGED-VALUE BAIL, unlike every setter above, and that is deliberate rather than an
+  // oversight. Re-recording is how a shipped url is RE-PROVEN: the same address can be recorded
+  // again after a new deployment of a new sha, and `recordedAt` moving is the whole content of that
+  // event — it is what re-dates the card. A bail keyed on the url would swallow exactly that.
+  setShippedDeploy: (agentId, deploy) =>
+    set((s) => ({ shippedByAgent: { ...s.shippedByAgent, [agentId]: deploy } })),
+  clearShippedDeploy: (agentId) =>
+    set((s) => {
+      if (!(agentId in s.shippedByAgent)) return s;
+      const { [agentId]: _removed, ...shippedByAgent } = s.shippedByAgent;
+      return { shippedByAgent };
+    }),
 }));
 
 /**

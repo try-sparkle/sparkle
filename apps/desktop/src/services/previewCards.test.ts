@@ -19,11 +19,13 @@ import {
   isPreviewNoticeState,
   livePreviewCards,
   pendingPreviewNotices,
+  renderablePreviewCards,
   renderablePreviewNotices,
   PREVIEW_NOTICE_DETAIL_MAX,
 } from "./previewCards";
+import { SHIPPED_DEPLOY_PROVENANCE } from "./shippedDeploy";
 import { isSurfacingState } from "../stores/previewStore";
-import type { PreviewEntry, PreviewState } from "../stores/previewStore";
+import type { PreviewEntry, PreviewState, ShippedDeploy } from "../stores/previewStore";
 
 const ALL_STATES: PreviewState[] = [
   "installing",
@@ -473,5 +475,137 @@ describe("`serving` stays handled even though nothing produces it", () => {
     expect(livePreviewCards({ "ag-1": entry({ status: "serving" }) }).map((c) => c.agentId)).toEqual([
       "ag-1",
     ]);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE GATE WAS WIDENED BY PROVENANCE, AND BOTH DIRECTIONS ARE PINNED — bead ``
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `livePreviewCards` refused every non-loopback url outright, so a finished agent's PUBLIC deploy
+// url could not reach a human through the one card surface the app has. Widening that gate is a
+// predicate that both BLOCKS and ALLOWS, so AGENTS.md's bidirectional rule applies: a mutant that
+// ADMITS an arbitrary public url must red a test here, and a mutant that REFUSES the proven one must
+// red a DIFFERENT test here. The pairs below are written so each covers exactly one direction.
+//
+// The urls are the ones increment 1 measured on a real pull request — see `shippedDeploy.test.ts`'s
+// header for what each is and why two of them are indistinguishable from the third by any test on
+// the string.
+describe("shipped deploy urls reach the card surface — by PROVENANCE, not by loosening the url test", () => {
+  const PROVEN_URL = "https://sparkle-gxh98nicm-drodio1s-projects.vercel.app";
+  const INSPECTOR_URL = "https://vercel.com/drodio1s-projects/sparkle/Pe5mf3eRW1MMt5UVDkBCsanpTcuB";
+  const BRANCH_ALIAS_URL =
+    "https://-feature-activity-narration-drodio1s-projects.vercel.app";
+
+  const shipped = (over: Partial<ShippedDeploy> = {}): ShippedDeploy => ({
+    url: PROVEN_URL,
+    provenance: SHIPPED_DEPLOY_PROVENANCE,
+    prNumber: 3067,
+    sha: null,
+    environment: "Preview",
+    recordedAt: 7_000,
+    ...over,
+  });
+
+  // ── DIRECTION 1: the proven url MUST become a card ──────────────────────────────────────────
+  // A mutant that narrows the gate — inverting either `continue`, or requiring loopback here too —
+  // reds this and only this.
+  it("produces a SHIPPED card carrying the proven url and its pr number", () => {
+    const cards = livePreviewCards({}, { "ag-1": shipped() });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      agentId: "ag-1",
+      origin: "shipped",
+      url: PROVEN_URL,
+      prNumber: 3067,
+      surfacedAt: 7_000,
+      startedAt: 7_000,
+    });
+  });
+
+  // ── DIRECTION 2: an arbitrary public url must NOT ───────────────────────────────────────────
+  // A mutant that widens the gate — dropping the provenance test, or replacing the pair with "is
+  // this https" — reds these and not the one above.
+  it("refuses the branch alias when it does not carry the provenance token", () => {
+    // THE CASE THE WHOLE DESIGN EXISTS FOR. This url passes `isShareableDeployUrl` (asserted in
+    // `shippedDeploy.test.ts`), so if provenance were not the gate it would become a card — and a
+    // person would be told their work is live at an address the provider never built.
+    expect(
+      livePreviewCards({}, { "ag-1": shipped({ url: BRANCH_ALIAS_URL, provenance: "vercel-bot-comment" }) }),
+    ).toHaveLength(0);
+  });
+
+  it("refuses an ordinary public url smuggled in under no provenance at all", () => {
+    expect(
+      livePreviewCards({}, { "ag-1": shipped({ url: "https://example.com/", provenance: "" }) }),
+    ).toHaveLength(0);
+  });
+
+  it("refuses the provider DASHBOARD even when it carries the provenance token", () => {
+    // The floor under the gate: the token is not a skeleton key. Reds a mutant that drops the url
+    // test on the strength of "provenance already proved it".
+    expect(livePreviewCards({}, { "ag-1": shipped({ url: INSPECTOR_URL }) })).toHaveLength(0);
+  });
+
+  it("refuses a LOOPBACK url even with the provenance token — a shipped card is never local", () => {
+    expect(
+      livePreviewCards({}, { "ag-1": shipped({ url: "https://127.0.0.1:5173/" }) }),
+    ).toHaveLength(0);
+  });
+
+  // ── THE LOOPBACK GATE IS UNTOUCHED ──────────────────────────────────────────────────────────
+  // The widening must not have leaked into the OTHER map. This is the regression the whole "widen
+  // by provenance, not by loosening the url test" instruction is about: a `byAgent` entry carrying
+  // the proven url is still a dev server that is not on loopback, and still gets no card.
+  it("does NOT admit that same proven url when it arrives as a dev server's address", () => {
+    const byAgent = { "ag-1": entry({ status: "ready", url: PROVEN_URL }) };
+    expect(livePreviewCards(byAgent)).toHaveLength(0);
+    // …and it still falls through to a notice, so the partition is intact.
+    expect(pendingPreviewNotices(byAgent)).toHaveLength(1);
+  });
+
+  it("leaves the notice projection alone — a shipped card creates no notice", () => {
+    // `pendingPreviewNotices` reads `byAgent` only, so a shipped-only agent contributes nothing to
+    // it. Pinned because a notice beside a working card is the double-count this surface's own
+    // partition rule forbids.
+    expect(pendingPreviewNotices({})).toHaveLength(0);
+    expect(livePreviewCards({}, { "ag-1": shipped() })).toHaveLength(1);
+  });
+
+  it("gives ONE agent both cards when it has a live dev server AND a shipped deploy", () => {
+    // The ordinary state of an agent that finished and left its server up. Both are true facts and
+    // both are shown; they are told apart by `origin`, which is what picks the click path and the
+    // scope sentence. A projection that silently dropped one would be choosing for the reader.
+    const cards = livePreviewCards(
+      { "ag-1": entry({ status: "ready", surfacedAt: 9_000 }) },
+      { "ag-1": shipped({ recordedAt: 7_000 }) },
+    );
+    expect(cards.map((c) => c.origin)).toEqual(["local", "shipped"]);
+    // NEWEST FIRST, across both sources — the local one surfaced later, so it leads.
+    expect(cards[0]!.surfacedAt).toBe(9_000);
+  });
+
+  it("orders a tie total, so a re-render cannot shuffle two cards past each other", () => {
+    const at = 4_000;
+    const cards = livePreviewCards(
+      { "ag-1": entry({ status: "ready", surfacedAt: at }) },
+      { "ag-1": shipped({ recordedAt: at }) },
+    );
+    expect(cards.map((c) => c.origin)).toEqual(["local", "shipped"]);
+  });
+
+  it("carries a null prNumber on every LOCAL card — a dev server has no pull request", () => {
+    const cards = livePreviewCards({ "ag-1": entry({ status: "ready" }) });
+    expect(cards[0]).toMatchObject({ origin: "local", prNumber: null });
+  });
+
+  it("drops a shipped card whose agent the roster cannot name", () => {
+    // The same rule `renderablePreviewCards` already applied to local cards: a card whose whole
+    // proposition is "SOMEONE shipped this" is worthless when the someone cannot be named or opened.
+    const shippedByAgent = { "ag-gone": shipped() };
+    expect(renderablePreviewCards({}, [{ agents: [] }], shippedByAgent)).toHaveLength(0);
+    expect(
+      renderablePreviewCards({}, [{ agents: [{ id: "ag-gone", name: "Deployer" }] }], shippedByAgent),
+    ).toMatchObject([{ agentId: "ag-gone", name: "Deployer", origin: "shipped" }]);
   });
 });

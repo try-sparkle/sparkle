@@ -185,6 +185,14 @@ import {
   fetchPreviewStatus,
   type PreviewOpened,
 } from "./preview";
+// The SHIPPED half of the same card surface (bead ``). Both gates live there, so this
+// handler validates nothing itself — a second copy of a security predicate is how the two drift.
+import {
+  clearShippedDeploy,
+  recordShippedDeploy,
+  SHIPPED_DEPLOY_PROVENANCE,
+  type ShippedRecordRefusal,
+} from "./shippedDeploy";
 import type { PreviewState } from "../stores/previewStore";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab, AgentTabStatus } from "../types";
@@ -3339,10 +3347,38 @@ function handleNavigate(req: ControlRequest): Record<string, unknown> {
   return { ok: false, error: 'view must be "sparkle" | "board" | "agent"' };
 }
 
-/** The three sub-ops `preview` carries. Frozen contract, mirrored by the Zod enum in
- *  apps/mcp-control's `previewArgs`. */
-const PREVIEW_OPS = ["open", "close", "list"] as const;
+/** The sub-ops `preview` carries. Frozen contract, mirrored by the Zod enum in apps/mcp-control's
+ *  `previewArgs` — the two spellings are asserted against each other in `tools.test.ts` and
+ *  `controlListenerPreview.test.ts`, because nothing executes both sides of this socket.
+ *
+ *  `shipped` is the fourth and it is not a dev-server op at all (bead ``): it records a
+ *  PROVEN public deploy url so the finished work reaches the human as a card. It lives on this tool
+ *  rather than on one of its own because the card surface is this tool's, and the alternative — a
+ *  second tool that writes into the same strip — would put two writers on one projection. */
+const PREVIEW_OPS = ["open", "close", "list", "shipped"] as const;
 type PreviewSubOp = (typeof PREVIEW_OPS)[number];
+
+/**
+ * WHY A CLAIMED DEPLOY URL WAS REFUSED, in the caller's terms.
+ *
+ * A TOTAL `Record` over the refusal union, so adding a refusal in `services/shippedDeploy` without
+ * giving it a sentence is a COMPILE error rather than an agent receiving a bare code it cannot act
+ * on. Each sentence names the REMEDY it actually has — `unproven` is the one that can point at a
+ * command, and it does, because "run the resolver" is the entire answer and an agent that was told
+ * only "unproven" would most likely go and find a different url, which is the wrong move.
+ */
+const SHIPPED_REFUSAL_TEXT: Record<ShippedRecordRefusal, string> = {
+  "no-url": 'preview shipped needs a url — the one scripts/deploy-url-for-pr.sh printed on exit 0',
+  unproven:
+    `preview shipped needs provenance: "${SHIPPED_DEPLOY_PROVENANCE}", and it must be a url that ` +
+    "scripts/deploy-url-for-pr.sh printed on stdout at EXIT 0. Every other exit prints nothing on " +
+    "stdout on purpose: a provider dashboard and a branch alias for a deployment that was never " +
+    "built both look exactly like a live url, and showing one tells a person their work shipped " +
+    "when it did not.",
+  "not-shareable":
+    "preview shipped refused that url: it is not one that could be opened by somebody else — it " +
+    "must be https, with no userinfo, on a public host that is not a provider's own dashboard.",
+};
 
 /**
  * Is this a ROUTE ON THE DEV SERVER, rather than a URL?
@@ -3517,7 +3553,7 @@ async function handlePreview(req: ControlRequest): Promise<Record<string, unknow
     return {
       ok: false,
       code: "preview_bad_op",
-      error: `preview needs previewOp: "open", "close" or "list" (got ${JSON.stringify(requested) ?? "nothing"})`,
+      error: `preview needs previewOp: "open", "close", "list" or "shipped" (got ${JSON.stringify(requested) ?? "nothing"})`,
     };
   }
   // The caller's OWN row. Not `resolveTargetId` — that honours a payload-supplied `targetAgentId`,
@@ -3536,7 +3572,36 @@ async function handlePreview(req: ControlRequest): Promise<Record<string, unknow
       // server id is not proof of ownership — routing through the agent makes "stop someone else's
       // preview" unrepresentable rather than merely refused.
       const outcome = await stopPreviewForAgent(req.callerAgentId);
+      // AND RETIRE THE SHIPPED CARD TOO, because `close` is the caller saying "take my preview
+      // surface down" and a shipped card is on that surface. Deliberately NOT wired into
+      // `stopPreviewForAgent` itself: the idle-grace clock calls that to reclaim a dev server nobody
+      // is watching, and a reclaimed dev server says nothing at all about whether the work is still
+      // deployed — a shipped link silently disappearing because a server went quiet would be the
+      // clock retiring a fact it has no opinion about.
+      clearShippedDeploy(req.callerAgentId);
       return { ok: true, outcome };
+    }
+    if (sub === "shipped") {
+      // ══ THE ONE WAY A PUBLIC URL BECOMES A CARD (bead ``) ══════════════════════════
+      // NO WORKTREE IS REQUIRED, unlike `open` — a deploy url describes work that has already left
+      // this machine. The caller must still RESOLVE to an agent (the check above), because a card
+      // names its owner and `renderablePreviewCards` drops any card whose agent the roster cannot.
+      //
+      // THE APP DOES NOT GO AND CHECK. `scripts/deploy-url-for-pr.sh` is what proves a url, and it
+      // needs `gh`, a repo and a network — all of which the agent has and the frontend deliberately
+      // does not. So the agent runs the resolver and reports its verdict-0 answer here, and this
+      // side re-applies both gates before anything is stored: the provenance token, then the
+      // shareable-url floor. Every refusal is named, because the caller is an agent and "it did not
+      // work" is not something an agent can act on.
+      const result = recordShippedDeploy(req.callerAgentId, {
+        url: req.payload.url,
+        provenance: req.payload.provenance,
+        prNumber: req.payload.pr,
+        sha: req.payload.sha,
+        environment: req.payload.environment,
+      });
+      if (!result.ok) return { ok: false, code: `preview_shipped_${result.reason.replace(/-/g, "_")}`, error: SHIPPED_REFUSAL_TEXT[result.reason] };
+      return { ok: true, shipped: result.deploy };
     }
     if (sub === "list") {
       // SCOPED TO THE CALLER, and `listPreviews()` is deliberately NOT used. `preview_list` returns

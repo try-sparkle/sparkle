@@ -96,8 +96,17 @@ import {
   renderablePreviewNotices,
   previewCardShot,
   type NamedPreviewNoticeModel,
+  type PreviewCardOrigin,
   type PreviewNoticeState,
 } from "../../services/previewCards";
+// THE SHIPPED CARD'S CLICK-TIME GATE. Its loopback twin (`resolvePreviewOpenTarget`, imported just
+// below) asks the preview SUPERVISOR whether a port is still this agent's; a shipped url has no
+// supervisor and no port, so the same question is asked of the shipped store instead — synchronously,
+// because the store IS the live answer. See `services/shippedDeploy` for why it is re-asked at all.
+import {
+  resolveShippedOpenTarget,
+  type ShippedOpenRefusal,
+} from "../../services/shippedDeploy";
 // The CLICK-TIME ownership read. See `resolvePreviewOpenTarget`: the address a card is showing was
 // true when the event that made the card landed, and a dev server's port outlives the server —
 // which is how one agent's card came to open another agent's app. Nothing about the card can be
@@ -190,6 +199,24 @@ export const PREVIEW_OPEN_REFUSAL_COPY: Record<PreviewOpenRefusal, string> = {
   unreadable: "Didn't open — couldn't confirm this port is still this agent's.",
 };
 
+/**
+ * WHAT A SHIPPED CARD SAYS WHEN IT WILL NOT OPEN.
+ *
+ * A SEPARATE TABLE FROM {@link PREVIEW_OPEN_REFUSAL_COPY}, not a widening of it, because every
+ * sentence in that one is about a PORT and a dev server — "moved to a different port", "that port
+ * may belong to another agent now". None of that is true of a deploy url, and a refusal message is
+ * an instruction the reader will act on: telling somebody their published link failed because of a
+ * port sends them to look at something that does not exist (AGENTS.md, `sparkle-8bvh`).
+ *
+ * The union is narrower for the same reason — see {@link ShippedOpenRefusal} for which refusals a
+ * shipped card structurally cannot reach.
+ */
+export const PREVIEW_SHIPPED_REFUSAL_COPY: Record<ShippedOpenRefusal, string> = {
+  gone: "Didn't open — this link is no longer recorded as shipped, so it can't be confirmed live.",
+  moved: "Didn't open — a newer deploy replaced this link. The card is updated; click again.",
+  unsafe: "Didn't open — this link is no longer one that was proven deployed.",
+};
+
 /** The NOTICE strip — the second, separate zone this component paints. See the block comment above
  *  {@link PreviewNotices} for why it is a zone of its own rather than more cards. */
 export const PREVIEW_NOTICES_TESTID = "concierge-preview-notices";
@@ -257,6 +284,57 @@ export const PREVIEW_CARD_AGE_TICK_MS = 30_000;
  *  it, and because it is the founder's own wording — not a string to improve in passing. */
 export const PREVIEW_CARD_LEAD = "has a preview for you to review:";
 
+/** The same slot on a SHIPPED card. Deliberately a different sentence: this one is not an invitation
+ *  to review something in progress, it is the announcement the whole bead exists to make. */
+export const PREVIEW_SHIPPED_CARD_LEAD = "shipped this, and it is live on the web:";
+
+/**
+ * WHICH LEAD EACH KIND OF CARD USES — a total `Record` over {@link PreviewCardOrigin}, so adding an
+ * origin without giving it a sentence is a COMPILE error rather than a blank line where the card's
+ * only prose should be.
+ */
+export const PREVIEW_CARD_LEAD_BY_ORIGIN: Record<PreviewCardOrigin, string> = {
+  local: PREVIEW_CARD_LEAD,
+  shipped: PREVIEW_SHIPPED_CARD_LEAD,
+};
+
+/**
+ * WHO CAN OPEN THIS LINK — the one line on the card that is a CLAIM rather than a label, and the
+ * reason it is a constant with a ratchet on it.
+ *
+ * ══ THE TWO CARDS MAKE OPPOSITE PROMISES AND LOOK IDENTICAL ════════════════════════════════════
+ * A loopback preview runs on this machine and dies with its dev server; nobody else can open it,
+ * ever. A shipped deploy opens for anyone it is sent to. Before this bead the column held only the
+ * first kind, so its silence about scope was harmless. With both kinds side by side that silence
+ * becomes the ambiguity — and the wrong reading in either direction is a real cost: forwarding a
+ * localhost url to someone gets a "can't connect" from a colleague, and NOT forwarding a shipped one
+ * means the finished work never reaches the person it was for, which is the whole point of the card.
+ *
+ * ══ EACH ONE STATES ITS OWN LIMIT POSITIVELY, AND DENIES THE OTHER IN SO MANY WORDS ════════════
+ * `copyRatchet` (this component's suite) pins both halves of each, negative AND positive, because
+ * neither half holds on its own: a ratchet that only BANS the false claim is green over copy trimmed
+ * to say nothing at all, which leaves the reader with exactly the inference that was wrong. The
+ * explicit denial ("It is not a local preview") is what makes the positive ratchet's counterpart
+ * possible without the negative one reddening the honest sentence — see AGENTS.md's worked example.
+ */
+export const PREVIEW_LOCAL_SCOPE_NOTE =
+  "Runs on this machine only — this address will not open for anyone else.";
+export const PREVIEW_SHIPPED_SCOPE_NOTE =
+  "Anyone you send this link to can open it. It is not a local preview.";
+
+/** Total over {@link PreviewCardOrigin}, same rule as the lead table directly above: a new origin
+ *  without a scope sentence is a compile error, not a card that quietly claims nothing. */
+export const PREVIEW_CARD_SCOPE_NOTE_BY_ORIGIN: Record<PreviewCardOrigin, string> = {
+  local: PREVIEW_LOCAL_SCOPE_NOTE,
+  shipped: PREVIEW_SHIPPED_SCOPE_NOTE,
+};
+
+/** The scope line, so a test asserts the SENTENCE ON SCREEN rather than the constant it came from. */
+export const PREVIEW_CARD_SCOPE_TESTID = "concierge-preview-scope";
+/** The "PR #123" caption on a shipped card. Absent on a local card, and absent on a shipped card
+ *  whose pr number was not recorded — never rendered as "PR #null". */
+export const PREVIEW_CARD_PR_TESTID = "concierge-preview-pr";
+
 /**
  * Roughly two cards. Past that the strip scrolls INSIDE itself rather than growing, exactly as
  * `PinnedBlockers` does and for the same non-negotiable reason: nothing above the composer may push
@@ -323,12 +401,22 @@ function PreviewCard({
   url,
   name,
   surfacedAt,
+  origin,
+  prNumber,
 }: {
   agentId: string;
   url: string;
   name: string;
   surfacedAt: number;
+  /** WHICH CLAIM THIS CARD MAKES — see `PreviewCardModel.origin`. It picks the lead sentence, the
+   *  scope note, the click path and whether a screenshot is even attempted. Every one of those is a
+   *  place where doing the local thing to a shipped url is wrong, so it is a required prop rather
+   *  than one defaulting to `"local"`: a caller that forgot it should not compile. */
+  origin: PreviewCardOrigin;
+  /** The pull request a shipped url came from, for the caption. Null on a local card. */
+  prNumber: number | null;
 }) {
+  const shipped = origin === "shipped";
   /**
    * THIS AGENT'S PORT, subscribed BY AGENT ID rather than passed down with the url.
    *
@@ -352,7 +440,9 @@ function PreviewCard({
    *  cleared when the url changes — the `moved` refusal's whole point is that the card corrected
    *  itself, and wiping the sentence on that very re-render would leave the reader with a card that
    *  silently changed under them and no idea why nothing opened. */
-  const [refusal, setRefusal] = useState<PreviewOpenRefusal | null>(null);
+  const [refusal, setRefusal] = useState<
+    { kind: "local"; reason: PreviewOpenRefusal } | { kind: "shipped"; reason: ShippedOpenRefusal } | null
+  >(null);
   /** ONE OWNERSHIP READ IN FLIGHT AT A TIME. A refused click shows a sentence and nothing else
    *  moves, which is exactly the shape that invites a second and third click — and each one is a
    *  round trip to the supervisor. A ref rather than state: it must be read and set inside the same
@@ -423,11 +513,20 @@ function PreviewCard({
     // Rust's `supervise` watches the PROCESS, not the served page, and after the port binds it
     // emits nothing at all until the server dies. So there is no event arriving to key on, and the
     // ⟳ is the answer to it. See `previewCardShot`'s header (now corrected) for the loop itself.
+    // NO AUTOMATIC CAPTURE FOR A SHIPPED CARD, and this is a correctness gate rather than a saving.
+    // `previewCardShot` drives a headless Chromium against `preview_screenshot`, which resolves the
+    // agent's own LOOPBACK dev-server port from `previewStore.byAgent`. For a shipped url there is
+    // no such entry, so the capture can only refuse (`no-preview`) — and if the agent DOES happen to
+    // have a dev server running as well, it would succeed and paint a picture of a completely
+    // different page under a link that goes somewhere else. A card showing the wrong page is exactly
+    // the "the reader cannot tell" failure this whole surface was hardened against. The shipped card
+    // shows its url instead, which is the actionable half.
+    if (shipped) return;
     const key = `${agentId}|${url}|${surfacedAt}`;
     if (fetchedRef.current === key) return;
     fetchedRef.current = key;
     capture();
-  }, [agentId, url, surfacedAt, capture]);
+  }, [agentId, url, surfacedAt, capture, shipped]);
 
   // THE CAPTION'S OWN CLOCK. See `PREVIEW_CARD_AGE_TICK_MS`: nothing else re-renders a card while a
   // dev server sits quietly serving, so without this the age freezes at whatever it was when the
@@ -467,6 +566,33 @@ function PreviewCard({
     // and synchronously, so neither a slow ownership read nor a refusal can cost the signal. The
     // click happened either way, which is the fact the grace clock is asking about.
     notePreviewActivity(agentId);
+    // ══ THE SHIPPED PATH, AND IT MUST NOT GO THROUGH THE SUPERVISOR ═════════════════════════════
+    // `resolvePreviewOpenTarget` asks `preview_status` whether this agent's dev server still owns
+    // the port on the card. A shipped url has no dev server, so that read returns `null` and the
+    // decision is `gone` — every time, for every shipped card, which would make the link unopenable
+    // while looking like a stale-address refusal. The equivalent question for a deploy url is asked
+    // of the shipped store, which is where its proof lives: same two gates as the projection
+    // (provenance, then shareable), re-asked at the instant of the click, and no fallback on a
+    // refusal for the same reason the loopback path has none.
+    if (shipped) {
+      const decision = resolveShippedOpenTarget(agentId, { url });
+      if (!decision.ok) {
+        setRefusal({ kind: "shipped", reason: decision.reason });
+        console.warn(
+          "preview card: refusing to open shipped url",
+          agentId,
+          decision.reason,
+          decision.heldUrl,
+          decision.liveUrl,
+        );
+        return;
+      }
+      setRefusal(null);
+      void openUrl(decision.url).catch((e) =>
+        console.warn("preview card: open shipped url failed", decision.url, e),
+      );
+      return;
+    }
     if (openingRef.current) return;
     openingRef.current = true;
     void resolvePreviewOpenTarget(agentId, { url, port: heldPort })
@@ -475,7 +601,7 @@ function PreviewCard({
           // The card may have retired while the read was in flight — a retired card has no reader,
           // and writing to it is a React warning for no benefit. The absence of a navigation is
           // what matters, and that has already happened by not calling `openUrl`.
-          if (aliveRef.current) setRefusal(decision.reason);
+          if (aliveRef.current) setRefusal({ kind: "local", reason: decision.reason });
           console.warn(
             "preview card: refusing to open",
             agentId,
@@ -525,7 +651,16 @@ function PreviewCard({
       // that can only read the url can assert two cards DIFFER — never that each belongs to the
       // right agent, which is the claim that actually failed. Absent rather than `"null"` when
       // there is none, so "no port" and the string "null" cannot be confused.
-      data-preview-port={heldPort === null ? undefined : String(heldPort)}
+      // NEVER ON A SHIPPED CARD, and this is a correctness point rather than tidiness. The port is
+      // read from `byAgent`, i.e. from this agent's LOOPBACK dev server — a fact about a completely
+      // different address than the one a shipped card is showing. An agent that finished and left
+      // its server up has both, so the shipped card would advertise a local port beside a public
+      // url, which is the one pairing this whole surface exists to keep apart. It is also what
+      // `data-preview-port` means to every existing reader: "the port THIS card's url is on".
+      data-preview-port={shipped || heldPort === null ? undefined : String(heldPort)}
+      // WHICH KIND OF CLAIM THIS CARD MAKES, published as its own fact so a test asserts the SIDE
+      // EFFECT — "the shipped url produced a shipped card" — rather than inferring it from prose.
+      data-preview-origin={origin}
       // WHICH SIZE THIS CARD IS, published as a fact so a test asserts the expand SIDE EFFECT rather
       // than eyeballing a width. Absent rather than `"false"` when collapsed, so the attribute's
       // presence is itself the signal.
@@ -596,7 +731,7 @@ function PreviewCard({
             cursor: "pointer",
           }}
         >
-          {PREVIEW_CARD_LEAD}
+          {PREVIEW_CARD_LEAD_BY_ORIGIN[origin]}
         </button>
       </div>
       {shotState ? (
@@ -624,6 +759,34 @@ function PreviewCard({
           {url}
         </span>
       )}
+      {/* WHO CAN OPEN THIS — see `PREVIEW_LOCAL_SCOPE_NOTE`. Present on BOTH kinds of card, always,
+          because the claim it makes is only unambiguous when its counterpart is also on screen: a
+          shipped card that says "anyone can open this" beside a silent local card still leaves the
+          local one to be guessed at. Not gated on the screenshot either — it is a statement about the
+          LINK, and the link is on the card whether or not a picture ever arrived. */}
+      <span
+        data-testid={PREVIEW_CARD_SCOPE_TESTID}
+        style={{
+          color: C.conciergeMuted,
+          fontSize: TYPE.micro,
+          minWidth: 0,
+          whiteSpace: "normal",
+          overflowWrap: "anywhere",
+        }}
+      >
+        {PREVIEW_CARD_SCOPE_NOTE_BY_ORIGIN[origin]}
+      </span>
+      {shipped && prNumber !== null && (
+        // WHICH PULL REQUEST THIS WAS PROVEN FROM. Rendered only when there IS one — a caption
+        // reading "PR #null" is worse than no caption, and `prNumber` is null whenever the resolver
+        // could not name one.
+        <span
+          data-testid={PREVIEW_CARD_PR_TESTID}
+          style={{ color: C.conciergeMuted, fontSize: TYPE.micro, minWidth: 0 }}
+        >
+          {`PR #${prNumber}`}
+        </span>
+      )}
       {refusal && (
         // THE ONE THING ON THE CARD THAT SAYS A CLICK WAS REFUSED. Without it the fix trades a
         // wrong app for a dead-looking card, and a dead-looking card gets clicked again.
@@ -648,7 +811,9 @@ function PreviewCard({
             overflowWrap: "anywhere",
           }}
         >
-          {PREVIEW_OPEN_REFUSAL_COPY[refusal]}
+          {refusal.kind === "shipped"
+            ? PREVIEW_SHIPPED_REFUSAL_COPY[refusal.reason]
+            : PREVIEW_OPEN_REFUSAL_COPY[refusal.reason]}
         </div>
       )}
       {/* THE FOOTER ROW — always present, and its two halves are gated DIFFERENTLY on purpose.
@@ -715,6 +880,13 @@ function PreviewCard({
             <FiExternalLink size={11} />
           </button>
         </span>
+        {/* NO ⟳ ON A SHIPPED CARD. The control re-captures a SNAPSHOT, and a shipped card has none
+            and can never have one — see the capture effect for why driving the screenshot path at a
+            deploy url would paint a picture of a different page. A button whose only possible
+            outcome is "couldn't refresh" is the dead-looking button this file's own comments spend
+            three paragraphs arguing against. */}
+        {!shipped && (
+        <>
         {/* FENCED, like the pill: a click here must re-capture and NOT also launch a browser.
             DISABLED WHILE ONE IS IN FLIGHT — see `busy`; a capture is a whole browser process.
 
@@ -753,6 +925,8 @@ function PreviewCard({
           <FiRefreshCw size={10} />
         </button>
         </span>
+        </>
+        )}
       </div>
     </div>
   );
@@ -917,12 +1091,16 @@ function PreviewNotices({ notices }: { notices: NamedPreviewNoticeModel[] }) {
  */
 export function PreviewCards() {
   const byAgent = usePreviewStore((s) => s.byAgent);
+  // THE SHIPPED HALF, subscribed as its own slice. A separate map rather than a field on
+  // `PreviewEntry` — see `ShippedDeploy`'s docstring — so a shipped url can never be mistaken for a
+  // dev server by the idle clock, and a dev-server event can never overwrite it.
+  const shippedByAgent = usePreviewStore((s) => s.shippedByAgent);
   const projects = useProjectStore((s) => s.projects);
   // BOTH GATES IN ONE PLACE — the store's (`ready`/`serving` on a loopback url) and the roster's
   // (an agent that is not in the fleet has nothing to show). The roster half used to be inline
   // here, which made this component's answer to "is this preview on screen?" differ from
   // `previewIdleGrace`'s, and the disagreement leaked a dev server. See `renderablePreviewCards`.
-  const named = renderablePreviewCards(byAgent, projects);
+  const named = renderablePreviewCards(byAgent, projects, shippedByAgent);
   // THE SECOND PROJECTION, kept separate all the way down. Broadening `renderablePreviewCards` to
   // cover these states would have changed which dev servers `previewIdleGrace` reclaims — a
   // lifecycle change wearing the costume of a UI change. See `services/previewCards`' second header.
@@ -975,12 +1153,18 @@ function PreviewCardStrip({ named }: { named: ReturnType<typeof renderablePrevie
       }}
     >
       {named.map((c) => (
+        // KEYED ON (agent, origin), not on the agent alone. One agent can legitimately have BOTH a
+        // running dev server and a shipped deploy — that is the ordinary state of an agent that
+        // finished and left its server up — and a duplicate React key silently drops one of the two
+        // and reuses the survivor's state for whichever renders next.
         <PreviewCard
-          key={c.agentId}
+          key={`${c.origin}:${c.agentId}`}
           agentId={c.agentId}
           url={c.url}
           name={c.name}
           surfacedAt={c.surfacedAt}
+          origin={c.origin}
+          prNumber={c.prNumber}
         />
       ))}
     </div>
@@ -1045,12 +1229,18 @@ function ThreadPreviewNotice({ notice }: { notice: NamedPreviewNoticeModel }) {
  * one frame every time a preview arrives. The write is idempotent and keyed by agent id (the same
  * shape a render-time memo cache has), so a double render under StrictMode produces the same map.
  *
- * ══ ONE ARTIFACT PER AGENT ═════════════════════════════════════════════════════════════════════
- * The card projection and the notice projection are disjoint by construction (see
- * `services/previewCards`: a notice exists exactly where a card cannot), so an agent contributes
- * one or the other and never both. Sharing ONE anchor map across the two is what lets an artifact
- * hold its place while an install turns into a running server — the reader watches one item change
- * state rather than watching it vanish and reappear at the bottom.
+ * ══ ONE ANCHOR PER ARTIFACT, WHICH IS NO LONGER ONE PER AGENT (bead ``) ═════════════
+ * The card projection and the notice projection are disjoint over `previewStore.byAgent` — a notice
+ * exists exactly where a LOCAL card cannot — so an agent contributes one or the other of THOSE and
+ * never both, and they share an anchor key on purpose: that is what lets an artifact hold its place
+ * while an install turns into a running server, so the reader watches one item change state rather
+ * than watching it vanish and reappear at the bottom.
+ *
+ * A SHIPPED card is outside that partition. It comes from a different map, it arrives at a different
+ * moment, and an agent can have one at the same time as a local card or a notice — so it gets its
+ * own anchor, keyed by `(kind, agentId)`. Keying the whole map on the bare agent id was total before
+ * and is not now; the two would otherwise share one anchor and the second would be glued to wherever
+ * the first happened to land.
  */
 export function PreviewThreadArtifacts({
   messages,
@@ -1063,8 +1253,9 @@ export function PreviewThreadArtifacts({
   // roster gate lives in `renderablePreviewCards` and why broadening it would change which dev
   // servers `previewIdleGrace` reclaims.
   const byAgent = usePreviewStore((s) => s.byAgent);
+  const shippedByAgent = usePreviewStore((s) => s.shippedByAgent);
   const projects = useProjectStore((s) => s.projects);
-  const named = renderablePreviewCards(byAgent, projects);
+  const named = renderablePreviewCards(byAgent, projects, shippedByAgent);
   const notices = renderablePreviewNotices(byAgent, projects);
 
   const anchors = useRef(new Map<string, string | null>());
@@ -1085,14 +1276,22 @@ export function PreviewThreadArtifacts({
   // below cannot actually be contending with a notice for an agent; it is ordered second so that if
   // that ever stops being true the openable surface wins, matching what the reader would be looking
   // at. With one clock the order no longer changes the VALUE either way — which is the point.
+  // KEYED BY ARTIFACT, NOT BY AGENT (bead ``). This was keyed on the bare agent id, which
+  // was total while the two projections partitioned the agent space — one agent, one artifact. A
+  // shipped card breaks that: an agent can have a running dev server AND a shipped deploy, and they
+  // arrived at different moments and belong at different points in the conversation. Sharing one
+  // anchor would glue the second to wherever the first landed. The notice key stays the bare agent id
+  // so an install that becomes a running server keeps its place, which is the property the shared map
+  // was written for in the first place.
+  const artifactKey = (kind: "notice" | PreviewCardOrigin, agentId: string) => `${kind}:${agentId}`;
   const arrivedAt = new Map<string, number>();
-  for (const n of notices) arrivedAt.set(n.agentId, n.startedAt);
-  for (const c of named) arrivedAt.set(c.agentId, c.startedAt);
+  for (const n of notices) arrivedAt.set(artifactKey("notice", n.agentId), n.startedAt);
+  for (const c of named) arrivedAt.set(artifactKey(c.origin, c.agentId), c.startedAt);
   // FORGOTTEN WITH THE CARD. Retirement is derived (see the file header), so an agent that drops out
   // of both projections drops its anchor too — and a preview that comes back is news again and
   // anchors to wherever the conversation is then.
-  for (const agentId of Array.from(anchors.current.keys())) {
-    if (!arrivedAt.has(agentId)) anchors.current.delete(agentId);
+  for (const key of Array.from(anchors.current.keys())) {
+    if (!arrivedAt.has(key)) anchors.current.delete(key);
   }
   // STILL CAPTURED ONCE, ON FIRST SIGHT. The derivation is stable under a growing conversation on its
   // own — a message that arrives later cannot have arrived before `at` — but only while the messages
@@ -1100,27 +1299,32 @@ export function PreviewThreadArtifacts({
   // newest anchorable message", which recomputed every render is precisely the glued-to-the-bottom
   // behaviour this whole surface exists to avoid. So the ref stays: it is what makes the fallback
   // safe, and it keeps the write on the SAME render that first draws the card (see the docstring).
-  for (const [agentId, at] of arrivedAt) {
-    if (!anchors.current.has(agentId)) anchors.current.set(agentId, anchorableIdAt(messages, at));
+  for (const [key, at] of arrivedAt) {
+    if (!anchors.current.has(key)) anchors.current.set(key, anchorableIdAt(messages, at));
   }
-  const anchorFor = (agentId: string) => anchors.current.get(agentId) ?? null;
+  const anchorFor = (key: string) => anchors.current.get(key) ?? null;
 
   const artifacts: ThreadArtifact[] = [
     ...named.map((c) => ({
-      id: `preview-card:${c.agentId}`,
-      afterMessageId: anchorFor(c.agentId),
+      // THE ORIGIN IS PART OF THE ARTIFACT ID for the same reason it is part of the React key in the
+      // strip: one agent can contribute both a local and a shipped card, and two artifacts sharing an
+      // id is a collision the thread has no way to report.
+      id: `preview-card:${c.origin}:${c.agentId}`,
+      afterMessageId: anchorFor(artifactKey(c.origin, c.agentId)),
       node: (
         <PreviewCard
           agentId={c.agentId}
           url={c.url}
           name={c.name}
           surfacedAt={c.surfacedAt}
+          origin={c.origin}
+          prNumber={c.prNumber}
         />
       ),
     })),
     ...notices.map((n) => ({
       id: `preview-notice:${n.agentId}`,
-      afterMessageId: anchorFor(n.agentId),
+      afterMessageId: anchorFor(artifactKey("notice", n.agentId)),
       node: <ThreadPreviewNotice notice={n} />,
     })),
   ];

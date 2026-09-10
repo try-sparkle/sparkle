@@ -11,6 +11,9 @@
 // claiming to be scoped.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { useProjectStore } from "../stores/projectStore";
+import { usePreviewStore } from "../stores/previewStore";
+import { livePreviewCards } from "./previewCards";
+import { SHIPPED_DEPLOY_PROVENANCE } from "./shippedDeploy";
 import type { PreviewState, PreviewStatus } from "../stores/previewStore";
 import {
   startControlListener,
@@ -115,6 +118,7 @@ describe("control op: preview", () => {
     stopPreviewForAgentMock.mockClear();
     fetchPreviewStatusMock.mockClear();
     listPreviewsMock.mockClear();
+    usePreviewStore.setState({ byAgent: {}, shippedByAgent: {} });
     useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
@@ -655,5 +659,145 @@ describe("control op: preview", () => {
     const reply = lastReply();
     expect(reply.ok).toBe(false);
     expect(String(reply.error)).toMatch(/already-starting/);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// previewOp: "shipped" — the ONE way a proven public deploy url becomes a card (bead )
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// THE SIDE EFFECT ASSERTED IS A CARD, not a reply and not a store key. `livePreviewCards` is the
+// app's definition of "a preview the human can open", so a row that ends at the store would pass
+// against a handler that wrote an entry no projection will ever surface — which is precisely the
+// state this increment started from.
+//
+// EVERY REFUSAL ROW ASSERTS **ZERO CARDS** rather than a `ok: false` reply, for the same reason:
+// the cost of getting this wrong is a person being sent to a login wall or to a page that was never
+// built, and a handler that both refused AND wrote would satisfy a reply-only assertion.
+describe("control op: preview shipped", () => {
+  let cleanup: (() => void) | undefined;
+  let projectId: string;
+  let buildId: string;
+  const PROVEN_URL = "https://sparkle-gxh98nicm-drodio1s-projects.vercel.app";
+  const INSPECTOR_URL = "https://vercel.com/drodio1s-projects/sparkle/Pe5mf3eRW1MMt5UVDkBCsanpTcuB";
+  const BRANCH_ALIAS_URL =
+    "https://-feature-activity-narration-drodio1s-projects.vercel.app";
+
+  const cards = () =>
+    livePreviewCards(
+      usePreviewStore.getState().byAgent,
+      usePreviewStore.getState().shippedByAgent,
+    );
+
+  beforeEach(async () => {
+    firedHandler = undefined;
+    controlResponds.length = 0;
+    invokeMock.mockClear();
+    stopPreviewForAgentMock.mockClear();
+    usePreviewStore.setState({ byAgent: {}, shippedByAgent: {} });
+    useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
+    const store = useProjectStore.getState();
+    projectId = store.addProject("Demo", "/tmp/demo");
+    buildId = store.addAgent(projectId, { kind: "build" })!;
+    // DELIBERATELY NO WORKTREE. A shipped url describes work that has already left this machine, so
+    // unlike `open` this op must not require one — asserted by the happy path below succeeding.
+    cleanup = await startControlListener();
+  });
+  afterEach(() => {
+    cleanup?.();
+    cleanup = undefined;
+  });
+
+  const ship = (payload: Record<string, unknown>, reqId = "s1") =>
+    fire({ reqId, op: "preview", callerAgentId: buildId, payload: { previewOp: "shipped", ...payload } });
+
+  it("records a proven url and it becomes a SHIPPED card for the calling agent", async () => {
+    expect(cards()).toHaveLength(0);
+    ship({
+      url: PROVEN_URL,
+      provenance: SHIPPED_DEPLOY_PROVENANCE,
+      pr: 3067,
+      sha: "543021e0543021e0543021e0543021e0543021e0",
+      environment: "Preview",
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true });
+    expect(cards()).toMatchObject([
+      { agentId: buildId, origin: "shipped", url: PROVEN_URL, prNumber: 3067 },
+    ]);
+  });
+
+  it("refuses the branch alias that carries no provenance, and creates NO card", async () => {
+    // The measured trap: a public https url, on the provider's own host, for a deployment the same
+    // bot comment called skipped. Nothing about the string disqualifies it — the provenance does.
+    ship({ url: BRANCH_ALIAS_URL, provenance: "vercel-bot-comment" });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "preview_shipped_unproven" });
+    // The refusal has to tell an agent what to DO, and the only thing that helps is the resolver.
+    expect(String(lastReply().error)).toContain("deploy-url-for-pr.sh");
+    expect(cards()).toHaveLength(0);
+  });
+
+  it("refuses the provider DASHBOARD even with the provenance token, and creates NO card", async () => {
+    ship({ url: INSPECTOR_URL, provenance: SHIPPED_DEPLOY_PROVENANCE });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "preview_shipped_not_shareable" });
+    expect(cards()).toHaveLength(0);
+  });
+
+  it("refuses a missing url", async () => {
+    ship({ provenance: SHIPPED_DEPLOY_PROVENANCE });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "preview_shipped_no_url" });
+    expect(cards()).toHaveLength(0);
+  });
+
+  it("records against the CALLER, never the agent the payload names", async () => {
+    // The same confused-deputy property `open` has, and it must hold here too: a card names its
+    // owner, and one agent claiming another has shipped is a lie with a person's name on it.
+    const otherId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+    fire({
+      reqId: "s-spoof",
+      op: "preview",
+      callerAgentId: buildId,
+      payload: {
+        previewOp: "shipped",
+        url: PROVEN_URL,
+        provenance: SHIPPED_DEPLOY_PROVENANCE,
+        agentId: otherId,
+        targetAgentId: otherId,
+      },
+    });
+    await flush();
+    expect(cards().map((c) => c.agentId)).toEqual([buildId]);
+  });
+
+  it("refuses a caller that resolves to no agent", async () => {
+    fire({
+      reqId: "s-unknown",
+      op: "preview",
+      callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+      payload: { previewOp: "shipped", url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "preview_unknown_caller" });
+    expect(cards()).toHaveLength(0);
+  });
+
+  it("close retires the shipped card along with the dev server", async () => {
+    ship({ url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE });
+    await flush();
+    expect(cards()).toHaveLength(1);
+    fire({ reqId: "s-close", op: "preview", callerAgentId: buildId, payload: { previewOp: "close" } });
+    await flush();
+    expect(stopPreviewForAgentMock).toHaveBeenCalledWith(buildId);
+    expect(cards()).toHaveLength(0);
+  });
+
+  it("names 'shipped' in the bad-op refusal, so the op is discoverable from a typo", async () => {
+    fire({ reqId: "s-bad", op: "preview", callerAgentId: buildId, payload: { previewOp: "shippedd" } });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "preview_bad_op" });
+    expect(String(lastReply().error)).toContain("shipped");
   });
 });

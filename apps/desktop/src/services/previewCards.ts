@@ -32,15 +32,48 @@ import { previewScreenshot } from "./conciergeTools/previewInspect";
 // into the second, with its own containment check on the path it was handed.
 import { loadAttachment } from "../components/composer/attachmentsApi";
 import { isLoopbackPreviewUrl } from "./preview";
-import { isSurfacingState, type PreviewEntry, type PreviewState } from "../stores/previewStore";
+// THE PROVENANCE GATE for the second kind of card — see `livePreviewCards`' widening note and
+// `services/shippedDeploy`' own header. Imported rather than re-implemented, for the same reason
+// `isLoopbackPreviewUrl` is: a second copy of a url predicate is how the two drift.
+import { isShareableDeployUrl, SHIPPED_DEPLOY_PROVENANCE } from "./shippedDeploy";
+import {
+  isSurfacingState,
+  type PreviewEntry,
+  type PreviewState,
+  type ShippedDeploy,
+} from "../stores/previewStore";
 
 /** One card's worth of fact. Deliberately tiny: everything else a card draws (the agent's name, its
  *  status dot, whether it can be opened) is resolved from the live roster at render time, so a card
  *  cannot go stale in a way the rest of the column does not. */
+export type PreviewCardOrigin =
+  /** A dev server in the agent's own worktree. Loopback, ephemeral, visible only on this machine. */
+  | "local"
+  /** A PROVEN public deploy of the agent's finished work — `scripts/deploy-url-for-pr.sh` verdict 0,
+   *  recorded through `services/shippedDeploy`. Shareable, and outlives the agent's dev server. */
+  | "shipped";
+
 export interface PreviewCardModel {
   agentId: string;
-  /** ALREADY PROVEN LOOPBACK by {@link livePreviewCards}. A consumer may render it directly. */
+  /**
+   * WHICH KIND OF CLAIM THIS CARD MAKES, and it is not cosmetic — the two are different promises to
+   * the reader and a consumer MUST branch on it. A `local` url opens for nobody but the person
+   * sitting at this machine; a `shipped` url opens for anyone it is sent to. Saying either about the
+   * other is the specific lie this field exists to make impossible to tell by accident, which is why
+   * the consumer's wording is a total `Record` over this union rather than a ternary.
+   *
+   * It also picks the CLICK PATH: a `local` card re-derives its address from the preview supervisor
+   * (`resolvePreviewOpenTarget`), a `shipped` card from the shipped store
+   * (`resolveShippedOpenTarget`). Asking the supervisor about a shipped url would be told `gone`,
+   * every time, because there is no dev server behind it.
+   */
+  origin: PreviewCardOrigin;
+  /** ALREADY PROVEN by {@link livePreviewCards} — loopback for `local`, provenance + shareable for
+   *  `shipped`. A consumer may render it directly. */
   url: string;
+  /** The pull request a `shipped` url was resolved from, for the card's caption. Always null on a
+   *  `local` card, which has no pull request. */
+  prNumber: number | null;
   /**
    * When this preview last BECAME worth surfacing (`previewStore`'s `surfacedAt`), or when its
    * entry first appeared. The card re-captures its snapshot when this moves — see below for why
@@ -101,11 +134,22 @@ export interface PreviewCardRoster {
  *     subtle enough to get wrong twice (it parses rather than string-matches, precisely so that
  *     `127.0.0.1.evil.com` and `evil.com/#127.0.0.1` cannot pass).
  *
+ * ══ AND A SECOND SOURCE, ADMITTED BY PROVENANCE (bead ``) ═══════════════════════════
+ * `shippedByAgent` holds PROVEN public deploy urls. Its entries are admitted by where they came
+ * from, not by relaxing the url test above — the loopback gate is untouched and still refuses every
+ * non-loopback `byAgent` url. The full argument is in the loop itself; the one-line version is that
+ * a login-walled provider dashboard and a branch alias for a deployment that was never built are
+ * both perfectly ordinary public https urls, so no test on the string can separate them from a real
+ * one. The argument is DEFAULTED to `{}` so every existing caller and fixture is unchanged.
+ *
  * A PURE FUNCTION over the store's map, so the whole "which cards exist" question is testable
  * without rendering anything — and so the retirement rule is one readable expression rather than a
  * lifecycle scattered across a component.
  */
-export function livePreviewCards(byAgent: Record<string, PreviewEntry>): PreviewCardModel[] {
+export function livePreviewCards(
+  byAgent: Record<string, PreviewEntry>,
+  shippedByAgent: Record<string, ShippedDeploy> = {},
+): PreviewCardModel[] {
   const cards: { card: PreviewCardModel; at: number }[] = [];
   for (const [agentId, entry] of Object.entries(byAgent)) {
     if (!entry || !isSurfacingState(entry.status)) continue;
@@ -117,11 +161,69 @@ export function livePreviewCards(byAgent: Record<string, PreviewEntry>): Preview
     const at = entry.surfacedAt ?? entry.startedAt;
     // `at` orders the cards and drives snapshot recapture; `startedAt` is carried UNMODIFIED beside
     // it because an anchor needs one instant per agent that does not move — see the field docstring.
-    cards.push({ card: { agentId, url, surfacedAt: at, startedAt: entry.startedAt }, at });
+    cards.push({
+      card: {
+        agentId,
+        origin: "local",
+        url,
+        prNumber: null,
+        surfacedAt: at,
+        startedAt: entry.startedAt,
+      },
+      at,
+    });
+  }
+  // ══ THE SECOND SOURCE, AND THE WIDENING IS BY PROVENANCE ═════════════════════════════════════
+  // Everything above is the loopback gate, unchanged. This loop is the answer to bead ``:
+  // a finished agent's PROVEN public deploy url, reaching the reader through the same card surface a
+  // localhost preview already uses.
+  //
+  // WHAT WAS **NOT** DONE, and it is the whole design decision: `isLoopbackPreviewUrl` was not
+  // loosened, and no url found in text can produce a card. The two gates below are (1) the entry
+  // came out of `previewStore.shippedByAgent`, whose only writer is
+  // `services/shippedDeploy.recordShippedDeploy`, and (2) it carries the provenance token that
+  // `scripts/deploy-url-for-pr.sh` stamps on a verdict-0 answer — a GitHub `deployment_status` with
+  // `state: "success"` and a non-empty `environment_url`. `isShareableDeployUrl` sits under those as
+  // a FLOOR, never as the gate: increment 1 measured two urls on a real pull request that pass every
+  // possible test on the string and are both wrong — Vercel's login-walled inspector dashboard, and
+  // a branch alias for a deployment the provider itself skipped. Nothing about a url can tell you
+  // whether anything was deployed at it; only where the url came from can.
+  //
+  // A SEPARATE MAP, NOT A `PreviewEntry` — see `ShippedDeploy`'s docstring. It is also why this
+  // widening cannot change which dev servers `previewIdleGrace` reclaims: that clock reads
+  // `byAgent`, which this loop does not touch. Nor can it steal a NOTICE: `pendingPreviewNotices`
+  // reads `byAgent` too, so an agent whose dev server failed still says so, beside its shipped card.
+  for (const [agentId, deploy] of Object.entries(shippedByAgent)) {
+    if (!deploy) continue;
+    if (deploy.provenance !== SHIPPED_DEPLOY_PROVENANCE) continue;
+    if (!isShareableDeployUrl(deploy.url)) continue;
+    // ONE INSTANT FOR BOTH CLOCKS, deliberately. A shipped deploy has no startup window — there is
+    // no gap between "this entry appeared" and "this became worth showing" for the thread anchor to
+    // fall into (see `startedAt`'s docstring for the gap a dev server has, and what it cost).
+    const at = deploy.recordedAt;
+    cards.push({
+      card: {
+        agentId,
+        origin: "shipped",
+        url: deploy.url,
+        prNumber: deploy.prNumber,
+        surfacedAt: at,
+        startedAt: at,
+      },
+      at,
+    });
   }
   // NEWEST FIRST, because the newest preview is the one the reader has not seen yet. Ties fall back
-  // to the agent id so the order is total and a re-render cannot shuffle two cards past each other.
-  cards.sort((a, b) => b.at - a.at || a.card.agentId.localeCompare(b.card.agentId));
+  // to the agent id, and then to the ORIGIN, so the order is total even for the one agent that has
+  // both a running dev server and a shipped url — without the last clause `sort` would be free to
+  // shuffle that pair on a re-render, and a card that swaps places under the reader is the same
+  // "it silently moved" symptom the anchor exists to remove.
+  cards.sort(
+    (a, b) =>
+      b.at - a.at ||
+      a.card.agentId.localeCompare(b.card.agentId) ||
+      a.card.origin.localeCompare(b.card.origin),
+  );
   return cards.map((c) => c.card);
 }
 
@@ -147,9 +249,10 @@ export function livePreviewCards(byAgent: Record<string, PreviewEntry>): Preview
 export function renderablePreviewCards(
   byAgent: Record<string, PreviewEntry>,
   projects: readonly PreviewCardRoster[],
+  shippedByAgent: Record<string, ShippedDeploy> = {},
 ): NamedPreviewCardModel[] {
   const named: NamedPreviewCardModel[] = [];
-  for (const card of livePreviewCards(byAgent)) {
+  for (const card of livePreviewCards(byAgent, shippedByAgent)) {
     for (const project of projects) {
       const agent = project.agents.find((a) => a.id === card.agentId);
       if (agent) {

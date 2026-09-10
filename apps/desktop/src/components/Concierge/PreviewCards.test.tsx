@@ -44,10 +44,22 @@ import {
   PREVIEW_NOTICE_AGE_TESTID,
   PREVIEW_NOTICE_LEAD,
   PREVIEW_ZONE_TESTID,
+  PreviewThreadArtifacts,
+  PREVIEW_SHIPPED_CARD_LEAD,
+  PREVIEW_SHIPPED_REFUSAL_COPY,
+  PREVIEW_CARD_SCOPE_TESTID,
+  PREVIEW_CARD_PR_TESTID,
+  PREVIEW_LOCAL_SCOPE_NOTE,
+  PREVIEW_SHIPPED_SCOPE_NOTE,
 } from "./PreviewCards";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { expectAnnounced, flattenedBy } from "../../testing/announcedControls";
 import { applyPreviewStatus } from "../../services/preview";
+// THE REAL WRITER, not a store seed. `recordShippedDeploy` is what the `preview shipped` control op
+// calls, and it is where both gates live — so a row that drives it is asserting the production path
+// rather than a shape the writer is supposed to produce (AGENTS.md's vacuous-fixture rule, and the
+// same reason every local card below arrives through `applyPreviewStatus`).
+import { recordShippedDeploy, SHIPPED_DEPLOY_PROVENANCE } from "../../services/shippedDeploy";
 import { usePreviewStore, type PreviewState, type PreviewStatus } from "../../stores/previewStore";
 import { useProjectStore } from "../../stores/projectStore";
 import type { MentionAgent } from "./mentions";
@@ -179,7 +191,7 @@ beforeEach(() => {
   // `preview_status` DOES answer, because it is the click-time ownership read every open goes
   // through — a bridge that refuses it would make every card refuse, which is not the ordinary case.
   invokeMock.mockImplementation(defaultInvoke);
-  usePreviewStore.setState({ byAgent: {}, capability: {}, openedProjects: {} });
+  usePreviewStore.setState({ byAgent: {}, shippedByAgent: {}, capability: {}, openedProjects: {} });
   useProjectStore.setState({
     projects: [
       {
@@ -1442,5 +1454,373 @@ describe("PreviewCards — the card sizes to a third and expands in place", () =
     // -from-one-gesture surprise the fence exists to prevent.
     expect(cardFor(OTTER)!.getAttribute("data-expanded")).toBeNull();
     expect(cardFor(OTTER)!.style.width).toBe(PREVIEW_CARD_COLLAPSED_WIDTH);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// A SHIPPED DEPLOY URL REACHES THE HUMAN AS A CLICKABLE CARD — bead ``, increment 2
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// This is the deliverable, asserted at the surface it has to reach. Increment 1 built the resolver;
+// nothing in the app read it back, because this component's projection refused every non-loopback
+// url outright. The rows below assert the SIDE EFFECT — a card with the proven url in the DOM, and
+// a real `openUrl` call carrying that url — rather than that the store has an entry in it.
+//
+// EVERY ABSENCE IS MOUNTED BESIDE ITS PRESENT TWIN, exactly as this file's header requires: a
+// refused url is asserted with an accepted one on screen, so "renders nothing" cannot be satisfied
+// by a component that renders nothing at all.
+describe("a proven public deploy url becomes a shipped card", () => {
+  const PROVEN_URL = "https://sparkle-gxh98nicm-drodio1s-projects.vercel.app";
+  const BRANCH_ALIAS_URL =
+    "https://-feature-activity-narration-drodio1s-projects.vercel.app";
+
+  /** Drive the REAL writer, the one `preview shipped` calls. */
+  function ship(agentId: string, over: Record<string, unknown> = {}) {
+    act(() => {
+      recordShippedDeploy(
+        agentId,
+        { url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE, prNumber: 3067, ...over },
+        6_000,
+      );
+    });
+  }
+
+  function originsOnScreen(): [string, string][] {
+    return screen
+      .queryAllByTestId(PREVIEW_CARD_TESTID)
+      .map((el) => [
+        el.getAttribute("data-preview-origin") ?? "",
+        el.getAttribute("data-preview-url") ?? "",
+      ]);
+  }
+
+  it("renders the proven url as a card, named and clickable", () => {
+    mount();
+    expect(cardsOnScreen()).toEqual([]);
+
+    ship(KRAKEN);
+    expect(originsOnScreen()).toEqual([["shipped", PROVEN_URL]]);
+    // Its own lead, not the localhost one — see the copy ratchet below for why the two must differ.
+    expect(screen.getByText(PREVIEW_SHIPPED_CARD_LEAD)).toBeTruthy();
+    expect(screen.queryByText(PREVIEW_CARD_LEAD)).toBeNull();
+    // The founder's shape names the agent, on this card as on the other one.
+    expect(pillFor(KRAKEN).textContent).toContain("Kraken Auth");
+    // And the pull request it was proven from.
+    expect(screen.getByTestId(PREVIEW_CARD_PR_TESTID).textContent).toBe("PR #3067");
+  });
+
+  it("OPENS the proven url in a real browser when the reader clicks Open", () => {
+    // THE WHOLE POINT OF THE BEAD, as a side effect: `openUrl` — the plugin that leaves the app —
+    // called with the deploy url. Not "the card rendered"; the reader's click has to land somewhere.
+    mount();
+    ship(KRAKEN);
+    fireEvent.click(screen.getByTestId(PREVIEW_CARD_OPEN_TESTID));
+    expect(openUrlMock).toHaveBeenCalledWith(PROVEN_URL);
+  });
+
+  it("does NOT ask the preview supervisor about a shipped url", () => {
+    // A shipped url has no dev server, so `preview_status` would answer `null` and the click would
+    // be refused as `gone` — every time, for every shipped card. Pinned as an absence of the call,
+    // because a version that routed both cards through one path would still LOOK right until the
+    // bridge was consulted.
+    mount();
+    ship(KRAKEN);
+    invokeMock.mockClear();
+    fireEvent.click(screen.getByTestId(PREVIEW_CARD_OPEN_TESTID));
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "preview_status")).toBe(false);
+    expect(openUrlMock).toHaveBeenCalledWith(PROVEN_URL);
+  });
+
+  it("refuses the click, with SHIPPED wording, once the entry is retired underneath the card", () => {
+    // The click-time gate, re-asked. The card is still on screen for the instant of the click, and
+    // the refusal must not borrow the loopback card's sentences — those are all about ports.
+    mount();
+    ship(KRAKEN);
+    const card = screen.getByTestId(PREVIEW_CARD_TESTID);
+    act(() => {
+      usePreviewStore.setState({ shippedByAgent: {} });
+    });
+    // The projection retires the card, so drive the handler on the element we already hold — the
+    // click that races a retirement is exactly the case the gate exists for.
+    fireEvent.click(card.querySelector(`[data-testid="${PREVIEW_CARD_OPEN_TESTID}"]`)!);
+    expect(openUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("follows a newer deploy only because the CARD followed it first — never as a silent redirect", () => {
+    // A re-record for the same agent is a NEW deployment, and the card is a projection of the store,
+    // so by the time anything can be clicked the card is already showing the new url. That is the
+    // property worth pinning: the reader never clicks url A and gets url B. It is also WHY the
+    // refusal copy below is a race-only surface rather than an everyday one.
+    mount();
+    ship(KRAKEN);
+    const newer = "https://sparkle-newer-drodio1s-projects.vercel.app";
+    ship(KRAKEN, { url: newer });
+    expect(originsOnScreen()).toEqual([["shipped", newer]]);
+    fireEvent.click(screen.getByTestId(PREVIEW_CARD_OPEN_TESTID));
+    expect(openUrlMock).toHaveBeenCalledWith(newer);
+    expect(openUrlMock).not.toHaveBeenCalledWith(PROVEN_URL);
+  });
+
+  it("keeps the shipped refusal wording free of the loopback card's ports", () => {
+    // ══ WHY THIS IS A COPY ASSERTION AND NOT A RENDER ONE ══════════════════════════════════════
+    // Both the card projection and the click gate read the SAME store, so every refusal state also
+    // retires the card that would have shown the sentence — the wording is reachable only in the
+    // window between a render and the click that lands on it. The refusal BEHAVIOUR is what the row
+    // above pins (no `openUrl`, asserted); this pins the thing that would actually be wrong if
+    // somebody folded the two tables together: `PREVIEW_OPEN_REFUSAL_COPY` talks about ports and
+    // dev servers throughout, and a refusal message is an instruction the reader acts on — sending
+    // somebody to look at a port their published link does not have (AGENTS.md, `sparkle-8bvh`).
+    for (const [reason, sentence] of Object.entries(PREVIEW_SHIPPED_REFUSAL_COPY)) {
+      expect(sentence, `the shipped '${reason}' refusal must not talk about ports`).not.toMatch(
+        /\bport\b|\bdev server\b|\blocal\b/i,
+      );
+      expect(sentence, `the shipped '${reason}' refusal must say the link did not open`).toMatch(
+        /didn't open/i,
+      );
+    }
+    // TOTAL over the union — a refusal added in `services/shippedDeploy` without wording is a
+    // compile error, and this asserts the three that exist today are all present rather than the
+    // table having quietly lost one.
+    expect(Object.keys(PREVIEW_SHIPPED_REFUSAL_COPY).sort()).toEqual(["gone", "moved", "unsafe"]);
+  });
+
+  it("does NOT render an unproven url — with a proven card mounted beside it", () => {
+    // The branch alias: a public https url, on the same provider host, for a deployment the provider
+    // never built. BOTH agents claim a url; only the proven one is on screen.
+    mount();
+    ship(KRAKEN);
+    ship(OTTER, { url: BRANCH_ALIAS_URL, provenance: "vercel-bot-comment" });
+    expect(originsOnScreen()).toEqual([["shipped", PROVEN_URL]]);
+    expect(cardsOnScreen().some(([id]) => id === OTTER)).toBe(false);
+  });
+
+  it("takes NO screenshot for a shipped card, while capturing one for a local card beside it", () => {
+    // `preview_screenshot` resolves the agent's own LOOPBACK port. Driven at a shipped card it can
+    // only refuse — or, worse, succeed against a dev server that happens to be running and paint a
+    // picture of a different page under a link that goes somewhere else. Mounted in a pair so the
+    // absence is a verdict about the shipped card rather than a broken capture path.
+    invokeMock.mockImplementation((cmd: string, args?: { agentId?: string }) => {
+      if (cmd === "preview_screenshot") {
+        return Promise.resolve({ path: `/tmp/${args?.agentId}.png`, width: 1280, height: 800, bytes: 4 });
+      }
+      if (cmd === "load_attachment") {
+        return Promise.resolve({ path: "/tmp/x.png", name: "x.png", data_url: "data:image/png;base64,AAAA" });
+      }
+      return defaultInvoke(cmd, args);
+    });
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    ship(OTTER);
+    return waitFor(() => {
+      const shots = screen.queryAllByTestId(PREVIEW_CARD_SHOT_TESTID);
+      expect(shots).toHaveLength(1);
+      const owner = shots[0]!.closest(`[data-testid="${PREVIEW_CARD_TESTID}"]`);
+      expect(owner?.getAttribute("data-agent-id")).toBe(KRAKEN);
+    }).then(() => {
+      expect(invokeMock.mock.calls.filter(([c]) => c === "preview_screenshot").length).toBe(1);
+    });
+  });
+
+  it("gives one agent BOTH cards when it has a dev server and a shipped deploy", () => {
+    // Two true facts about one agent, told apart by their origin. This also pins that the two cards
+    // do not collide on a React key — a duplicate key silently drops one and reuses the survivor's
+    // state, which would show up as the wrong url under the wrong lead.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    ship(KRAKEN);
+    const on = originsOnScreen();
+    expect(on).toHaveLength(2);
+    expect(on.map(([o]) => o).sort()).toEqual(["local", "shipped"]);
+    expect(on.find(([o]) => o === "shipped")?.[1]).toBe(PROVEN_URL);
+    expect(on.find(([o]) => o === "local")?.[1]).toBe("http://127.0.0.1:5173");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE COPY RATCHET — a localhost preview and a shipped url make OPPOSITE promises
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// User-facing copy is code (AGENTS.md). The two cards look identical and mean opposite things, so
+// each one's scope sentence is pinned in BOTH directions. A negative-only ratchet is green over copy
+// trimmed to say nothing at all — which leaves the reader with exactly the inference that was wrong
+// — and a positive-only one is green over copy that ALSO tells the lie. Neither half catches both,
+// so each is mutation-provable on its own: restoring the false claim reds the negative, deleting the
+// true statement reds the positive.
+//
+// THE LOOKBEHINDS LIVE HERE AND NOWHERE ELSE. A lookbehind is a PARSE error in the safari14 WebView
+// this app pins, so the idiom must never leak into the shipped module — which is also why the honest
+// sentence denies its counterpart in so many words rather than the regex being loosened.
+describe("the two cards' scope copy cannot drift into each other's claim", () => {
+  const PROVEN_URL = "https://sparkle-gxh98nicm-drodio1s-projects.vercel.app";
+
+  it("the LOCAL note states its limit, and never claims the link is shareable", () => {
+    expect(
+      PREVIEW_LOCAL_SCOPE_NOTE,
+      "POSITIVE: a local card must SAY the address opens for nobody else. Deleting the limit leaves " +
+        "copy that is merely silent, which reads as 'this is a link' — the inference that is wrong.",
+    ).toMatch(/will not open for anyone else/i);
+    expect(
+      PREVIEW_LOCAL_SCOPE_NOTE,
+      "NEGATIVE: a local card must never make the shipped card's claim. 'Anyone … can open' about a " +
+        "loopback url tells the reader to forward an address that answers on this machine alone.",
+    ).not.toMatch(/(?<!will not )(?<!cannot )\banyone\b[^.]*\bopen\b/i);
+    expect(PREVIEW_LOCAL_SCOPE_NOTE).not.toMatch(/live on the web/i);
+  });
+
+  it("the SHIPPED note states who can open it, and never calls itself a local preview", () => {
+    expect(
+      PREVIEW_SHIPPED_SCOPE_NOTE,
+      "POSITIVE: a shipped card must SAY the link opens for other people. Without it the reader has " +
+        "no reason to send it on, which is the whole point of the card.",
+    ).toMatch(/anyone[^.]*can open it/i);
+    expect(
+      PREVIEW_SHIPPED_SCOPE_NOTE,
+      "NEGATIVE: a shipped card must not describe itself as local. The lookbehind is what lets the " +
+        "honest denial ('It is not a local preview') stand while the bare claim is refused.",
+    ).not.toMatch(/(?<!not )(?<!isn't )\ba local preview\b/i);
+    expect(PREVIEW_SHIPPED_SCOPE_NOTE).not.toMatch(/this machine only/i);
+  });
+
+  it("puts the right sentence on the right card, on screen", () => {
+    // The constants above are only worth ratcheting if each reaches the card it describes. Both
+    // mounted at once, so a component that painted one sentence everywhere would red here.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    act(() => {
+      recordShippedDeploy(
+        OTTER,
+        { url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE },
+        6_000,
+      );
+    });
+    const notes = screen.getAllByTestId(PREVIEW_CARD_SCOPE_TESTID).map((el) => [
+      el.closest(`[data-testid="${PREVIEW_CARD_TESTID}"]`)?.getAttribute("data-preview-origin"),
+      el.textContent,
+    ]);
+    expect(notes).toContainEqual(["local", PREVIEW_LOCAL_SCOPE_NOTE]);
+    expect(notes).toContainEqual(["shipped", PREVIEW_SHIPPED_SCOPE_NOTE]);
+  });
+});
+
+describe("a shipped card never advertises a loopback port", () => {
+  // FOUND BY SELF-REVIEW, not by a failure. `data-preview-port` is read from `byAgent`, so an agent
+  // that finished and left its dev server up — the ordinary state of an agent with a shipped
+  // deploy — would publish its LOCAL port on the card whose url is PUBLIC. Both cards are mounted
+  // here, so this is a verdict about the shipped one rather than an empty tree: the local card must
+  // still carry the port (that attribute is what proves a card belongs to the right agent), and the
+  // shipped card must not.
+  it("carries the port on the local card and omits it on the shipped one", () => {
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    act(() => {
+      recordShippedDeploy(
+        KRAKEN,
+        {
+          url: "https://sparkle-gxh98nicm-drodio1s-projects.vercel.app",
+          provenance: SHIPPED_DEPLOY_PROVENANCE,
+        },
+        6_000,
+      );
+    });
+    const byOrigin = new Map(
+      screen
+        .queryAllByTestId(PREVIEW_CARD_TESTID)
+        .map((el) => [el.getAttribute("data-preview-origin"), el.getAttribute("data-preview-port")]),
+    );
+    expect(byOrigin.get("local")).toBe("5173");
+    expect(byOrigin.get("shipped")).toBeNull();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE THREAD SURFACE — the PRIMARY one, and where a shipped card actually lives
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Every row above mounts `<PreviewCards />`, which is the PINNED STRIP — and that strip survives for
+// exactly one state (a mounted build agent, where no concierge transcript is on screen). The
+// surface a reader normally sees is `PreviewThreadArtifacts`, an anchored item in the transcript.
+// Testing only the strip would leave the primary surface for this whole increment uncovered, which
+// is the `sparkle-foqoe` shape one level up: asserting against a component that is not the one in
+// the tree.
+//
+// It is a RENDER PROP, so it can be driven directly — no `ConciergeColumn` needed. That is the point
+// of its shape (see its docstring), and it means these rows assert the ARTIFACT LIST it produces
+// rather than a DOM layout owned by another component.
+describe("a shipped card is a thread artifact, with an anchor of its own", () => {
+  const PROVEN_URL = "https://sparkle-gxh98nicm-drodio1s-projects.vercel.app";
+
+  /** Two anchorable messages, oldest first, each stamped so `anchorableIdAt` can order against them. */
+  const messages = () =>
+    [
+      { id: "m1", kind: "user", text: "one", arrivedAt: 1_000 },
+      { id: "m2", kind: "user", text: "two", arrivedAt: 5_000 },
+    ] as never;
+
+  /** Render the wrapper and capture the artifact list it hands its child. */
+  function artifacts(): { id: string; afterMessageId: string | null }[] {
+    let captured: { id: string; afterMessageId: string | null }[] = [];
+    render(
+      <AgentPillProvider value={{ agents: roster(), onOpenAgent: vi.fn(() => "revealed" as RevealOutcome) }}>
+        <PreviewThreadArtifacts messages={messages()}>
+          {(list) => {
+            captured = list.map((a) => ({ id: a.id, afterMessageId: a.afterMessageId }));
+            return null;
+          }}
+        </PreviewThreadArtifacts>
+      </AgentPillProvider>,
+    );
+    return captured;
+  }
+
+  it("produces a shipped artifact whose id names the origin", () => {
+    act(() => {
+      recordShippedDeploy(KRAKEN, { url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE }, 6_000);
+    });
+    expect(artifacts().map((a) => a.id)).toEqual([`preview-card:shipped:${KRAKEN}`]);
+  });
+
+  it("gives ONE agent's two cards DISTINCT artifact ids — the collision the origin key prevents", () => {
+    // Before the origin was part of the id, both cards were `preview-card:<agentId>`. Two artifacts
+    // sharing an id is a collision the thread has no way to report — it silently drops one. This is
+    // the regression half, and it is why the id is keyed on (origin, agentId).
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    act(() => {
+      recordShippedDeploy(KRAKEN, { url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE }, 6_000);
+    });
+    const ids = artifacts().map((a) => a.id).sort();
+    expect(ids).toEqual([`preview-card:local:${KRAKEN}`, `preview-card:shipped:${KRAKEN}`]);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("anchors the two cards INDEPENDENTLY, at the moment each actually arrived", () => {
+    // THE REASON THE ANCHOR MAP HAD TO BE RE-KEYED. It was keyed on the bare agent id, which was
+    // total while the two projections partitioned the agent space. A shipped card breaks that: the
+    // two arrive at different moments and belong at different points in the conversation, so a
+    // shared key would glue the second to wherever the first landed.
+    //
+    // The local preview surfaces AFTER both messages (so it anchors to the newest, m2); the shipped
+    // deploy is recorded BETWEEN them (so it anchors to m1). Different answers from one render is
+    // exactly what a shared key could not produce.
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    act(() => {
+      // `surfacedAt` for the local card is stamped by the store at Date.now(), which is later than
+      // both fixture stamps — so it anchors to the newest anchorable message.
+      recordShippedDeploy(KRAKEN, { url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE }, 3_000);
+    });
+    const byId = new Map(artifacts().map((a) => [a.id, a.afterMessageId]));
+    expect(byId.get(`preview-card:shipped:${KRAKEN}`)).toBe("m1");
+    expect(byId.get(`preview-card:local:${KRAKEN}`)).toBe("m2");
+  });
+
+  it("drops the shipped artifact when the deploy is retired — retirement stays derived", () => {
+    act(() => {
+      recordShippedDeploy(KRAKEN, { url: PROVEN_URL, provenance: SHIPPED_DEPLOY_PROVENANCE }, 6_000);
+    });
+    expect(artifacts()).toHaveLength(1);
+    cleanup();
+    act(() => {
+      usePreviewStore.setState({ shippedByAgent: {} });
+    });
+    expect(artifacts()).toHaveLength(0);
   });
 });
