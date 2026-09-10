@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { scopePullRequest, type ScopedSurface } from './humaneScope';
+import {
+  INTERPOLATION_MARKER,
+  neutralizeInterpolations,
+  neutralizeJsxExpressions,
+  scopePullRequest,
+  type ScopedSurface,
+} from './humaneScope';
 
 import type { DetectorInput } from './humaneDetectors';
 
@@ -305,5 +311,283 @@ describe('scopePullRequest — the mixed pull request', () => {
     // No infra line is ever rendered, quoted or blamed, so the score cannot move because
     // the pull request was large. There is deliberately no ratio threshold.
     expect(withInfra.surfaces).toEqual(alone.surfaces);
+  });
+});
+
+describe('scopePullRequest — an interpolation is not prose a person reads', () => {
+  // The other half of bead sparkle-83q4z1. `humaneRender` must not FEED judges unresolved
+  // `${...}` spans; this step must not let one make a surface look human-facing in the first
+  // place. Both read the same lifted string, so both were fooled by the same characters.
+
+  it('does not put a one-word string in scope because a placeholder supplied the other word', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', 'const label = `${count} items`;\n'),
+    ]);
+
+    // This module deliberately treats a SINGLE word as below its prose threshold — the
+    // comment on TWO_WORDS says so, and calls the recall cost worth paying. `${count} items`
+    // holds exactly one literal word; the other is the identifier `count`, which no person
+    // ever sees. Admitting it lets the threshold be cleared by code.
+    expect(decision.inScope).toBe(false);
+    expect(decision.surfaces).toEqual([]);
+    expect(decision.excluded.map((e) => e.reason)).toEqual(['no-human-surface']);
+  });
+
+  it('does not let the ARGUMENTS of a call inside an interpolation read as prose', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', "const s = `${plural(n, 'turn')} from`;\n"),
+    ]);
+
+    // Two words only if `turn')}` counts as one of them. It is the second argument to a
+    // helper, sitting in the source.
+    expect(decision.inScope).toBe(false);
+    expect(decision.excluded.map((e) => e.reason)).toEqual(['no-human-surface']);
+  });
+
+  it('keeps real copy that merely contains an interpolation, with the placeholder neutralized', () => {
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        'const msg = `We could not reach ${host}. Try again in ${delay} seconds.`;\n',
+      ),
+    ]);
+
+    expect(decision.inScope).toBe(true);
+    expect(decision.surfaces).toHaveLength(1);
+    expect(decision.surfaces[0]?.kind).toBe('refusal-or-remedy');
+    // The judged text carries the copy and no template code.
+    expect(decision.surfaces[0]?.text).toEqual([
+      'We could not reach […]. Try again in […] seconds.',
+    ]);
+    // EVIDENCE is untouched: a PR comment quotes the line as the author wrote it, so a
+    // reviewer can find it. Only what a JUDGE reads is neutralized.
+    expect(decision.surfaces[0]?.evidence).toContain('${host}');
+  });
+
+  it('stops an identifier inside an interpolation from classifying the surface', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', 'const label = `${consentPrompt} now applies`;\n'),
+    ]);
+
+    // `consentPrompt` is a variable NAME. It never reaches a person, so it must not make
+    // this a consent-or-permission surface — the same artifact as above, one step earlier.
+    expect(decision.surfaces).toHaveLength(1);
+    expect(decision.surfaces[0]?.kind).toBe('user-copy');
+    expect(decision.surfaces[0]?.text).toEqual(['[…] now applies']);
+  });
+
+  it('lifts nothing containing a raw placeholder span, across a mixed file', () => {
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        [
+          'const a = `Saved ${count} of ${total} items to ${destination}.`;',
+          'const b = `${w}px ${h}px`;',
+          "const c = 'Everything is up to date.';",
+        ].join('\n'),
+      ),
+    ]);
+
+    expect(decision.inScope).toBe(true);
+    for (const surface of decision.surfaces) {
+      for (const span of surface.text) {
+        expect(span).not.toContain('${');
+      }
+    }
+  });
+});
+
+describe('neutralizeInterpolations — the one shared definition', () => {
+  it('leaves a span with no interpolation byte for byte identical', () => {
+    const copy = 'We cannot export your data right now. Try again after the sync finishes.';
+    expect(neutralizeInterpolations(copy)).toBe(copy);
+  });
+
+  it('balances nested braces rather than closing at the first one', () => {
+    expect(neutralizeInterpolations('a ${f({ x: 1 })} b')).toBe(`a ${INTERPOLATION_MARKER} b`);
+  });
+
+  it('does not close on a brace inside a quoted argument', () => {
+    expect(neutralizeInterpolations("a ${f('}')} b")).toBe(`a ${INTERPOLATION_MARKER} b`);
+  });
+
+  it('consumes an unterminated interpolation to the end of the span', () => {
+    expect(neutralizeInterpolations('ready ${status(')).toBe(`ready ${INTERPOLATION_MARKER}`);
+  });
+
+  it('uses a marker carrying no letters, so it can never be counted as a word', () => {
+    // Load-bearing, not cosmetic. A worded marker such as `[value]` would satisfy the
+    // two-word prose test all by itself and re-admit exactly the spans this removes.
+    expect(INTERPOLATION_MARKER).not.toMatch(/[A-Za-z]/);
+  });
+});
+
+describe('scopePullRequest — a JSX expression container is not prose either', () => {
+  // roborev 82380. The first fix for sparkle-83q4z1 covered `${...}` and missed `{...}`,
+  // which in a .tsx tree is the commoner way interpolated copy is written. `scanFile` builds
+  // jsxText out of `code`, which blanks string literals but leaves JSX braces standing, so
+  // every consequence of the template form recurred here untouched.
+
+  it('lifts JSX copy with the expression containers neutralized', () => {
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        '<p>Deleted {count} of {total} items from your account.</p>\n',
+      ),
+    ]);
+
+    expect(decision.surfaces).toHaveLength(1);
+    expect(decision.surfaces[0]?.text).toEqual([
+      'Deleted […] of […] items from your account.',
+    ]);
+  });
+
+  it('does not put one-word JSX copy in scope because an expression supplied the other word', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', '<span>{count} items</span>\n'),
+    ]);
+
+    expect(decision.inScope).toBe(false);
+    expect(decision.surfaces).toEqual([]);
+  });
+
+  it('keeps an identifier in a JSX expression out of what a JUDGE reads', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', '<p>{consentPrompt} now applies to you</p>\n'),
+    ]);
+
+    expect(decision.surfaces).toHaveLength(1);
+    // The artifact is what reaches a judge, and `consentPrompt` no longer does.
+    expect(decision.surfaces[0]?.text).toEqual(['[…] now applies to you']);
+
+    // THE KIND STILL COMES FROM THE CODE SHAPE, AND THAT IS DELIBERATE — not a leftover.
+    // `classifyLine` reads `code`, which blanks string literals but keeps JSX braces, so an
+    // element named for consent is a consent surface for the same reason `<ConsentToggle/>`
+    // is. That is the module's code-shape classifier doing its job; it is a statement about
+    // WHICH SITUATION to judge this copy in, never a word the judge is shown. The template
+    // form differs only because a literal is blanked whole — see the `${consentPrompt}` case
+    // above, which lands on user-copy.
+    expect(decision.surfaces[0]?.kind).toBe('consent-or-permission');
+  });
+
+  it('drops a JSX node that is nothing but a call expression', () => {
+    // Measured in real product source: `{describeRecommendation(recommendation, display)}`
+    // was scored as a ui-component surface, as if a person read the call.
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        '<div>{describeRecommendation(recommendation, display)}</div>\n',
+      ),
+    ]);
+
+    expect(decision.surfaces).toEqual([]);
+  });
+
+  it('leaves a brace run inside a STRING LITERAL alone — it is prose, not a container', () => {
+    // The scoping is measured, not cautious. This exact shape lives in a prompt template in
+    // real source, describing an output schema to a model. Neutralizing it would destroy
+    // meaning rather than remove code, which is why provenance decides.
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        'const schema = \'Reply with { "text": string, "kind": "auto" } and nothing else\';\n',
+      ),
+    ]);
+
+    expect(decision.surfaces).toHaveLength(1);
+    expect(decision.surfaces[0]?.text).toEqual([
+      'Reply with { "text": string, "kind": "auto" } and nothing else',
+    ]);
+  });
+
+  it('neutralizes a nested JSX expression rather than closing at the first brace', () => {
+    expect(neutralizeJsxExpressions('a {f({ x: 1 })} b')).toBe(`a ${INTERPOLATION_MARKER} b`);
+  });
+
+  it('leaves a JSX span with no expression byte for byte identical', () => {
+    const copy = 'Everything is up to date.';
+    expect(neutralizeJsxExpressions(copy)).toBe(copy);
+  });
+});
+
+describe('scopePullRequest — a marker must not COST the surface its prose', () => {
+  // roborev 82414. The marker is letterless so it supplies no word — but TWO_WORDS wants its
+  // two words ADJACENT, so a marker standing between them destroyed the match and took the
+  // commonest shape of React copy out of scope entirely. A gate that silently stops looking
+  // is worse than one that judges neutralized text.
+
+  it('keeps JSX copy whose two real words are separated by an expression', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', '<p>Deleted {count} files.</p>\n'),
+    ]);
+
+    expect(decision.inScope).toBe(true);
+    expect(decision.surfaces).toHaveLength(1);
+    expect(decision.surfaces[0]?.text).toEqual(['Deleted […] files.']);
+  });
+
+  it('keeps template copy whose two real words are separated by an interpolation', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', 'const msg = `Saved ${n} changes`;\n'),
+    ]);
+
+    expect(decision.inScope).toBe(true);
+    expect(decision.surfaces[0]?.text).toEqual(['Saved […] changes']);
+  });
+
+  it('still refuses a span the marker would have to supply a word to save', () => {
+    // The elision must not become a way IN: `{count} items` has one literal word before and
+    // after, and one literal word is deliberately below this module's prose threshold.
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', '<span>{count} items</span>\n'),
+    ]);
+
+    expect(decision.surfaces).toEqual([]);
+  });
+
+  it('still refuses a span with no literal word at all', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', 'const name = `${firstName} ${lastName}`;\n'),
+    ]);
+
+    expect(decision.surfaces).toEqual([]);
+  });
+});
+
+describe('scopePullRequest — the utility-class guard must survive interpolation', () => {
+  // roborev 82416. `looksLikeClassNames` requires EVERY token to be class-shaped, and the
+  // marker token is not — so asked with markers standing it returns false for any
+  // interpolated span, leaving the guard permanently inert for exactly the population the
+  // elision re-admits. Both structural questions are now asked of the elided form.
+
+  it('does not judge a dynamic className as copy a person reads', () => {
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        '<div className={`flex ${gap} items-center`}>x</div>\n',
+      ),
+    ]);
+
+    expect(decision.surfaces.flatMap((surface) => surface.text)).toEqual([]);
+  });
+
+  it('still rejects a class string that carries no interpolation at all', () => {
+    const decision = scopePullRequest([
+      added('apps/desktop/src/Panel.tsx', '<div className="flex items-center gap-2">x</div>\n'),
+    ]);
+
+    expect(decision.surfaces.flatMap((surface) => surface.text)).toEqual([]);
+  });
+
+  it('still admits real copy on a line that also carries a dynamic className', () => {
+    // The guard must narrow the class string only — not the sentence beside it.
+    const decision = scopePullRequest([
+      added(
+        'apps/desktop/src/Panel.tsx',
+        '<p className={`text-sm ${tone}`}>Deleted {count} files.</p>\n',
+      ),
+    ]);
+
+    expect(decision.surfaces.flatMap((surface) => surface.text)).toEqual(['Deleted […] files.']);
   });
 });

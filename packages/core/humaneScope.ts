@@ -171,6 +171,105 @@ const MACHINE_AUDIENCE_LINE =
 const URL_LIKE = /^(?:[a-z]+:)?\/\//i;
 
 /**
+ * TEMPLATE INTERPOLATION IS SOURCE CODE, NOT COPY — bead sparkle-83q4z1.
+ *
+ * A literal is lifted off an added line with its `${...}` spans intact, because the line is
+ * read as text and nothing evaluates it. Those characters then travel all the way to a judge
+ * as if a person met them. The first real score HumaneBench ever produced was depressed to
+ * -0.83 on one principle with rationales explicitly about "unresolved template code" and
+ * "gibberish": the judges were right, and they were scoring the instrument.
+ *
+ * The same characters fool THIS step one moment earlier. `isHumanReadable` admits a span on
+ * TWO_WORDS, and an identifier inside an interpolation is made of letters, so `${count}
+ * items` clears a two-word threshold on one literal word — while the module's own comment on
+ * TWO_WORDS says a single word is deliberately below it. A placeholder can therefore make a
+ * surface look human-facing when it is not, and can make it look like a different KIND than
+ * it is when the word it supplies is `consentPrompt`. Both are the same artifact.
+ *
+ * THE MARKER CARRIES NO LETTERS, AND THAT IS LOAD-BEARING. A worded stand-in such as
+ * `[value]` satisfies TWO_WORDS by itself and would re-admit every span this removes. This
+ * one substitutes for the interpolation and touches nothing around it, so a pull request
+ * still cannot buy a better score by wording a message well — the whole reason `humaneRender`
+ * lifts a response VERBATIM. Substituting a marker is not paraphrase; it removes characters
+ * the diff wrote for a machine and adds none of ours.
+ */
+export const INTERPOLATION_MARKER = '[…]';
+
+/**
+ * Replace every `${...}` span with `INTERPOLATION_MARKER`, leaving all other bytes alone.
+ *
+ * Brace-balanced rather than regex-matched, and quote-aware inside the interpolation, because
+ * `${plural(n, 'turn')}` and `${f({ x: 1 })}` are the ordinary shapes and a `\$\{[^}]*\}` closes
+ * at the wrong place on both — leaving the tail of the expression behind, which is the very
+ * residue this exists to remove.
+ *
+ * An UNTERMINATED `${` consumes to the end of the span. `scanFile` bounds a literal at the
+ * newline, so a body genuinely can end mid-interpolation; erring toward removing code is the
+ * safe direction, since the alternative is leaking source into what a judge scores.
+ */
+function neutralizeBraced(span: string, openerLength: (at: number) => number): string {
+  let out = '';
+  let i = 0;
+  while (i < span.length) {
+    const opener = openerLength(i);
+    if (opener > 0) {
+      let depth = 1;
+      let j = i + opener;
+      while (j < span.length && depth > 0) {
+        const c = span[j] as string;
+        if (c === "'" || c === '"' || c === '`') {
+          // Skip a quoted run whole: a brace inside it is text, not structure.
+          let k = j + 1;
+          while (k < span.length && span[k] !== c) k += span[k] === '\\' ? 2 : 1;
+          j = k + 1;
+          continue;
+        }
+        if (c === '{') depth += 1;
+        else if (c === '}') depth -= 1;
+        j += 1;
+      }
+      out += INTERPOLATION_MARKER;
+      i = j;
+      continue;
+    }
+    out += span[i];
+    i += 1;
+  }
+  return out;
+}
+
+export function neutralizeInterpolations(span: string): string {
+  if (!span.includes('${')) return span;
+  return neutralizeBraced(span, (at) => (span[at] === '$' && span[at + 1] === '{' ? 2 : 0));
+}
+
+/**
+ * The SAME artifact in JSX, which in a `.tsx` tree is the commoner half — and the half the
+ * first fix for bead sparkle-83q4z1 missed (roborev 82380).
+ *
+ * `scanFile` builds `jsxText` out of `code`, which blanks string literals but leaves JSX
+ * braces standing, so `<p>Deleted {count} of {total} items.</p>` lifts the expression
+ * containers verbatim. Every consequence of the `${...}` form recurs: `{count} items` clears
+ * TWO_WORDS on one literal word, and `<p>{consentPrompt} now applies</p>` classifies as
+ * consent-or-permission on a variable NAME. Measured over 400 real product files, 25 of 3596
+ * lifted spans carried a brace run — among them `{describeRecommendation(recommendation,
+ * display)}` and `Asked by {requesterLabels?.[approval.id] ?? unresolvedLabel(...)}`, both
+ * scored as if a person read them.
+ *
+ * APPLIED TO JSX TEXT ONLY, AND THE SCOPING IS MEASURED RATHER THAN CAUTIOUS. A brace run in
+ * a STRING LITERAL is ordinarily prose: the same census found
+ * `{ "text": string, "kind": "auto" | "manual", … }` inside a prompt template, describing an
+ * output schema to a model. That is copy, and neutralizing it would destroy meaning rather
+ * than remove code. Inside a JSX TEXT NODE a balanced `{...}` run is an expression container
+ * by construction, so provenance is what makes this safe — which is why it runs here, at the
+ * point of extraction, and not in `humaneRender`, whose `text` has lost that distinction.
+ */
+export function neutralizeJsxExpressions(span: string): string {
+  if (!span.includes('{')) return span;
+  return neutralizeBraced(span, (at) => (span[at] === '{' ? 1 : 0));
+}
+
+/**
  * Prose, for this instrument's purposes: at least two words made of letters. A single word
  * ("Cancel", "Deny") is user copy and IS missed by this rule — a known recall limit, taken
  * deliberately, because the alternative admits every identifier, path fragment and CSS
@@ -191,12 +290,35 @@ function looksLikeClassNames(span: string): boolean {
   return tokens.some((t) => /[-:]/.test(t));
 }
 
-function isHumanReadable(span: string): boolean {
+/**
+ * Exported so `humaneRender` can ask the SAME question rather than growing a second answer
+ * to it. Two classifiers can only disagree, which is the defect class this epic keeps
+ * hitting; render calls this one and never re-derives it.
+ */
+export function isHumanReadable(span: string): boolean {
   const trimmed = span.trim();
   if (trimmed.length < 4) return false;
   if (URL_LIKE.test(trimmed)) return false;
-  if (!TWO_WORDS.test(trimmed)) return false;
-  if (looksLikeClassNames(trimmed)) return false;
+  // THE PROSE TEST IS ASKED WITH MARKERS ELIDED, NOT WITH THEM STANDING (roborev 82414).
+  //
+  // TWO_WORDS requires its two letter-words to be ADJACENT, and the marker is letterless, so
+  // substituting it between two real words destroys the only adjacency the span had:
+  // `Deleted {count} files.` becomes `Deleted [ ] files.` and matches nothing. That is the
+  // commonest shape of React product copy — `Saved {n} changes`, `Removed {n} items` — and it
+  // would have gone silently OUT OF SCOPE, unjudged, which for a gate is the worst direction
+  // to fail in. Eliding makes the marker a word BOUNDARY that supplies no word: `[…] items`
+  // still has one literal word and is still refused, and `Deleted […] files.` has two and is
+  // admitted, which is exactly what the rule says it means.
+  // BOTH structural tests are asked of the ELIDED form, not just the prose one (roborev
+  // 82416). `looksLikeClassNames` requires EVERY token to be class-shaped, and the marker
+  // token is not, so asking it with markers standing makes it return false for any
+  // interpolated span — permanently inert, for exactly the population the elision re-admits.
+  // `className={`flex ${gap} items-center`}` is the commonest way a class string acquires an
+  // interpolation, and this module's own comment calls utility-class strings "the single
+  // largest false-positive source in a .tsx diff". One elided form, one set of questions.
+  const elided = trimmed.split(INTERPOLATION_MARKER).join(' ');
+  if (!TWO_WORDS.test(elided)) return false;
+  if (looksLikeClassNames(elided)) return false;
   return true;
 }
 
@@ -326,7 +448,10 @@ function scanFile(after: string): ScannedLine[] {
 
     const jsxText: string[] = [];
     for (const m of code.matchAll(/>([^<>]+)</g)) {
-      jsxText.push(m[1] ?? '');
+      // Neutralize AT THE POINT OF EXTRACTION, where this span is known to be a JSX text
+      // node. Downstream, `text` no longer records whether a span came from a literal or
+      // from JSX, and the two must not be treated alike — see `neutralizeJsxExpressions`.
+      jsxText.push(neutralizeJsxExpressions(m[1] ?? ''));
     }
 
     const wasInJsxText: boolean = inJsxText;
@@ -443,7 +568,11 @@ function surfacesIn(input: DetectorInput): ScopedSurface[] {
     const seen = new Set<string>();
     const text: string[] = [];
     for (const span of [...literals, ...jsxText]) {
-      const trimmed = span.trim();
+      // Neutralize BEFORE the prose test, so a placeholder cannot supply the words that
+      // clear it — and so `text`, which is what a judge eventually reads, never carries
+      // source. `evidence` stays the line as written: a PR comment must quote something a
+      // reviewer can find.
+      const trimmed = neutralizeInterpolations(span).trim();
       if (!isHumanReadable(trimmed)) continue;
       if (seen.has(trimmed)) continue;
       seen.add(trimmed);

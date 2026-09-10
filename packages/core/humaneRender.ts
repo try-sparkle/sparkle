@@ -23,7 +23,12 @@
  *
  *   RESPONSE  - what the person meets. Lifted VERBATIM from lines this diff added. Never
  *               paraphrased, never summarised, never generated. If the diff did not write
- *               those words, they do not appear.
+ *               those words, they do not appear. THE ONE EXCEPTION, and it runs the other
+ *               way: a `${...}` template interpolation is replaced by a neutral, letterless
+ *               marker. That REMOVES characters the diff wrote for a machine; it adds no
+ *               words of ours and moves nothing around it, so it cannot become a paraphrase
+ *               channel. Judged unresolved, those characters cost the first real score this
+ *               instrument ever produced -0.83 on one principle (bead sparkle-83q4z1).
  *   PROMPT    - the SITUATION that elicits it. This is OURS, not the pull request's. It is
  *               a fixed sentence per surface kind, drawn from the table below, chosen
  *               before any diff is seen and identical for every pull request.
@@ -65,7 +70,13 @@
  * earns. The two look alike and mean opposite things, so they are different fields.
  */
 
-import { SURFACE_KIND_LABELS, type ScopedSurface, type SurfaceKind } from './humaneScope';
+import {
+  isHumanReadable,
+  neutralizeInterpolations,
+  SURFACE_KIND_LABELS,
+  type ScopedSurface,
+  type SurfaceKind,
+} from './humaneScope';
 
 /** Where a rendered turn came from. One entry per line that contributed to it. */
 export interface TurnSource {
@@ -91,12 +102,14 @@ export interface RenderedTurn {
   sources: readonly TurnSource[];
 }
 
-export type UnrenderedReason = 'no-verbatim-anchor' | 'over-turn-budget';
+export type UnrenderedReason = 'no-verbatim-anchor' | 'over-turn-budget' | 'placeholder-only';
 
 export const UNRENDERED_REASON_LABELS: Readonly<Record<UnrenderedReason, string>> = Object.freeze({
   'no-verbatim-anchor':
     'the surface carried neither user-facing text nor a behaviour note, so there was nothing to render without inventing words',
   'over-turn-budget': 'the turn budget was already full when this surface was reached',
+  'placeholder-only':
+    "the surface's only text was template interpolation, so once the placeholders were neutralized nothing a person reads was left",
 });
 
 export interface UnrenderedSurface {
@@ -213,10 +226,26 @@ function renderGroup(g: Group): RenderedTurn | UnrenderedSurface {
   const seen = new Set<string>();
   const sources: TurnSource[] = [];
 
+  let droppedPlaceholderOnly = false;
+
   for (const member of g.members) {
     sources.push({ file: member.file, line: member.line, evidence: member.evidence });
     for (const span of member.text) {
-      const trimmed = span.trim();
+      // THE LAST GATE BEFORE A JUDGE READS IT (bead sparkle-83q4z1). `scopePullRequest`
+      // already neutralizes, but a surface reaches here across a PROCESS BOUNDARY and can be
+      // hand-built or deserialized, and this is the step whose output is scored. Asked here,
+      // the invariant holds however the surface was produced.
+      //
+      // DELIBERATELY NARROW: a span that held no interpolation is passed through untouched,
+      // byte for byte. This may only ever remove source the diff wrote for a machine — never
+      // reword what it wrote for a person, which would make the response a paraphrase
+      // channel and let a well-worded pull request buy a better score.
+      const neutralized = neutralizeInterpolations(span);
+      if (neutralized !== span && !isHumanReadable(neutralized)) {
+        droppedPlaceholderOnly = true;
+        continue;
+      }
+      const trimmed = neutralized.trim();
       if (trimmed === '' || seen.has(trimmed)) continue;
       seen.add(trimmed);
       verbatim.push(trimmed);
@@ -232,7 +261,13 @@ function renderGroup(g: Group): RenderedTurn | UnrenderedSurface {
     // does not produce one today, but a hand-built or deserialized surface can, and the
     // pipeline crosses a process boundary. Refusing to render it IS the failure contract:
     // the alternative is authoring words for a turn and then scoring our own words.
-    return { surface: g.members[0] as ScopedSurface, reason: 'no-verbatim-anchor' };
+    //
+    // The two reasons are kept apart because they send a reader to different places: nothing
+    // was ever there, versus what was there was template code. AGENTS.md: no silent drops.
+    return {
+      surface: g.members[0] as ScopedSurface,
+      reason: droppedPlaceholderOnly ? 'placeholder-only' : 'no-verbatim-anchor',
+    };
   }
 
   return {

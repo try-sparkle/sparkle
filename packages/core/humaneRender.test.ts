@@ -255,3 +255,163 @@ describe('scope and render together, on a diff', () => {
     expect(renderSurfaces(decision.surfaces).rendered).toBe(false);
   });
 });
+
+describe('renderSurfaces — no judged turn carries unresolved template code', () => {
+  // THE DEFECT (bead sparkle-83q4z1). The response is lifted VERBATIM off added lines, and a
+  // template literal's added line carries its `${...}` spans verbatim too. The first real
+  // score HumaneBench ever produced was -0.83 on one principle, with judge rationales
+  // explicitly about "unresolved template code" and "gibberish". The judges were right and
+  // they were scoring the instrument, not the product.
+
+  it('replaces an interpolation with a neutral marker and leaves the copy around it alone', () => {
+    const [turn] = renderSurfaces([
+      surface('refusal-or-remedy', ["We couldn't reach ${host}. Try again in ${delay} seconds."]),
+    ]).turns;
+
+    // The marker substitutes for the interpolation and NOTHING else moves. Rewriting the
+    // surrounding copy would make this a paraphrase channel, which is the one property the
+    // module exists to protect: a well-worded pull request must not buy a better score.
+    expect(turn?.response).toBe("We couldn't reach […]. Try again in […] seconds.");
+    expect(turn?.response).not.toContain('${');
+    expect(turn?.response).not.toContain('host');
+    expect(turn?.response).toContain("We couldn't reach");
+    expect(turn?.response).toContain('Try again in');
+  });
+
+  it('neutralizes an interpolation holding its own quotes, parens and nested braces', () => {
+    // The shape that actually produced the finding: a call with a quoted argument inside the
+    // interpolation. A naive `\$\{[^}]*\}` closes at the wrong brace and leaves code behind.
+    const [turn] = renderSurfaces([
+      surface('user-copy', ["Rendered ${plural(n, 'turn')} from ${`${a}${b}`} changed files."]),
+    ]).turns;
+
+    expect(turn?.response).toBe('Rendered […] from […] changed files.');
+    expect(turn?.response).not.toMatch(/[${}]/);
+  });
+
+  it('neutralizes an unterminated interpolation rather than leaking the rest of the line', () => {
+    // `scanFile` bounds a literal at the newline, so a body can end mid-interpolation. The
+    // safe direction is to remove code, never to keep it.
+    const [turn] = renderSurfaces([
+      surface('user-copy', ['Your export is ready to download ${status(']),
+    ]).turns;
+
+    expect(turn?.response).toBe('Your export is ready to download […]');
+    expect(turn?.response).not.toContain('${');
+  });
+
+  it('drops a span that is nothing but interpolation, and says so rather than judging it', () => {
+    // A name join: every word in it is code, so neutralizing leaves no literal word at all.
+    const result = renderSurfaces([surface('user-copy', ['${firstName} ${lastName}'])]);
+
+    // '[…] […]' is the same gibberish spelled differently. AGENTS.md: no silent drops — it is
+    // refused with a named reason, not quietly discarded.
+    expect(result.rendered).toBe(false);
+    expect(result.turns).toEqual([]);
+    expect(result.unrendered.map((u) => u.reason)).toEqual(['placeholder-only']);
+    expect(result.reason).toContain('not an empty pass');
+  });
+
+  it('keeps copy whose two real words are SEPARATED by an interpolation', () => {
+    // roborev 82414. The marker is letterless, so putting it between two words destroys the
+    // adjacency the prose test looks for. This is the commonest shape of React product copy
+    // and dropping it would blind the gate to it entirely, silently.
+    const [turn] = renderSurfaces([surface('user-copy', ['Deleted ${count} files.'])]).turns;
+
+    expect(turn?.response).toBe('Deleted […] files.');
+  });
+
+  it('keeps the real copy in a group and drops only the placeholder-only span beside it', () => {
+    const [turn] = renderSurfaces([
+      surface('user-copy', ['${a} ${b}', 'Your changes are saved.']),
+    ]).turns;
+
+    expect(turn?.verbatim).toEqual(['Your changes are saved.']);
+    expect(turn?.response).toBe('Your changes are saved.');
+  });
+
+  it('leaves a span carrying no interpolation completely untouched', () => {
+    // The verbatim property is narrow on purpose: this change may only touch spans that
+    // actually held an interpolation. Everything else passes through byte for byte.
+    const copy = 'We cannot export your data right now. Try again after the sync finishes.';
+    const [turn] = renderSurfaces([surface('refusal-or-remedy', [copy])]).turns;
+
+    expect(turn?.response).toBe(copy);
+    expect(turn?.verbatim).toEqual([copy]);
+  });
+
+  it('names the placeholder-only drop in the sentence a human reads', () => {
+    const result = renderSurfaces([
+      surface('user-copy', ['Your changes are saved.']),
+      surface('ui-component', ['${w} ${h}'], { file: 'apps/desktop/src/Other.tsx' }),
+    ]);
+
+    expect(result.rendered).toBe(true);
+    expect(result.unrendered.map((u) => u.reason)).toEqual(['placeholder-only']);
+    expect(result.reason).toContain('produced no turn');
+    expect(result.reason).toContain('template interpolation');
+  });
+
+  it('feeds the evaluator a response with no raw placeholder span, whatever the diff wrote', () => {
+    // The gate-level invariant, asserted at the exact boundary the vendored evaluator reads:
+    // whatever the diff wrote, `--response` never carries a raw `${` span.
+    const result = renderSurfaces([
+      surface('refusal-or-remedy', ['We could not sync ${count} of ${total} items.']),
+      surface('notification', ['${actor} finished ${job} for you.'], {
+        file: 'apps/desktop/src/Toast.tsx',
+      }),
+      surface('user-copy', ['Everything is up to date.'], {
+        file: 'apps/desktop/src/Status.tsx',
+      }),
+    ]);
+
+    expect(result.turns.length).toBeGreaterThan(0);
+    for (const turn of result.turns) {
+      expect(toEvaluatorInput(turn).response).not.toContain('${');
+    }
+  });
+});
+
+describe('scope and render together — no judged response carries unresolved code', () => {
+  it('carries neither a template placeholder nor a JSX expression through to the evaluator', () => {
+    // THE GATE-LEVEL INVARIANT, asserted end to end on a diff rather than on hand-built
+    // surfaces — the form the artifact actually arrives in. Widened from `${` alone after
+    // roborev 82380 showed the JSX half surviving a suite that only looked for the template
+    // half.
+    const decision = scopePullRequest([
+      {
+        path: 'apps/desktop/src/Panel.tsx',
+        before: 'export function Panel() {\n  return null;\n}\n',
+        after: [
+          'export function Panel() {',
+          '  const failed = `We could not sync ${count} of ${total} items.`;',
+          '  return (',
+          '    <section>',
+          '      <p>Deleted {removed} of {total} files from your account.</p>',
+          '      <button>{actionText(action, state)}</button>',
+          '      <span>Up to date with {baseLabel}</span>',
+          '      <p>Deleted {removed} files.</p>',
+          '    </section>',
+          '  );',
+          '}',
+        ].join('\n'),
+      },
+    ]);
+
+    const result = renderSurfaces(decision.surfaces);
+
+    expect(result.rendered).toBe(true);
+    for (const turn of result.turns) {
+      const { response } = toEvaluatorInput(turn);
+      expect(response).not.toContain('${');
+      // A surviving expression container is the same artifact in the commoner form.
+      expect(response).not.toMatch(/\{[^}]*\}/);
+    }
+    // And the copy around the containers is still there, unrewritten.
+    expect(result.turns.map((t) => t.response).join('\n')).toContain('Deleted');
+    expect(result.turns.map((t) => t.response).join('\n')).toContain('We could not sync');
+    // The `Word {expr} Word` shape survives the neutralization rather than falling out of
+    // scope — the regression roborev 82414 caught, pinned end to end.
+    expect(result.turns.map((t) => t.response).join('\n')).toContain('Deleted […] files.');
+  });
+});
