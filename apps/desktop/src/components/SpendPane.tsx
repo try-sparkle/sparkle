@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { FiRefreshCw } from "react-icons/fi";
 import { C, DANGER } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
@@ -18,6 +18,10 @@ import {
   maxDaily,
   shortDate,
 } from "./spendFormat";
+import { AgentSpendSection } from "./AgentSpendSection";
+import { rosterFromProjects, type AgentIdentity } from "../engine/agentSpend";
+import { useProjectStore } from "../stores/projectStore";
+import { useSpendCapStore } from "../stores/spendCapStore";
 
 // Settings → History & Spend: a local-first read of what your agents have actually spent.
 //
@@ -52,6 +56,13 @@ type PaneState =
 export function SpendPane() {
   const [windowDays, setWindowDays] = useState<number>(DEFAULT_WINDOW);
   const [state, setState] = useState<PaneState>({ kind: "loading" });
+
+  // The agent roster and the cap are read HERE and handed down, so `AgentSpendSection` stays a pure
+  // function of its props and can be tested without standing up either store.
+  const projects = useProjectStore((s) => s.projects);
+  const roster = useMemo<AgentIdentity[]>(() => rosterFromProjects(projects), [projects]);
+  const capUsd = useSpendCapStore((s) => s.capUsd);
+  const setCapUsd = useSpendCapStore((s) => s.setCapUsd);
 
   // Monotonic epoch so a window switch mid-flight can't be repainted by the slower earlier scan.
   const epoch = useRef(0);
@@ -115,12 +126,24 @@ export function SpendPane() {
         </div>
       )}
 
-      {state.kind === "ready" && <Report report={state.report} />}
+      {state.kind === "ready" && (
+        <Report report={state.report} roster={roster} capUsd={capUsd} onCapChange={setCapUsd} />
+      )}
     </div>
   );
 }
 
-function Report({ report }: { report: SpendReport }) {
+function Report({
+  report,
+  roster,
+  capUsd,
+  onCapChange,
+}: {
+  report: SpendReport;
+  roster: AgentIdentity[];
+  capUsd: number | null;
+  onCapChange: (value: number | null) => void;
+}) {
   const empty = report.totals.tokens.total === 0;
   return (
     <>
@@ -137,6 +160,15 @@ function Report({ report }: { report: SpendReport }) {
           <DailyChart days={report.days} />
         )}
       </section>
+
+      {!empty && (
+        <AgentSpendSection
+          report={report}
+          roster={roster}
+          capUsd={capUsd}
+          onCapChange={onCapChange}
+        />
+      )}
 
       {report.models.length > 0 && (
         <section>
