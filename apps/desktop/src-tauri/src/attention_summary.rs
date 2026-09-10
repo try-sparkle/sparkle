@@ -38,29 +38,18 @@ no markdown.";
 
 /// Take the last `max` chars of `s` (on a char boundary), trimmed. The ask lives at the end of the
 /// visible screen, so the tail is the part that matters.
+///
+/// Delegates to `oneshot_text`, which `activity_narration` shares — the two summarizers must agree
+/// on what bounding an input means, and two copies is the shape that drifts apart silently.
 fn tail(s: &str, max: usize) -> String {
-    let t = s.trim();
-    let n = t.chars().count();
-    if n <= max {
-        return t.to_string();
-    }
-    t.chars().skip(n - max).collect::<String>().trim().to_string()
+    crate::oneshot_text::tail(s, max)
 }
 
 /// Collapse internal whitespace runs (incl. newlines) to single spaces, trim, and hard-cap to
 /// `SUMMARY_CAP_CHARS` on a char boundary. Keeps the banner to one tidy line regardless of what the
 /// model returned. Exposed for testing so the cap/collapse is pinned without a network call.
 fn clean_summary(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= SUMMARY_CAP_CHARS {
-        return collapsed;
-    }
-    collapsed
-        .chars()
-        .take(SUMMARY_CAP_CHARS)
-        .collect::<String>()
-        .trim_end()
-        .to_string()
+    crate::oneshot_text::clean_one_line(s, SUMMARY_CAP_CHARS)
 }
 
 /// Summarize what an agent is asking the user, from the tail of its terminal screen. Returns the

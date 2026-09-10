@@ -74,6 +74,7 @@ import { log } from "../logger";
 import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
+import { maybeNarrateActivity } from "../services/activityNarrator";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useScrollIntentStore, applyScrollIntent } from "../stores/scrollIntentStore";
 import { usePaneFocusStore, applyPaneFocus } from "../stores/paneFocusStore";
@@ -549,6 +550,42 @@ function AgentPaneInner({
             if (text === lastResponseRef.current) return; // dup Stop for the same turn — already recorded
             lastResponseRef.current = text;
             void record({ ...base(), kind: "response", text });
+            // Read the agent's CURRENT stored line straight from the store rather than the
+            // captured `agent` prop: this runs inside an async Stop handler, so the prop may be a
+            // render or two behind, and both the throttle and the self-report protection below are
+            // decisions about what is on the row RIGHT NOW.
+            const liveAgent = () =>
+              useProjectStore
+                .getState()
+                .projects.find((p) => p.id === project.id)
+                ?.agents.find((a) => a.id === agent.id);
+            // ACTIVITY NARRATION (bead ). This turn's text is the freshest account the
+            // agent has given of what it is building, and we already have it in hand — so refresh
+            // the agent's activity line from it instead of waiting for the agent to remember to
+            // call `set_agent_activity`. Fire-and-forget and NOT awaited: the judge below decides
+            // whether this row goes red, and a model call for a muted secondary line must never
+            // delay that. `maybeNarrateActivity` applies its own throttle and gate, so this is
+            // usually a cheap no-op that spends nothing.
+            void maybeNarrateActivity(text, {
+              agentKey: agent.id,
+              lastNarratedAt: liveAgent()?.activityAt,
+              // Never overwrite a still-fresh deliberate self-report (roborev 82272).
+              existingSource: liveAgent()?.activitySource,
+              // ...and re-ask that at WRITE time too (roborev 82276). The model call takes seconds,
+              // and a `set_agent_activity` arriving inside that window is exactly the shape of an
+              // agent that has just been given new work.
+              currentLine: () => {
+                const a = liveAgent();
+                return a ? { source: a.activitySource, at: a.activityAt } : undefined;
+              },
+              project: project.name,
+              write: (line, at) =>
+                useProjectStore
+                  .getState()
+                  .setAgentActivity(project.id, agent.id, line, at, "narrated"),
+            }).catch(() => {
+              // Narration is advisory — never let it disturb history capture or status handling.
+            });
             // Followup judge (tune-coloring): the hook fired Stop→idle (gray); decide whether this
             // finished turn is actually blocked on the user (a closeout ask) and, if so, escalate to
             // red. Best-effort and gated: only the freshest agent state, only the still-current turn.

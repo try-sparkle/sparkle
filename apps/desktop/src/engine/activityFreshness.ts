@@ -71,3 +71,57 @@ export function formatActivityAge(activityAt: number | undefined, now: number): 
   const d = Math.floor(h / 24);
   return `${d}d ago`;
 }
+
+/** How an activity line should be RENDERED, given its text, its age and who wrote it. */
+export interface ActivityPresentation {
+  /** The visible line. */
+  label: string;
+  /** The `title` tooltip — always states provenance in full, whatever the line reads as. */
+  title: string;
+  /** Whether to render as a past quote (italic, dimmed). */
+  stale: boolean;
+}
+
+/**
+ * Present an activity line honestly, including WHO WROTE IT.
+ *
+ * PROVENANCE IS NOT COSMETIC HERE, because the two sources have different failure modes and a
+ * reader has to know which one they are looking at:
+ *
+ *   • `"self"` — the agent called `set_agent_activity` itself, at a phase boundary it chose. Its
+ *     characteristic failure is ABANDONMENT: accurate when written, then left behind for hours
+ *     while the agent works on something else. A stale one means the agent stopped narrating.
+ *   • `"narrated"` — Sparkle generated it from the agent's own last turn at a Stop boundary
+ *     (services/activityNarrator, bead ). It cannot be abandoned, because a Stop fires
+ *     whether or not the agent thought about it. A stale one therefore means something ELSE and
+ *     genuinely useful: no turn has ENDED recently, i.e. the agent has been inside one long turn.
+ *
+ * So a stale self-report and a stale narration must not read the same. `said "…"` is right for the
+ * first and actively wrong for the second — nobody said it; Sparkle summarized it. Note what the
+ * narrated wording deliberately does NOT claim: "as of Nm ago" states when the line was derived and
+ * stops there. It would be easy to write "working for Nm", and that would be an assertion of
+ * LIVENESS this module cannot support — the agent may equally have died mid-turn. Liveness comes
+ * from real tool activity, never from this prose.
+ */
+export function presentActivity(
+  activity: string,
+  activityAt: number | undefined,
+  source: "self" | "narrated" | undefined,
+  now: number,
+): ActivityPresentation {
+  const stale = isActivityStale(activityAt, now);
+  const age = formatActivityAge(activityAt, now);
+  // Undefined source reads as "self": every line written before provenance existed was one.
+  const narrated = source === "narrated";
+
+  const provenance = narrated
+    ? "Summarized by Sparkle from this agent's last turn"
+    : "Self-reported by the agent";
+  const title = `${provenance}${age ? ` ${age}` : " (age unknown)"}: ${activity}`;
+
+  if (!stale) return { label: activity, title, stale };
+
+  const suffix = age ?? "age unknown";
+  const label = narrated ? `as of ${suffix}: ${activity}` : `said “${activity}” · ${suffix}`;
+  return { label, title, stale };
+}

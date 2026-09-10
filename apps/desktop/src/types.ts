@@ -67,6 +67,10 @@ export interface AgentAlertRecord {
   dismissedSeq: number | null;
 }
 
+/** Provenance of an agent's `activity` line — see `AgentTab.activitySource`. `"self"` is what the
+ *  agent said about itself; `"narrated"` is what Sparkle derived from the agent's own last turn. */
+export type ActivitySource = "self" | "narrated";
+
 export interface AgentTab {
   id: string;
   name: string;
@@ -96,6 +100,22 @@ export interface AgentTab {
   // (undefined) whenever the line is cleared. Optional, so legacy/restored records read as "unknown
   // age", which callers must treat as stale — never as fresh (see engine/activityFreshness).
   activityAt?: number;
+  // WHO WROTE the current `activity` line — `"self"` when the agent called the sparkle-control
+  // `set_agent_activity` op itself, `"narrated"` when Sparkle GENERATED it from the agent's own last
+  // turn at a Stop boundary (services/activityNarrator, bead ).
+  //
+  // IT IS NOT DECORATION. The two have different failure modes and a reader has to be able to tell
+  // them apart: a self-report is written at phase boundaries the agent CHOOSES, so its characteristic
+  // failure is being ABANDONED — accurate when written, then left behind for hours while the agent
+  // works on something else. A narrated line is regenerated at every turn boundary whether or not the
+  // agent thought about it, so it cannot be abandoned; its characteristic failure is being a
+  // model's PARAPHRASE, which can be bland or subtly off. Rendering both identically would put the
+  // burden of guessing which one you are looking at back on the reader — the exact burden that made
+  // the field untrustworthy in the first place.
+  //
+  // Optional so legacy/restored records need no migration; undefined reads as `"self"`, which is
+  // what every line written before this existed actually was.
+  activitySource?: ActivitySource;
   // WHERE THIS AGENT'S WORK ACTUALLY LANDED, when that is not the repository this project is bound
   // to (engine/crossRepo.LandedElsewhere). Written by the agent itself via the sparkle-control
   // `set_agent_landed` op; read by `deriveLiveStage`, which PREFERS it over the bound-project probe.

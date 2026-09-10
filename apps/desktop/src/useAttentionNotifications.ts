@@ -91,7 +91,7 @@ import {
   type ObservedReading,
 } from "./engine/observedAttention";
 import { thrashReportFor, type ThrashReport } from "./engine/agentThrash";
-import type { AgentTab, AgentTabStatus } from "./types";
+import type { ActivitySource, AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
 
 // `isRelayRed` USED TO LIVE HERE and was deleted, not renamed. Once `questions` joined the set it
@@ -605,7 +605,27 @@ export function selfReportBody(
   now: number,
   status: AgentTabStatus | undefined,
   activityAt?: number,
+  activitySource?: ActivitySource,
 ): string | null {
+  // A GENERATED line is not a self-report and must never stand in for the ask-summary (roborev
+  // 82235, bead ). Three things go wrong if it does, and the second is the damaging one:
+  //
+  //  1. This body reaches a phone banner with NO tooltip to qualify it, so a line Sparkle wrote is
+  //     delivered as the agent's own words. AgentRow was fixed for exactly this; the same rule
+  //     applies here, and this is the surface with no room to correct itself.
+  //  2. It ANSWERS THE WRONG QUESTION. Narration fires at the Stop boundary — the very boundary at
+  //     which the followup judge escalates a row to `waiting` — so a narrated line is routinely
+  //     well inside ACTIVITY_FRESH_MS at the moment the notification is built, and would displace
+  //     the Haiku ask-summary. But a narration is a recap of the turn that just ENDED ("what did it
+  //     just do?"), while this notification's whole question is "what does it WANT?". The
+  //     self-report substitution was justified because a self-report is written at a phase boundary
+  //     and the ask lies inside that phase; a recap of a finished turn carries no such guarantee.
+  //  3. It would blind the regression detector for (2): `attentionBodySource` classifies any
+  //     non-null return here as `self_report`, so the metric would show self-reports rising exactly
+  //     as the paid path was displaced, indistinguishable from agents simply narrating more.
+  //
+  // Legacy/`undefined` reads as "self", which is what every line written before provenance was.
+  if (activitySource === "narrated") return null;
   // Only substitute the activity narration for a WAITING body, where "what I'm doing now" is a
   // reasonable proxy for the question. For APPROVAL we must NOT — the body has to describe the
   // action being approved (e.g. "Approve `rm -rf build/`?"), which the narration ("Refactoring
@@ -907,6 +927,7 @@ export function useAttentionNotifications(): void {
           now,
           st,
           agent.activityAt,
+          agent.activitySource,
         );
         void (async () => {
           // The agent's ask, summarized once and shared by phone + banner. A fresh self-report wins;

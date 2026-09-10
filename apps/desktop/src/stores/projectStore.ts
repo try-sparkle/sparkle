@@ -5,6 +5,7 @@ import { create } from "zustand";
 import { mayReplaceVerify, type GoalVerify } from "@sparkle/core";
 import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
 import type {
+  ActivitySource,
   AgentKind,
   AgentName,
   AgentTab,
@@ -260,7 +261,13 @@ export interface ProjectState {
    *  Stamps `activityAt` (default `Date.now()`, injectable for tests) so the string can be read as a
    *  TIMESTAMPED QUOTE rather than as perpetually-current state — a stale self-report is how a dead
    *  agent looked "explained" (bead sparkle-s8y5t6). Clearing the line clears the stamp. */
-  setAgentActivity: (projectId: string, agentId: string, activity: string, now?: number) => void;
+  setAgentActivity: (
+    projectId: string,
+    agentId: string,
+    activity: string,
+    now?: number,
+    source?: ActivitySource,
+  ) => void;
   /** Record WHERE this agent's work actually landed, when that is a repository other than the one
    *  this project is bound to (sparkle-control `set_agent_landed`; bead `sparkle-pgh1ue`). `null`
    *  clears the stamp.
@@ -1742,7 +1749,7 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      setAgentActivity: (projectId, agentId, activity, now = Date.now()) =>
+      setAgentActivity: (projectId, agentId, activity, now = Date.now(), source = "self") =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             // Trim so a whitespace-only report clears the line; store the string verbatim otherwise.
@@ -1756,13 +1763,29 @@ export const useProjectStore = create<ProjectState>()(
               const text = activity.trim();
               const nextActivity = text ? text : "";
               const nextActivityAt = text ? now : undefined;
+              // Provenance rides with the text (bead ). A CLEARED line carries none, for
+              // the same reason it carries no stamp: there is no quote left to attribute.
+              const nextActivitySource = text ? source : undefined;
               // IDENTITY PRESERVATION: bail to the SAME agent object when the write changes nothing
               // (e.g. re-clearing an already-clear line, or re-reporting the identical text at the
               // same `now`). This propagates through mapAgent → mapProject so a genuine no-op leaves
               // the whole `projects` reference intact. A real activity change still stamps `now` and
               // mints a new object, exactly as before (bead sparkle-s8y5t6).
-              if (a.activity === nextActivity && a.activityAt === nextActivityAt) return a;
-              return { ...a, activity: nextActivity, activityAt: nextActivityAt };
+              // IDENTITY PRESERVATION must compare EVERY field this writer sets. Omitting
+              // `activitySource` here would silently swallow a self→narrated flip that reused the
+              // same text and stamp, leaving the row attributing a generated line to the agent.
+              if (
+                a.activity === nextActivity &&
+                a.activityAt === nextActivityAt &&
+                a.activitySource === nextActivitySource
+              )
+                return a;
+              return {
+                ...a,
+                activity: nextActivity,
+                activityAt: nextActivityAt,
+                activitySource: nextActivitySource,
+              };
             }),
           ),
         })),

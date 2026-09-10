@@ -4,6 +4,10 @@ import {
   stampActivity,
   selfReportBody,
 } from "./useAttentionNotifications";
+import {
+  NARRATION_MIN_INTERVAL_MS,
+  SELF_REPORT_PROTECTED_MS,
+} from "./engine/activityNarrationPolicy";
 
 // Phase-2b: when an agent FRESHLY self-reported "what I'm building" (AgentTab.activity, via the
 // sparkle-control set_agent_activity op) right as it crossed into a needs-you state, we use that
@@ -135,5 +139,72 @@ describe("selfReportBody — precedence gate for the notification body", () => {
     const at = now - ACTIVITY_FRESH_MS; // exactly at the edge
     expect(selfReportBody("edge", { value: "edge", at }, now, "waiting")).toBe("edge");
     expect(selfReportBody("edge", { value: "edge", at: at - 1 }, now, "waiting")).toBeNull();
+  });
+});
+
+describe("selfReportBody — a GENERATED line never stands in for the ask (bead )", () => {
+  const now = 1_000_000;
+  // FRESH by every existing rule: a durable stamp, well inside ACTIVITY_FRESH_MS, status waiting.
+  // Everything the "self" path needs to win — so only provenance can be what rejects it.
+  const freshStamp = { value: "Wiring the login screen", at: now - 1_000 };
+  const activityAt = now - 1_000;
+
+  it("still uses a fresh SELF-report, unchanged", () => {
+    // The control. Without this the next test passes trivially for a suite that rejects everything.
+    expect(
+      selfReportBody("Wiring the login screen", freshStamp, now, "waiting", activityAt, "self"),
+    ).toBe("Wiring the login screen");
+  });
+
+  it("treats a legacy line with no source as a self-report", () => {
+    // Every line written before provenance existed was a self-report; defaulting the other way
+    // would silently switch the whole persisted backlog onto the paid Haiku path.
+    expect(
+      selfReportBody("Wiring the login screen", freshStamp, now, "waiting", activityAt, undefined),
+    ).toBe("Wiring the login screen");
+  });
+
+  it("falls through to the Haiku ask-summary for a NARRATED line", () => {
+    // THE BUG THIS PINS (roborev 82235). Narration fires at the Stop boundary, which is the same
+    // boundary the followup judge uses to escalate a row to `waiting` — so a narrated line is
+    // routinely fresh at exactly the moment this body is built, and would displace the ask-summary.
+    // A narration recaps the turn that just ENDED ("what did it just do?"); this notification asks
+    // "what does it WANT?". Returning null is what sends it to the Haiku path that answers that.
+    expect(
+      selfReportBody("Wiring the login screen", freshStamp, now, "waiting", activityAt, "narrated"),
+    ).toBeNull();
+  });
+
+  it("rejects a narrated line regardless of how fresh it is", () => {
+    // Not a staleness question — provenance alone decides. Pinned separately so a future change
+    // that "fixes" this by tightening the freshness window is caught rather than looking equivalent.
+    for (const age of [0, 1, 500, 5_000]) {
+      expect(
+        selfReportBody("Wiring it", { value: "Wiring it", at: now - age }, now, "waiting", now - age, "narrated"),
+      ).toBeNull();
+    }
+  });
+});
+
+describe("the self-report protection window covers the notification window (roborev 82272)", () => {
+  it("SELF_REPORT_PROTECTED_MS >= ACTIVITY_FRESH_MS", () => {
+    // THE HOLE THIS CLOSES, stated as arithmetic. Narration is freed by its own throttle at
+    // NARRATION_MIN_INTERVAL_MS (60s) while selfReportBody still accepts a self-report until
+    // ACTIVITY_FRESH_MS (120s). If narration were allowed to overwrite inside that gap, every
+    // self-report aged 60-120s would be destroyed AND replaced by a "narrated" line that
+    // selfReportBody rejects — turning a free, ask-relevant body into a PAID summarize_attention
+    // call, which ACTIVITY_FRESH_MS's own header calls out as "not a saving at all".
+    //
+    // The two constants live in different modules (the policy engine stays free of this React hook
+    // module), so nothing but this assertion couples them. Lower SELF_REPORT_PROTECTED_MS below
+    // ACTIVITY_FRESH_MS and the regression returns silently — no test would otherwise fail.
+    expect(SELF_REPORT_PROTECTED_MS).toBeGreaterThanOrEqual(ACTIVITY_FRESH_MS);
+  });
+
+  it("narration cannot free itself inside the notification window", () => {
+    // The same fact from the other side: the throttle alone is NOT what protects the body, so a
+    // future change that raises the throttle must not be read as making the protection redundant.
+    expect(NARRATION_MIN_INTERVAL_MS).toBeLessThan(ACTIVITY_FRESH_MS);
+    expect(SELF_REPORT_PROTECTED_MS).toBeGreaterThanOrEqual(NARRATION_MIN_INTERVAL_MS);
   });
 });

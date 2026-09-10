@@ -53,7 +53,7 @@ import {
 import { ActiveFillets, rowBoxFor } from "./rowAnatomy";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { isStalled, stallReport } from "../engine/agentStall";
-import { formatActivityAge, isActivityStale } from "../engine/activityFreshness";
+import { presentActivity } from "../engine/activityFreshness";
 import { thrashReportFor } from "../engine/agentThrash";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { humanBlockIn, loginStanddownIn } from "../services/humanBlockFor";
@@ -2166,14 +2166,18 @@ export const AgentRow = memo(function AgentRow({
               // Read staleness off the ROW'S shared clock (clockNow), not a bare Date.now(): the
               // row already subscribes to it (see useRowClock above), so the fresh→stale transition
               // re-renders on its own, and a component test can drive it with a controlled `now`.
-              const stale = isActivityStale(a.activityAt, clockNow);
-              const age = formatActivityAge(a.activityAt, clockNow);
-              const label = stale
-                ? `said “${a.activity}”${age ? ` · ${age}` : " · age unknown"}`
-                : a.activity;
+              // Provenance-aware (bead ): a line Sparkle GENERATED from the agent's
+              // last turn must not render as something the agent "said", and the tooltip must not
+              // call it self-reported. All of that policy is pure and lives in activityFreshness.
+              const { label, title, stale } = presentActivity(
+                a.activity,
+                a.activityAt,
+                a.activitySource,
+                clockNow,
+              );
               return (
                 <div
-                  title={stale ? `Self-reported${age ? ` ${age}` : " (age unknown)"}: ${a.activity}` : a.activity}
+                  title={title}
                   style={{
                     color: C.muted,
                     fontSize: 12,

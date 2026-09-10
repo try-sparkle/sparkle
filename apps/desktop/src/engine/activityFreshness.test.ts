@@ -4,6 +4,7 @@ import {
   activityAgeMs,
   formatActivityAge,
   isActivityStale,
+  presentActivity,
 } from "./activityFreshness";
 
 const NOW = 1_800_000_000_000;
@@ -72,5 +73,72 @@ describe("formatActivityAge — the coarse quote suffix", () => {
   it("is null for an unknown (missing/future) stamp so the caller shows no false age", () => {
     expect(formatActivityAge(undefined, NOW)).toBeNull();
     expect(formatActivityAge(NOW + 1_000, NOW)).toBeNull();
+  });
+});
+
+describe("presentActivity — provenance (bead )", () => {
+  const NOW = 10_000_000;
+  const FRESH = NOW - 5_000; // well inside ACTIVITY_STALE_MS
+  const OLD = NOW - 3 * 60_000; // 3m — comfortably stale
+
+  it("shows a fresh line bare, whoever wrote it", () => {
+    // Fresh, the two sources read identically ON PURPOSE: both are a present-tense description of
+    // current work, and prefixing every row with a provenance badge would be noise on the surface
+    // that was deliberately trimmed to one line. Provenance still reaches the reader via `title`.
+    expect(presentActivity("Wiring the login screen", FRESH, "self", NOW).label).toBe(
+      "Wiring the login screen",
+    );
+    expect(presentActivity("Wiring the login screen", FRESH, "narrated", NOW).label).toBe(
+      "Wiring the login screen",
+    );
+  });
+
+  it("a stale SELF-report reads as something the agent said", () => {
+    const p = presentActivity("Wiring the login screen", OLD, "self", NOW);
+    expect(p.stale).toBe(true);
+    expect(p.label).toBe("said “Wiring the login screen” · 3m ago");
+  });
+
+  it("a stale NARRATION does not claim the agent said it", () => {
+    // THE COPY BUG THIS PREVENTS: nobody "said" a narrated line — Sparkle summarized it from the
+    // transcript. Rendering it as a quote attributes words to the agent it never wrote.
+    const p = presentActivity("Wiring the login screen", OLD, "narrated", NOW);
+    expect(p.stale).toBe(true);
+    expect(p.label).toBe("as of 3m ago: Wiring the login screen");
+    expect(p.label).not.toMatch(/said/);
+  });
+
+  it("never claims LIVENESS for a stale narration", () => {
+    // A stale narration means no turn has ENDED recently, which is consistent with a long turn AND
+    // with an agent that died mid-turn. Wording like "working for 3m" would assert the first; this
+    // module cannot support that claim and must not make it (see engine header: liveness comes from
+    // real tool activity, never from this prose).
+    const p = presentActivity("Wiring the login screen", OLD, "narrated", NOW);
+    expect(p.label).not.toMatch(/working|running|still|active/i);
+  });
+
+  it("titles state provenance in full, and disagree with each other", () => {
+    const self = presentActivity("Wiring it", FRESH, "self", NOW).title;
+    const narrated = presentActivity("Wiring it", FRESH, "narrated", NOW).title;
+    expect(self).toMatch(/Self-reported/);
+    expect(narrated).toMatch(/Summarized by Sparkle/);
+    // The positive half alone would pass if BOTH titles said both things.
+    expect(narrated).not.toMatch(/Self-reported/);
+    expect(self).not.toMatch(/Summarized by Sparkle/);
+  });
+
+  it("treats an unknown source as self, which is what every legacy line was", () => {
+    // Records written before provenance existed carry no source. They were all self-reports, so
+    // defaulting to "narrated" would retroactively mislabel the entire persisted backlog.
+    const p = presentActivity("Wiring it", OLD, undefined, NOW);
+    expect(p.label).toBe("said “Wiring it” · 3m ago");
+    expect(p.title).toMatch(/Self-reported/);
+  });
+
+  it("says the age is unknown rather than inventing one", () => {
+    const p = presentActivity("Wiring it", undefined, "narrated", NOW);
+    expect(p.stale).toBe(true); // unknown age folds to stale — the conservative direction
+    expect(p.label).toBe("as of age unknown: Wiring it");
+    expect(p.title).toMatch(/age unknown/);
   });
 });

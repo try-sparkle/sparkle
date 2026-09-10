@@ -12,6 +12,7 @@ mod overlay_tray;
 mod asset_serving;
 mod attachments;
 mod attention;
+mod activity_narration;
 mod attention_summary;
 mod audio;
 mod audio_devices;
@@ -99,6 +100,7 @@ mod model;
 mod model_catalog;
 mod naming;
 mod onepassword;
+mod oneshot_text;
 mod peak_concurrency;
 /// Runtime arbitration for parallel agents: machine-wide port LEASES for ports that can move, and
 /// named gate LOCKS for the ones that cannot (bead `.5`).
@@ -1842,6 +1844,7 @@ pub fn run() {
             attention::notify_attention,
             watchdog::watchdog_heartbeat,
             attention_summary::summarize_attention,
+            activity_narration::narrate_activity,
             accounts::accounts_list,
             accounts::ensure_project_trusted,
             accounts::accounts_add,
