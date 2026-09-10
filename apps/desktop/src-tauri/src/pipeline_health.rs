@@ -1205,6 +1205,36 @@ fn classify_ci_pool(
             ),
         );
     }
+    // THE AUTOSCALER'S IDLE FLOOR, and it must be read BEFORE the outage arm below (bead
+    // sparkle-hwhheg). `linux-ci` is an autoscaled Spot pool that deliberately scales to ZERO when
+    // idle (`cia_effective_primary_floor`, `CIA_IDLE_AFTER_S` default 3600), so an empty pool with
+    // an EMPTY queue is the designed resting state: nothing is waiting, and the next push boots a
+    // runner in ~175s. `scripts/actions-queue-health.sh` already knew this — commit 26bc29ce7
+    // age-gated its NO CAPACITY verdict for exactly this reason and cited this bead — but this
+    // ladder, which is what the hourly scan FILES from, blocked before the queue was consulted at
+    // all. Every quiet hour therefore published the string one arm below, which is that bead's
+    // TITLE verbatim: 340 sightings, 153 in a single day, and a REGRESSION after it was closed with
+    // evidence, because by the time anyone looked the pool had scaled back up and read healthy.
+    //
+    // NO REAL OUTAGE IS LOST. A genuinely broken pool — a MIG that was never created
+    // (sparkle-l4ii8d), a resize failing closed under congestion (sparkle-m6xos8) — harms nobody
+    // until there is work to run, and that case falls through to the arm below and still blocks.
+    // The repo-wide queue count is the STRONGEST form of this evidence rather than the weakest: it
+    // is not attributed to a label, so zero queued means nothing is waiting ANYWHERE, which
+    // certainly includes this pool. `None` (unreadable) deliberately does NOT reach this arm — the
+    // idle floor is only provable from a read that came back and said zero.
+    if r.online_total() == 0 && queued == Some(0) {
+        return (
+            HealthState::Healthy,
+            format!(
+                "no CI runners ({CI_RUNNER_LABEL}) are online, but NOTHING is queued — this is the \
+                 autoscaled Spot pool at its idle floor, which scales to zero after a quiet hour by \
+                 design, not an outage. The next queued run boots one in about three minutes; \
+                 merges and deploys are not blocked."
+            ),
+        );
+    }
+    // Reached with work QUEUED, or with a queue we could not read.
     if r.online_total() == 0 {
         return (
             HealthState::Blocking,
@@ -4791,15 +4821,19 @@ mod tests {
         assert_eq!(state, HealthState::Unknown, "an unreadable read is UNKNOWN, not blocking");
     }
 
-    /// The CI pool severity ladder: empty → BLOCKING (nothing can test), all-busy WITH A DRAINED
-    /// QUEUE → HEALTHY saturation (bead `sparkle-ot4dxb` — not an incident), some-idle → HEALTHY.
-    /// The empty case is the one red state a runner pool produces on its own; saturation is not.
+    /// The CI pool severity ladder: empty WITH WORK QUEUED → BLOCKING (nothing can test it),
+    /// all-busy WITH A DRAINED QUEUE → HEALTHY saturation (bead `sparkle-ot4dxb` — not an
+    /// incident), some-idle → HEALTHY. The empty-and-queued case is the one red state a runner pool
+    /// produces on its own; saturation is not, and neither is the idle floor (`sparkle-hwhheg`).
     #[test]
     fn ci_pool_empty_blocks_saturated_is_healthy_idle_is_healthy() {
         // No linux-ci runner online (an unrelated label online does not count).
         let none = runners_json(&[("sparkle-release", "online", false)]);
-        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), Some(0));
-        assert_eq!(state, HealthState::Blocking, "no CI runner online cannot run tests");
+        // WITH WORK QUEUED — an empty pool and an EMPTY queue is the autoscaler's idle floor and is
+        // Healthy one arm above (bead `sparkle-hwhheg`); the outage is queued work with nothing to
+        // run it.
+        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), Some(7));
+        assert_eq!(state, HealthState::Blocking, "no CI runner online cannot run queued tests");
         assert!(detail.contains("cannot run tests"), "{detail}");
 
         // All linux-ci runners busy but the queue is drained → HEALTHY saturation, NOT a warning.
@@ -4813,6 +4847,55 @@ mod tests {
         let idle = runners_json(&[("linux-ci", "online", true), ("linux-ci", "online", false)]);
         let (state, _) = classify_ci_pool(read_runner_pool(&idle, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Healthy);
+    }
+
+    /// THE AUTOSCALER'S IDLE FLOOR (bead `sparkle-hwhheg`, 340 sightings — 153 in one day — and a
+    /// REGRESSION after it was closed with evidence). `linux-ci` is an autoscaled Spot pool that
+    /// deliberately scales to ZERO when idle, so an empty pool with an EMPTY queue is the designed
+    /// resting state, not an outage. `scripts/actions-queue-health.sh` learned this in commit
+    /// 26bc29ce7 and cited this very bead; this ladder — the one the hourly scan files from — did
+    /// not, and blocked before the queue was consulted at all, publishing that bead's TITLE every
+    /// quiet hour. By the time anyone looked the pool had scaled back up and read healthy, which is
+    /// why closing the bead never held.
+    #[test]
+    fn an_empty_pool_with_a_drained_queue_is_the_idle_floor_not_an_outage() {
+        let none = runners_json(&[("sparkle-release", "online", false)]);
+        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), Some(0));
+        assert_eq!(state, HealthState::Healthy, "nothing queued means nothing is blocked: {detail}");
+        assert_ne!(state, HealthState::Blocking, "the idle floor must not publish an outage: {detail}");
+        assert!(
+            !detail.contains("cannot run tests"),
+            "and must not carry the outage string that IS the bead's title: {detail}"
+        );
+        // A reader who sees total=0 in the readings escalates on that alone unless the verdict says
+        // WHY it is green — the same remedy commit 26bc29ce7 applied to actions-queue-health's note.
+        assert!(
+            detail.contains("scales to zero"),
+            "the verdict must name the scale-to-zero autoscaler: {detail}"
+        );
+
+        // PAIRED, and load-bearing in the opposite direction: without these, "the idle floor is
+        // healthy" is satisfied by a ladder that never blocks on an empty pool at all.
+        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), Some(1));
+        assert_eq!(state, HealthState::Blocking, "one queued run with nothing to run it blocks: {detail}");
+        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), None);
+        assert_eq!(
+            state,
+            HealthState::Blocking,
+            "an UNREADABLE queue keeps the outage verdict — the idle floor is only provable from a \
+             read that came back and said zero: {detail}"
+        );
+
+        // ARM ORDER: both degraded-read arms still outrank the idle floor. A truncated page and an
+        // empty enumeration each report queued=0 while proving nothing about the pool, so greening
+        // them here would resurrect the fabricated outage from the other side.
+        let rel_only = [("sparkle-release", "online", false)];
+        let (state, detail) =
+            classify_ci_pool(read_runner_pool(&runners_page(61, &rel_only), CI_RUNNER_LABEL), Some(0));
+        assert_eq!(state, HealthState::Unknown, "a TRUNCATED read stays unknown, drained queue or not: {detail}");
+        let (state, detail) =
+            classify_ci_pool(read_runner_pool(r#"{"total_count":0,"runners":[]}"#, CI_RUNNER_LABEL), Some(0));
+        assert_eq!(state, HealthState::Unknown, "an EMPTY enumeration stays unknown: {detail}");
     }
 
     /// bead `sparkle-ot4dxb`: HEALTHY SATURATION MUST NOT ALARM, but the SAME pool WITH a real
@@ -5076,8 +5159,8 @@ mod tests {
 
         // Paired: zero CI runners from a read that DID list a fleet (complete, non-empty) still blocks.
         let entries: Vec<(&str, &str, bool)> = (0..5).map(|_| ("sparkle-release", "online", false)).collect();
-        let (state, _) = classify_ci_pool(read_runner_pool(&runners_page(5, &entries), CI_RUNNER_LABEL), Some(0));
-        assert_eq!(state, HealthState::Blocking, "a complete, non-empty read with no CI runner is the real outage");
+        let (state, _) = classify_ci_pool(read_runner_pool(&runners_page(5, &entries), CI_RUNNER_LABEL), Some(7));
+        assert_eq!(state, HealthState::Blocking, "a complete, non-empty read with no CI runner, WITH work queued, is the real outage");
     }
 
     /// FIX 1(a)'s wire shape. `gh api --paginate … --slurp` returns an ARRAY of
