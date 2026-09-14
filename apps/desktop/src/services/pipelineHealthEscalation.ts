@@ -394,12 +394,25 @@ export function remediationFor(componentId: string, detail?: string): string | n
       // AGENTS.md's rule is that a remedy string is an instruction someone will follow, so pointing
       // at a script that no-ops under exactly the condition that triggered the alert is worse than
       // no remedy: it burns the reader's trust in the line. Name the real blocker instead.
+      //
+      // AND NAME THE CAP THAT IS ACTUALLY BINDING (bead `sparkle-vwvwkn`). This string used to say the
+      // "ONLY remediation is raising that quota" whenever the pool was ceiling-clamped. The tick now
+      // tells the two caps apart, because measured live they diverge: quota allowed 29 VMs while the
+      // configured CIA_CEILING_TOTAL was 24, so the ceiling was CONFIG — and raising CPUS_ALL_REGIONS
+      // would have cost money and moved the ceiling by zero VMs. A remedy has to be true under the
+      // conditions that produced it, so this mirrors the tick's own two message prefixes and sends the
+      // reader to the knob each one names. A Spot stockout is neither: no quota raise adds capacity a
+      // region does not have. It also no longer cites `sparkle-skcxyj` — that bead is the MIG
+      // OPPORTUNISTIC update policy, not quota, so the citation sent readers to an unrelated issue.
       return (
         "CI test capacity is short — a real backlog is queued that free runners are not draining. " +
-        "Check the autoscaler's verdict with `scripts/runner/ci-autoscale-tick.sh` (dry run): if it " +
-        "reports HOLD because the pool is ceiling-clamped (CPUS_ALL_REGIONS) or every Spot region is " +
-        "stocked out, it is already at the GCP quota ceiling and re-running it adds nothing — the ONLY " +
-        "remediation is raising that quota, which is a founder spend decision tracked on sparkle-skcxyj."
+        "Check the autoscaler's verdict with `scripts/runner/ci-autoscale-tick.sh` (dry run). Re-running " +
+        "it adds nothing while it HOLDs, so read WHICH cap it names. \"CEILING CLAMPED … BY QUOTA\" " +
+        "means the GCP CPUS_ALL_REGIONS quota is binding: raising that quota is a founder spend " +
+        "decision. \"CEILING HELD AT THE CONFIGURED … BY CIA_CEILING_TOTAL\" means the configured cap " +
+        "is binding and quota already has room: raise CIA_CEILING_TOTAL instead — raising " +
+        "CPUS_ALL_REGIONS there moves nothing. If every Spot region is stocked out, neither knob adds " +
+        "capacity: that is Spot availability, not quota."
       );
     case "release_runner":
       return releaseRunnerRemediation(detail);

@@ -277,6 +277,30 @@ describe("composeEscalationMessage + remediationFor", () => {
     expect(remediationFor("nope")).toBeNull();
   });
 
+  // The ci_runners remedy had ZERO assertions beyond "not null", so it could say anything. It said
+  // raising the GCP quota was the ONLY remediation for a ceiling-clamped pool — measured wrong: with
+  // quota at 29 VMs and the configured CIA_CEILING_TOTAL at 24, the cap was CONFIG, and a quota raise
+  // would have been a spend that moved nothing. It also cited sparkle-skcxyj, which is the MIG
+  // update-policy bead, not a quota one.
+  //
+  // PAIRED on purpose (AGENTS.md copy-ratchet rule): the negatives alone would pass on a remedy
+  // trimmed to silence. Each positive fails if the true advice is deleted, including the QUOTA
+  // advice — which is still correct when quota really is the binding cap.
+  it("the ci_runners remedy names the cap that is actually binding, not only the quota", () => {
+    const remedy = remediationFor("ci_runners")!;
+    // NEGATIVE: the unconditional "quota is the only fix" claim and the unrelated bead are gone.
+    expect(remedy, "must not claim a quota raise is the ONLY remediation").not.toMatch(/ONLY remediation/i);
+    expect(remedy, "must not cite the unrelated MIG update-policy bead").not.toContain("sparkle-skcxyj");
+    // POSITIVE: the config cap is named as its own remedy, and the quota raise is said to move nothing there.
+    expect(remedy, "must name CIA_CEILING_TOTAL as the knob when config is binding").toContain("CIA_CEILING_TOTAL");
+    expect(remedy, "must say a quota raise moves nothing when config is binding").toMatch(/moves nothing/i);
+    // POSITIVE: the quota remedy survives for the case where quota IS the binding cap.
+    expect(remedy, "must still name the quota raise for a quota-bound pool").toMatch(/BY QUOTA[\s\S]*CPUS_ALL_REGIONS/);
+    // POSITIVE: both tick message prefixes are named, so the reader can tell which verdict they got.
+    expect(remedy).toContain("CEILING CLAMPED");
+    expect(remedy).toContain("CEILING HELD AT THE CONFIGURED");
+  });
+
   it("a recovery message says RECOVERED and needs no remediation", () => {
     const ev = detectEscalations(snap("blocking"), snap("healthy", "back up"))[0]!;
     const msg = composeEscalationMessage(ev);
