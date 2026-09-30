@@ -36,6 +36,7 @@ import {
   withDeadline,
   withDeadlineOrExpired,
   isBdMissing,
+  isBeadsError,
   isNoWorkspace,
   isWriteDropped,
   toBeadsError,
@@ -510,12 +511,14 @@ export interface CreatedPlan {
  *   `not-created`  PROVEN nothing was filed. Safe to retry unchanged.
  *   `unknown`      Genuinely unresolved. Do NOT retry blind; read the plan list first.
  *
- * Only two things prove absence, and both are narrow on purpose. `invalidInput` is rejected in Rust
+ * Only three things prove absence, and all are narrow on purpose. `invalidInput` is rejected in Rust
  * before bd is ever invoked. `isWriteDropped` fires only when the post-create probe RAN CLEANLY and
  * found no row — a probe that could not run fails OPEN in `confirm_written`, precisely so an
- * unreadable probe can never condemn a create that landed. Everything else is `unknown`, which is
- * the fail-safe direction: over-reporting "unknown" costs one extra read, over-reporting
- * "not-created" costs a duplicate epic.
+ * unreadable probe can never condemn a create that landed. And {@link isNeverSpawned}: a
+ * `storeBusy` whose bd was never started because the concurrency permit stayed saturated. Everything
+ * else is `unknown` — including a `storeBusy` from bd having RUN and lost the lock, which may have
+ * committed first (sparkle-lncpoc) — which is the fail-safe direction: over-reporting "unknown"
+ * costs one extra read, over-reporting "not-created" costs a duplicate epic.
  *
  * Pure and exported so this can be tested against every kind without a bd that fails on cue.
  */
@@ -523,7 +526,26 @@ export function createFailureVerdict(e: unknown): "unavailable" | "not-created" 
   if (isNoWorkspace(e) || isBdMissing(e)) return "unavailable";
   if (isWriteDropped(e)) return "not-created";
   if (toBeadsError(e).kind === "invalidInput") return "not-created";
+  if (isNeverSpawned(e)) return "not-created";
   return "unknown";
+}
+
+/**
+ * True ONLY for the `storeBusy` whose bd was never spawned (beads_cmd.rs `queue_saturated`), read
+ * from the machine-readable `neverSpawned` flag rather than the English message. `storeBusy` has a
+ * second producer — bd RAN and lost the store lock — which is write-AMBIGUOUS for a create, and it
+ * carries the same kind with `neverSpawned: false`.
+ *
+ * The flag reaches here through `toBeadsError`, which `call()` applies to every rejection and which
+ * preserves `neverSpawned` only when it is literally `true` (beadsCommands.ts). Absent (an older
+ * build), null, or any truthy non-boolean is unrecognised and fails CLOSED to `unknown`.
+ */
+function isNeverSpawned(e: unknown): boolean {
+  return (
+    isBeadsError(e) &&
+    e.kind === "storeBusy" &&
+    (e as { neverSpawned?: unknown }).neverSpawned === true
+  );
 }
 
 /** Normalized for comparison only — case and inner whitespace, which is all a model varies when it

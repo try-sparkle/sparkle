@@ -207,6 +207,22 @@ export const RESTART_ENABLED = true;
 export const DECOMPOSE_REQUEST_ENABLED = true;
 
 /**
+ * The sweep's flag on an epic whose every open child is already named by a landed commit (bead
+ * `sparkle-5wjy5a`): DONE-PENDING-CLOSE. Deliberately NOT `stalled` — that is the mark the board
+ * routes to the BLOCKED lane, and a finished epic is not blocked. Terminal while the epic stays
+ * still (the engine skips it `awaiting-close`, so the founder is told once), and retracted by the
+ * `clear` path the moment a child moves or the epic finishes.
+ */
+export const EPIC_READY_TO_CLOSE_LABEL = "ready-to-close";
+
+// THE SWEEP NEVER WRITES TO A CHILD BEAD (bead `sparkle-5wjy5a`, roborev 83478). The landed subset
+// is recorded on the EPIC — its audit note and notice — and never as a label on each child, because
+// the newest child `updatedAt` IS this module's stall clock (`lastChildProgressAt`): a child write
+// would read as progress on the next tick, retracting a ready-to-close flag the founder was just
+// told about and re-granting a mixed epic the one restart it had spent. Nothing is closed either —
+// epic `sparkle-qtvp6c` exists because automatic closes were wrong, and `Refs:` means "related to".
+
+/**
  * How many times to try the best-effort audit note, and how long to pause between tries.
  *
  * SMALL and SHORT on purpose. This retry runs INSIDE the sweep loop, so a long one would stall the
@@ -323,7 +339,14 @@ export interface EpicSweepOutcome extends EpicSweepDecision {
   /** The action that was actually performed. Differs from `action` when the sweep was capped for
    *  this tick, or when a write failed — a decision is not a deed and the two must be legible
    *  apart. */
-  performed: "restarted" | "escalated" | "cleared" | "decompose-requested" | "none";
+  performed:
+    | "restarted"
+    | "escalated"
+    | "cleared"
+    | "decompose-requested"
+    /** Flagged {@link EPIC_READY_TO_CLOSE_LABEL} and the founder told it needs a close. */
+    | "ready-to-close"
+    | "none";
   /**
    * Did the handoff actually RELAUNCH the orchestrator, or was it already running?
    *
@@ -790,6 +813,7 @@ export function candidateFor(
     // only the first. The second is handled where it belongs — in the runner, which resets a
     // stand-in the moment the restart becomes available (see `standInToReset`).
     alreadyEscalated: epic.labels.includes(STALLED_LABEL),
+    awaitingClose: epic.labels.includes(EPIC_READY_TO_CLOSE_LABEL),
     optedOut: isAutoRestartOptedOut(epic),
     // ── THE HOLLOW-EPIC FACTS ────────────────────────────────────────────────────────────────
     // `status` is the roll-up over CHILDREN, so it answers `unplanned` for a CLOSED childless epic
@@ -820,7 +844,11 @@ export function candidateFor(
  * proofread like prose — and it is pinned by a test against the constant the engine vetoes on, so
  * the sentence and the behaviour cannot drift apart again.
  */
-export function restartMessage(epic: Bead, relaunched = true): string {
+export function restartMessage(
+  epic: Bead,
+  relaunched = true,
+  landedIds: readonly string[] = [],
+): string {
   const name = `**${epic.id} — ${epic.title}**`;
   const why =
     `Its plan was written and then nothing moved on it for over two hours`;
@@ -840,7 +868,7 @@ export function restartMessage(epic: Bead, relaunched = true): string {
   // the epic watched across the orchestrator being closed, retired, or lost to a relaunch, which is
   // the entire point of the fix. Leaving the old sentence would hand the founder an instruction
   // that silently does nothing — the failure mode this repo audits remedy copy for.
-  return relaunched
+  return (relaunched
     ? `I restarted ${name}. ${why}, with no build agent on it, so I handed it back to one. ` +
       `If that was not what you wanted, add the \`${NO_AUTO_RESTART_LABEL}\` label to the epic and ` +
       `I will leave it alone — closing the agent no longer stops me, because I now track the epic ` +
@@ -848,7 +876,17 @@ export function restartMessage(epic: Bead, relaunched = true): string {
     : `I handed ${name} back to its orchestrator. ${why} — but the orchestrator was already ` +
       `running, so I did not restart it; I told it to pick the epic back up. An epic sitting ` +
       `still with a live agent on it is worth a look. I will not hand this one back again ` +
-      `until it moves.`;
+      `until it moves.`) + landedSentence(landedIds);
+}
+
+/** The mixed-epic addendum: which open children a landed commit already names. Empty when none
+ *  did, so an epic with nothing landed reads exactly as it always has. */
+function landedSentence(landedIds: readonly string[]): string {
+  if (landedIds.length === 0) return "";
+  return (
+    ` A landed commit already names ${landedIds.join(", ")}, so I told the orchestrator to ` +
+    `skip ${landedIds.length === 1 ? "it" : "them"} — I did not label or close anything.`
+  );
 }
 
 /**
@@ -872,6 +910,7 @@ export function auditNote(
   now: number,
   beads: readonly Bead[],
   relaunched = true,
+  landedIds: readonly string[] = [],
 ): string {
   const children = childrenOf(beads, epic.id);
   const progressed = lastChildProgressAt(beads, epic.id);
@@ -895,6 +934,50 @@ export function auditNote(
     `BUDGET: this epic's ONE automatic restart is now spent. If nothing moves, the next sweep` +
       ` escalates it to the Blocked lane instead of restarting it again. The budget resets only` +
       ` when a child bead actually moves.`,
+    // THE BRIEF FOR THE MIXED EPIC. This note lands on the epic, which is what the resumed
+    // orchestrator reads its plan from, so it is where "these are done, do not rebuild them" has
+    // to be said. Only when there is something to say — a no-landed restart reads as it always has.
+    ...(landedIds.length > 0 ? landedLines(landedIds) : []),
+  ].join("\n");
+}
+
+/** Split out so the conditional that includes it stays one mutable line. */
+function landedLines(landedIds: readonly string[]): string[] {
+  return [
+    `ALREADY LANDED: ${landedIds.join(", ")} — a commit on the default branch names each in a` +
+      ` Refs:/Fixes: trailer. SKIP them: do not dispatch a worker to rebuild them. Verify with` +
+      ` \`bash scripts/bead-landed-check.sh <id>\` if in doubt. They are listed only here, NOT` +
+      ` labelled and NOT closed — a Refs: trailer means "related to", so closing them is a` +
+      ` human's call.`,
+  ];
+}
+
+/**
+ * The notice for an epic whose every open child a landed commit already names. NOT the Blocked
+ * wording: nothing is stuck, the work looks finished, and what it needs is a human CLOSE — which
+ * the sweep will not do itself (epic `sparkle-qtvp6c`: automatic closes were wrong).
+ */
+export function readyToCloseMessage(epic: Bead, landedIds: readonly string[]): string {
+  return (
+    `**${epic.id} — ${epic.title}** looks ready to close: every open child ` +
+    `(${landedIds.join(", ")}) is already named by a commit on the default branch, so I did not ` +
+    `restart it and did not put it in Blocked. I labelled the epic ` +
+    `\`${EPIC_READY_TO_CLOSE_LABEL}\`, but I have not closed anything — a Refs: ` +
+    `trailer can name a partial fix. Check them and close the epic, or re-plan what is left.`
+  );
+}
+
+/** The durable note for the same outcome, on the epic. */
+export function readyToCloseNote(epic: Bead, landedIds: readonly string[]): string {
+  return [
+    `Flagged ready-to-close by the epic sweep (NOT restarted, NOT escalated to Blocked).`,
+    ``,
+    `WHY: no child bead has moved, and every still-open child is named in a Refs:/Fixes: trailer` +
+      ` by a commit that is an ancestor of the default branch: ${landedIds.join(", ")}.`,
+    `ACTION: labelled this epic \`${EPIC_READY_TO_CLOSE_LABEL}\`. The children were NOT labelled` +
+      ` and nothing was closed — a Refs: trailer means "related to".`,
+    `NEXT: a human verifies and closes ${epic.id}, or re-plans the remainder. The flag comes off by` +
+      ` itself the moment a child moves.`,
   ].join("\n");
 }
 
@@ -1011,6 +1094,7 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
     }
     await setLabel(projectPath, "add", epic.id, `${SWEEP_RESTART_PREFIX}${at}`);
   }
+
   const beadsFor =
     opts.beadsFor ?? ((projectId: string) => useBeadsStore.getState().byProject[projectId]?.beads ?? null);
   // ── THE FRESHNESS CLOCK BELONGS TO THE STORE, SO IT ONLY SPEAKS FOR THE STORE ─────────────────
@@ -1190,9 +1274,16 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       // still-open child already been named by a commit on the default branch? Measured: an epic
       // with six open children, all fixed by two merged PRs, was restarted and its one restart spent
       // on an orchestrator with nothing to dispatch. When they all read landed, the restart becomes
-      // an ESCALATION, never a silent skip (roborev 83233 — a trailer can name a partial increment).
-      // Asked only for a decided restart, so a quiet tick pays no git read; `null` changes nothing.
-      if (decision.action === "restart") {
+      // `ready-to-close`, never a silent skip (roborev 83233 — a trailer can name a partial
+      // increment) and never the Blocked lane (the epic is finished-pending-close, not stuck).
+      // Asked only for a decided restart OR escalation — the two answers that spend a slot or file a
+      // Blocked mark — so a quiet tick pays no git read; `null` changes nothing.
+      //
+      // A MIXED epic (some open children landed, some not) still restarts, but `landedOpen` carries
+      // the landed subset forward so the restart can mark those children and brief the orchestrator
+      // to skip them, rather than re-pointing it at work that is already on the default branch.
+      let landedOpen: Bead[] = [];
+      if (decision.action === "restart" || decision.action === "escalate") {
         const open = childrenOf(beads, epic.id).filter((c) => c.status !== "closed");
         if (open.length > 0) {
           let landed: ReadonlySet<string> | null = null;
@@ -1207,7 +1298,9 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
               error: String(e),
             });
           }
-          if (landed && open.every((c) => landed.has(c.id))) {
+          const landedSet = landed;
+          landedOpen = landedSet ? open.filter((c) => landedSet.has(c.id)) : [];
+          if (landedOpen.length === open.length) {
             decision = decideEpicSweep(
               { ...candidate, openChildrenLanded: true },
               now,
@@ -1393,6 +1486,52 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
         continue;
       }
 
+      if (action === "ready-to-close") {
+        // ── DONE-PENDING-CLOSE: FLAG THE EPIC, TELL THE FOUNDER — AND CLOSE NOTHING ────────────────
+        // The epic flag is the durable signal and it is what makes the outcome terminal (the engine
+        // skips `awaiting-close` next tick), so it is written FIRST and a failure stops here without
+        // a notice: "I flagged it" must not be said about a flag that never landed. It is NOT the
+        // `stalled` mark, so the epic stays out of the Blocked lane.
+        //
+        // GATED ON `canNotify()` LIKE RESTART AND DECOMPOSE (roborev 83514). Nothing on the board reads
+        // this flag, so the NOTICE is the only way the founder learns of this outcome — and the flag
+        // is terminal. Writing it from a window that cannot notify (a satellite) would park a finished
+        // epic where no one sees it, which is worse than the Blocked escalation it replaced. Skipping
+        // writes nothing, so a window that CAN notify flags it on a later tick.
+        if (!canNotify()) {
+          log.warn("epics", "skipping a ready-to-close flag this window could not report", { epic: epic.id });
+          outcomes.push({ ...out, note: "cannot-notify" });
+          continue;
+        }
+        try {
+          await setLabel(project.rootPath, "add", epic.id, EPIC_READY_TO_CLOSE_LABEL);
+          epic.labels = [
+            ...epic.labels.filter((l) => l !== EPIC_READY_TO_CLOSE_LABEL),
+            EPIC_READY_TO_CLOSE_LABEL,
+          ];
+        } catch (e) {
+          log.warn("epics", "could not flag an epic ready to close", { epic: epic.id, error: String(e) });
+          outcomes.push({ ...out, note: "write-failed" });
+          continue;
+        }
+        acted += 1;
+        const ids = landedOpen.map((c) => c.id);
+        await writeAuditNoteResilient(
+          audit,
+          project.rootPath,
+          epic.id,
+          readyToCloseNote(epic, ids),
+          auditAttempts,
+          auditBackoffMs,
+        );
+        const noticed = notify(readyToCloseMessage(epic, ids));
+        if (!noticed) {
+          log.warn("epics", "flagged an epic ready to close but the notice was dropped", { epic: epic.id });
+        }
+        outcomes.push({ ...out, performed: "ready-to-close", noticed });
+        continue;
+      }
+
       if (action === "restart") {
         // ── A RESTART IS ONE REMEDY, NOT THE DEFAULT ONE ───────────────────────────────────────
         // CHECKED FIRST IN THIS BRANCH, ABOVE THE NOTIFIER GATE AND ABOVE `stamp`, because both of
@@ -1456,6 +1595,9 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
           outcomes.push({ ...out, note: "cannot-notify" });
           continue;
         }
+        // THE MIXED EPIC: the landed subset goes into the epic's audit note and the notice — never
+        // onto the children, whose `updatedAt` is the stall clock the restart budget is judged by.
+        const landedIds = landedOpen.map((c) => c.id);
         try {
           // STAMP BEFORE HANDING OVER. The marker is what makes "restart once" a real bound, so it
           // has to be written on the path that spends the restart — and written FIRST, because a
@@ -1492,12 +1634,12 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
             audit,
             project.rootPath,
             epic.id,
-            auditNote(epic, handoff.agentId, now, beads, relaunched),
+            auditNote(epic, handoff.agentId, now, beads, relaunched, landedIds),
             auditAttempts,
             auditBackoffMs,
           );
           // The notice's own answer, not an assumption that sending equals delivering.
-          const noticed = notify(restartMessage(epic, relaunched));
+          const noticed = notify(restartMessage(epic, relaunched, landedIds));
           if (!noticed) {
             log.warn("epics", "restarted an epic but the notice was dropped", { epic: epic.id });
           }
@@ -1522,7 +1664,14 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
 
       // escalate / clear — both are one label write on the epic.
       try {
-        await mark(project.rootPath, action === "escalate" ? "add" : "remove", epic.id);
+        // The `stalled` mark is written on escalate and retracted on a clear — but only when it is
+        // there: a clear may now be retracting the ready-to-close flag alone.
+        if (action === "escalate" || epic.labels.includes(STALLED_LABEL)) {
+          await mark(project.rootPath, action === "escalate" ? "add" : "remove", epic.id);
+        }
+        if (action === "clear" && epic.labels.includes(EPIC_READY_TO_CLOSE_LABEL)) {
+          await setLabel(project.rootPath, "remove", epic.id, EPIC_READY_TO_CLOSE_LABEL);
+        }
         // A STAND-IN escalation gets a second marker so the engine does not read it as a spent
         // budget. Without it, every epic that stalls while the restart is gated off permanently
         // burns the restart it is still owed, and flipping RESTART_ENABLED on later could never

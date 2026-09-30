@@ -451,7 +451,7 @@ export function useBeadBuildActions({
 
   const buildOne = useCallback(
     async (mode: "epic" | "task") => {
-      const blocked = sendToBuildBlockedReason(projectId, bead.id, mode);
+      const blocked = sendToBuildBlockedReason(projectId, bead.id, mode, prdPath);
       if (blocked) throw new Error(blocked);
       if (rootPath) await claimBead(rootPath, bead.id);
       // THE PREFLIGHT IS NOT ENOUGH — see `releaseClaim`. It answers the capacity question only,
@@ -474,7 +474,7 @@ export function useBeadBuildActions({
   const buildAllPrd = useCallback(async () => {
     let built = 0;
     for (const epic of prdEpics) {
-      const blocked = sendToBuildBlockedReason(projectId, epic.id);
+      const blocked = sendToBuildBlockedReason(projectId, epic.id, "epic", prdPath);
       if (blocked) {
         throw new Error(`${blocked} Started ${built} of ${prdEpics.length}; the rest are untouched.`);
       }

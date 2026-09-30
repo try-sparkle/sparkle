@@ -170,7 +170,22 @@ export interface GenerateArgs {
   /** Extra line(s) appended to the epic body after the PRD back-link — e.g. the capture
    *  flow's `Screenshot: <repo-relative path>` reference. */
   epicBodyExtra?: string;
+  /** bd priority ("0"-"4") for every epic this call creates. Defaults to
+   *  {@link DEFAULT_EPIC_PRIORITY}; see there for why it is always sent. */
+  epicPriority?: string;
 }
+
+/**
+ * The priority an epic is created at when the caller names none (`sparkle-1abg72`).
+ *
+ * ALWAYS SENT, never left to bd. An epic asked for at P1 persisted at bd's default P2 because no
+ * caller of `create_bead_full` ever passed a priority — the request had nowhere to go. Sending an
+ * explicit value makes the epic's priority a fact this app chose rather than whatever the store's
+ * default happens to be, and it is what gives the Rust read-back in `notes.rs::create_bead_full`
+ * something to verify: it only reads a bead back when a priority or a non-task type was asked for.
+ * "2" equals bd's own default, so no epic that was being created at P2 moves.
+ */
+export const DEFAULT_EPIC_PRIORITY = "2";
 
 export interface GenerateResult {
   /** Every epic bead created for this PRD, in plan order. */
@@ -331,6 +346,7 @@ export async function generateTasks(
       "",
       "",
       "think-build-loop",
+      args.epicPriority?.trim() || DEFAULT_EPIC_PRIORITY,
     );
     epicIds.push(epicId);
     // ── THE STRUCTURED HALF OF THE SAME BACK-LINK ────────────────────────────────────────────

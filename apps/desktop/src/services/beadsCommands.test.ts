@@ -366,3 +366,36 @@ describe("mutations", () => {
     await expect(beadsClose("/repo", "b-1", "done")).rejects.toMatchObject({ exitCode: 1 });
   });
 });
+
+// sparkle-lncpoc (roborev 83472): the never-spawned `storeBusy` marker must SURVIVE `call()`'s
+// normalization, or `createFailureVerdict` never sees it and a write-safe busy reads as
+// outcome-unknown. Driven through the real `beadsCreate` → `call()` → `toBeadsError` seam.
+describe("neverSpawned survives normalization (sparkle-lncpoc)", () => {
+  it("carries neverSpawned:true from the raw rejection through beadsCreate", async () => {
+    invokeMock.mockRejectedValue({
+      kind: "storeBusy",
+      message: "bd was not started",
+      exitCode: null,
+      neverSpawned: true,
+    });
+    const err = await beadsCreate("/repo", { title: "t", issueType: "task" }).catch((e) => e);
+    expect(err.kind).toBe("storeBusy");
+    expect(err.neverSpawned).toBe(true);
+  });
+
+  it("keeps the flag only for a literal true — false, null, a truthy string or absent all drop it", () => {
+    const base = { kind: "storeBusy", message: "m", exitCode: null };
+    expect(toBeadsError({ ...base, neverSpawned: true }).neverSpawned).toBe(true);
+    for (const v of [false, null, "true", 1, undefined]) {
+      expect(toBeadsError({ ...base, neverSpawned: v })).not.toHaveProperty("neverSpawned");
+    }
+  });
+
+  it("leaves an ordinary error's shape unchanged (no neverSpawned key)", () => {
+    expect(toBeadsError({ kind: "bdFailed", message: "boom", exitCode: 1 })).toEqual({
+      kind: "bdFailed",
+      message: "boom",
+      exitCode: 1,
+    });
+  });
+});

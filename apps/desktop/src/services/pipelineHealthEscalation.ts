@@ -1098,14 +1098,15 @@ export function liveEscalationDeps(projectPath: string): EscalationDeps {
         title,
         body,
         issueType: "task",
+        // REQUIRED by the Rust command (`priority: String`, since ad9458404): Tauri rejects a call
+        // missing it before any bd runs, so omitting it filed nothing at all (roborev 83515). This
+        // seeds the priority at filing; the hourly scan owns it afterwards (never re-driven here).
+        priority,
         parent: "",
         deps: "",
         labels: `pipeline-health,phc-${ev.componentId},agent-feedback`,
-        // priority is seeded via the body/label; create_bead_full has no priority arg, and the
-        // hourly scan owns priority after filing (never re-driven here).
       });
       assertBeadWasCreated(raw);
-      void priority;
     },
   };
 }

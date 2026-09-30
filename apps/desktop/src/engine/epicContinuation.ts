@@ -82,6 +82,16 @@ export type EpicSweepAction =
   /** It is moving again (or finished). Take the escalation mark back off. */
   | "clear"
   /**
+   * EVERY OPEN CHILD IS ALREADY NAMED BY A LANDED COMMIT (bead `sparkle-5wjy5a`). Not a restart —
+   * there is nothing left to dispatch — and NOT an escalation either: `escalate` writes the
+   * `stalled` mark, which the board routes to the BLOCKED lane, and this epic is not blocked. It is
+   * DONE-PENDING-CLOSE. The runner flags it and tells the founder it needs a human close.
+   *
+   * It never closes anything. A `Refs:` trailer means "related to", not "finished" (the reason
+   * epic `sparkle-qtvp6c` exists), so whether those children really are done is the human's call.
+   */
+  | "ready-to-close"
+  /**
    * ASK FOR A PLAN. The epic was declared an epic and has NO children, so there is nothing to
    * restart and nothing to escalate — it is a title. The sweep requests decomposition (the runner
    * writes `services/epicDecompose`'s explicit opt-in label) rather than spending an agent slot.
@@ -113,6 +123,9 @@ export type EpicSkipReason =
   | "orchestrator-alive"
   /** Already escalated and still not moving. Waiting on the human, by design. */
   | "already-escalated"
+  /** Already flagged ready-to-close and still not moving. Waiting on the human's close, by design —
+   *  re-flagging would re-notify every tick. */
+  | "awaiting-close"
   /** We cannot tell how old the last progress is, so we refuse to act. */
   | "unknown-age"
   /**
@@ -301,13 +314,15 @@ export interface EpicSweepCandidate {
    * Is EVERY still-open child named, in a `Refs:`/`Fixes:` trailer, by a commit that is already an
    * ancestor of the default branch? (bead `sparkle-5wjy5a`)
    *
-   * `true` turns a RESTART into an ESCALATION — never into a skip. A trailer naming a bead says the
-   * commit is ABOUT it, not that the bead is finished: `Refs:` means "related to" and every worker
-   * increment carries one (bead `sparkle-50pjf8`, roborev 83233). So this is evidence against
-   * spending a restart on an orchestrator that may have nothing to dispatch, and NOT evidence that
-   * the epic needs no human: the founder is shown it in the Blocked lane, where "close the landed
-   * children or re-plan" is a decision only he can make. A silent skip here hid a partly-fixed
-   * epic permanently, because a `Refs:`-only child is never closed by anything.
+   * `true` turns a RESTART (or a spent-budget escalation) into `ready-to-close` — never into a skip,
+   * and never into the Blocked lane. A trailer naming a bead says the commit is ABOUT it, not that
+   * the bead is finished: `Refs:` means "related to" and every worker increment carries one (bead
+   * `sparkle-50pjf8`, roborev 83233). So this is evidence against spending a restart on an
+   * orchestrator that may have nothing to dispatch, and NOT evidence that the epic needs no human:
+   * "close the landed children or re-plan" is a decision only he can make, so he is told. But the
+   * epic is not BLOCKED — it looks finished — and filing it in the lane he scans for real blockages
+   * was a false alarm of its own. A silent skip here hid a partly-fixed epic permanently, because a
+   * `Refs:`-only child is never closed by anything.
    *
    * Three states, and only `true` changes anything. `false` (some open child has no landed commit)
    * and `null`/absent (the reading was not taken, or could not be) both leave the decision exactly
@@ -319,6 +334,13 @@ export interface EpicSweepCandidate {
    * the mirror of bead `sparkle-aoqzzo` (a bead closed because its SIBLINGS landed).
    */
   openChildrenLanded?: boolean | null;
+  /**
+   * The epic already carries the sweep's ready-to-close flag — every open child read landed on an
+   * earlier tick and the founder has been told. The `ready-to-close` twin of
+   * {@link alreadyEscalated}: terminal while the epic stays still, retracted the moment it moves or
+   * finishes. Absent reads as `false`, which is the pre-flag behaviour exactly.
+   */
+  awaitingClose?: boolean;
 }
 
 /**
@@ -365,6 +387,9 @@ export function decideEpicSweep(
     reason,
   });
   const clear = (): EpicSweepDecision => ({ epicId: c.epicId, action: "clear" });
+  // Is there a sweep-written mark to retract? The `stalled` escalation OR the ready-to-close flag:
+  // either one is a claim about a still epic, and both are wrong once it moves or finishes.
+  const marked = c.alreadyEscalated || c.awaitingClose === true;
 
   // ── A STALE BOARD DISQUALIFIES EVERY OTHER FACT, SO IT IS CHECKED BEFORE ALL OF THEM ─────────
   // Above even the watch gate, and that ordering is the fix rather than fussiness. `promoted` is
@@ -386,13 +411,13 @@ export function decideEpicSweep(
   // Finished, or someone is on it. Both are "not stalled" — but if we had previously marked it
   // stalled, that mark is now wrong and comes off. A stale escalation is worse than none: it is a
   // false alarm sitting in the lane the human scans for real ones.
-  if (c.status === "done") return c.alreadyEscalated ? clear() : skip("already-done");
+  if (c.status === "done") return marked ? clear() : skip("already-done");
   // STAFFING UNREADABLE ⇒ REFUSE, and refuse BEFORE the alive test rather than after. `null` is
   // falsy, so an `if (c.orchestratorAlive)` placed first would fall straight through to the restart
   // ladder — the exact collapse this state exists to prevent. Note it does NOT clear an existing
   // escalation either: clearing is a claim that the epic is fine, and we have not established that.
   if (c.orchestratorAlive === null) return skip("staffing-unknown");
-  if (c.orchestratorAlive) return c.alreadyEscalated ? clear() : skip("orchestrator-alive");
+  if (c.orchestratorAlive) return marked ? clear() : skip("orchestrator-alive");
 
   // ── A HOLLOW EPIC IS A TITLE, SO THE ANSWER IS "ASK FOR A PLAN", NOT "RESTART" ───────────────
   // No children at all. Restarting would hand a build agent an empty brief, which is how you get an
@@ -446,7 +471,7 @@ export function decideEpicSweep(
   // on the next tick, flapping the human's lane forever. A test caught this; it is kept as
   // "does NOT clear a still-stalled escalated epic".
   if (now - c.lastChildProgressAt < stallMs) {
-    return c.alreadyEscalated ? clear() : skip("too-soon");
+    return marked ? clear() : skip("too-soon");
   }
 
   // ── THE FOUNDER'S EXPLICIT VETO ──────────────────────────────────────────────────────────────
@@ -475,11 +500,18 @@ export function decideEpicSweep(
   // stops the retry loop rather than slowing it down.
   if (c.alreadyEscalated) return skip("already-escalated");
 
+  // Flagged ready-to-close and STILL not moving ⇒ wait for the human's close, exactly as an
+  // escalated epic waits. Terminal, so the founder is told once rather than every ten minutes, and
+  // the runner pays no git read for an epic whose answer it already gave.
+  if (c.awaitingClose === true) return skip("awaiting-close");
+
   // THE REMAINING WORK APPEARS TO HAVE MERGED (bead `sparkle-5wjy5a`). Checked here — after every
-  // rule that clears or waits, before the restart — because a restart would hand an orchestrator a
-  // plan that may have nothing left in it. It ESCALATES rather than skipping (roborev 83233): the
-  // evidence is a trailer, which can name a partial increment, so the human must still see it.
-  if (c.openChildrenLanded === true) return { epicId: c.epicId, action: "escalate" };
+  // rule that clears or waits, before the restart AND before the spent-budget escalation — because
+  // a restart would hand an orchestrator a plan with nothing left in it, and an escalation would
+  // put a finished epic in the Blocked lane. It is not a silent skip either (roborev 83233): the
+  // evidence is a trailer, which can name a partial increment, so the human must still see it —
+  // as a close to make, not as a blockage.
+  if (c.openChildrenLanded === true) return { epicId: c.epicId, action: "ready-to-close" };
 
   // THE SWEEP restarted this epic more recently than anything moved on it — its one restart was
   // spent and bought nothing. Stop, and put it in front of the human.

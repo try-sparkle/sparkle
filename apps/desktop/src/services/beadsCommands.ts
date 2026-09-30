@@ -39,6 +39,9 @@ export interface BeadsError {
   kind: BeadsErrorKind;
   message: string;
   exitCode: number | null;
+  /** Present, and literally `true`, only on a `storeBusy` whose bd was never spawned (beads_cmd.rs
+   *  `queue_saturated`) — nothing was written, so a retry is safe. Absent on every other error. */
+  neverSpawned?: true;
 }
 
 const KINDS: readonly BeadsErrorKind[] = [
@@ -68,7 +71,16 @@ export function isBeadsError(v: unknown): v is BeadsError {
  *  handler that was trying to report it. */
 export function toBeadsError(e: unknown): BeadsError {
   if (isBeadsError(e)) {
-    return { kind: e.kind, message: e.message ?? "", exitCode: e.exitCode ?? null };
+    // Carry the never-spawned marker through, or `createFailureVerdict` (plans.ts) never sees it —
+    // every caller reaches it through `call()`, which normalizes here (sparkle-lncpoc, roborev
+    // 83472). Only a literal `true` survives, so an older build or a malformed value fails CLOSED.
+    const neverSpawned = (e as { neverSpawned?: unknown }).neverSpawned === true;
+    return {
+      kind: e.kind,
+      message: e.message ?? "",
+      exitCode: e.exitCode ?? null,
+      ...(neverSpawned ? { neverSpawned: true as const } : {}),
+    };
   }
   const message = e instanceof Error ? e.message : typeof e === "string" ? e : JSON.stringify(e);
   return { kind: "bdFailed", message: message || "unknown beads failure", exitCode: null };

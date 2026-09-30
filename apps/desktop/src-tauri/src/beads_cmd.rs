@@ -155,26 +155,33 @@ pub enum BeadsErrorKind {
     ///  2. `queue_saturated`: bd was NEVER SPAWNED because the concurrency permit queue stayed
     ///     saturated past the deadline. Unconditionally write-SAFE — nothing ran, nothing was
     ///     written — so retry the same request as-is.
-    /// Only producer 2 is unconditionally retry-safe. Today both reach the user via `describe_bd_failure`'s
-    /// verbatim pass-through, so producer 1's write-ambiguity is NOT yet surfaced — a real gap tracked
-    /// as a follow-up (sparkle-lncpoc: a machine-distinguishable never-spawned marker so consumers like
-    /// `describe_bd_failure` and the frontend `createFailureVerdict` can tell the two apart). Until
-    /// then, do NOT collapse them into one remedy in either direction: keep the never-spawned half's
-    /// write-safe copy (guarded by a test in notes.rs), and do NOT tell a create that lost the lock to
-    /// retry blindly.
+    /// Only producer 2 is unconditionally retry-safe, and it is the only one that sets
+    /// `BeadsError::never_spawned` — the machine-readable marker (sparkle-lncpoc) a consumer branches
+    /// on instead of parsing English. The frontend `createFailureVerdict` reads it: never-spawned is
+    /// `not-created`, any other `StoreBusy` stays `unknown`. `describe_bd_failure` still passes both
+    /// through verbatim, so producer 1's write-ambiguity is not yet in THAT copy. Do NOT collapse them
+    /// into one remedy in either direction: keep the never-spawned half's write-safe copy (guarded by
+    /// a test in notes.rs), and do NOT tell a create that lost the lock to retry blindly.
     StoreBusy,
     /// bd exited cleanly but its output was not the JSON we expect (version skew, partial write).
     BadOutput,
 }
 
 /// The error every command in this module returns. Serializes to
-/// `{ kind, message, exitCode }` — a caller branches on `kind` and shows `message`.
+/// `{ kind, message, exitCode, neverSpawned }` — a caller branches on `kind` and shows `message`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BeadsError {
     pub kind: BeadsErrorKind,
     pub message: String,
     pub exit_code: Option<i32>,
+    /// True ONLY when bd was never started — `queue_saturated`, the permit queue stayed saturated —
+    /// so nothing ran and nothing was written. It is what separates the two `StoreBusy` producers
+    /// (see `BeadsErrorKind::StoreBusy`) without a string match. A plain `bool`, not an `Option`: it
+    /// crosses the wire as `neverSpawned: true|false`, never `null`, and a reader must treat anything
+    /// but a literal `true` as "bd may have run". `default` keeps an older payload deserializable.
+    #[serde(default)]
+    pub never_spawned: bool,
 }
 
 impl BeadsError {
@@ -183,7 +190,12 @@ impl BeadsError {
     // which would bypass the `excerpt` truncation every other error goes through — or invent a
     // second error type. One error type, one constructor, one truncation rule.
     pub(crate) fn new(kind: BeadsErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: excerpt(&message.into(), ERROR_MESSAGE_CHARS).0, exit_code: None }
+        Self {
+            kind,
+            message: excerpt(&message.into(), ERROR_MESSAGE_CHARS).0,
+            exit_code: None,
+            never_spawned: false,
+        }
     }
     fn with_code(kind: BeadsErrorKind, message: impl Into<String>, code: Option<i32>) -> Self {
         Self { exit_code: code, ..Self::new(kind, message) }
@@ -906,13 +918,16 @@ fn enough_budget_to_run(remaining: Duration) -> bool {
 /// message through verbatim, so the user is told the truth. One definition, shared by the "no permit
 /// at all" and "permit came too late to use" branches.
 pub(crate) fn queue_saturated(timeout: Duration) -> BeadsError {
-    BeadsError::new(
-        BeadsErrorKind::StoreBusy,
-        format!(
-            "bd was not started within {}s — the bd concurrency limit stayed saturated (the store is contended), so nothing was run and nothing was written; retrying in a moment is safe",
-            timeout.as_secs()
-        ),
-    )
+    BeadsError {
+        never_spawned: true,
+        ..BeadsError::new(
+            BeadsErrorKind::StoreBusy,
+            format!(
+                "bd was not started within {}s — the bd concurrency limit stayed saturated (the store is contended), so nothing was run and nothing was written; retrying in a moment is safe",
+                timeout.as_secs()
+            ),
+        )
+    }
 }
 
 /// The runner every bd caller shares. Selects the store permit — the process-wide `BD_LIMITER` for
@@ -2977,6 +2992,28 @@ pub(crate) mod tests {
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), tag);
         }
+    }
+
+    #[test]
+    fn only_the_never_spawned_store_busy_carries_the_machine_readable_marker() {
+        // sparkle-lncpoc. Both producers are `StoreBusy`; the frontend `createFailureVerdict` tells
+        // them apart by `neverSpawned` alone, so this pins the WIRE shape for each: the key is
+        // camelCase, a plain bool (never null), true only for `queue_saturated`.
+        let never = serde_json::to_value(queue_saturated(Duration::from_secs(30))).unwrap();
+        assert_eq!(never["kind"], "storeBusy");
+        assert_eq!(never["neverSpawned"], serde_json::Value::Bool(true), "{never}");
+
+        // bd RAN and lost the lock — write-ambiguous for a create, so the marker must be false.
+        let lost = serde_json::to_value(classify_bd_message("Error: database is locked", Some(1)))
+            .unwrap();
+        assert_eq!(lost["kind"], "storeBusy");
+        assert_eq!(lost["neverSpawned"], serde_json::Value::Bool(false), "{lost}");
+        assert!(lost.get("never_spawned").is_none(), "snake_case must not cross the wire: {lost}");
+
+        // An older payload without the key still deserializes, as "bd may have run".
+        let old: BeadsError =
+            serde_json::from_str(r#"{"kind":"storeBusy","message":"m","exitCode":null}"#).unwrap();
+        assert!(!old.never_spawned);
     }
 
     #[test]

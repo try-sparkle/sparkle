@@ -544,6 +544,64 @@ describe("create_plan", () => {
     // A rejection that is not a BeadsError at all must not read as proof of anything either.
     expect(createFailureVerdict(new Error("ipc down"))).toBe("unknown");
   });
+
+  // sparkle-lncpoc. `storeBusy` has TWO Rust producers with OPPOSITE write-safety, told apart by the
+  // machine-readable `neverSpawned` flag (never by the English message):
+  //   - queue_saturated: bd was NEVER SPAWNED under permit saturation — nothing ran, nothing was
+  //     written, so the honest verdict is `not-created` and a re-file is correct.
+  //   - classify_bd_message: bd RAN and lost the store lock — the create may have committed, so
+  //     `unknown` (check the list before re-filing).
+  // The never-spawned message is the real Rust copy, so a verdict keyed on its wording would also
+  // flip the lost-lock case below it (which carries the same kind and no flag).
+  it("reads a NEVER-SPAWNED storeBusy as not-created, and a lost-lock storeBusy as unknown", () => {
+    const neverSpawned = {
+      kind: "storeBusy",
+      message:
+        "bd was not started within 30s — the bd concurrency limit stayed saturated (the store is contended), so nothing was run and nothing was written; retrying in a moment is safe",
+      exitCode: null,
+      neverSpawned: true,
+    };
+    expect(createFailureVerdict(neverSpawned)).toBe("not-created");
+
+    // bd RAN and lost the lock: serde always emits the flag, as `false`.
+    expect(
+      createFailureVerdict({
+        kind: "storeBusy",
+        message: "database is locked",
+        exitCode: 1,
+        neverSpawned: false,
+      }),
+    ).toBe("unknown");
+  });
+
+  it("keeps an UNRECOGNISED storeBusy as unknown — the flag must be literally true", () => {
+    const busy = (neverSpawned: unknown) =>
+      createFailureVerdict({ kind: "storeBusy", message: "busy", exitCode: null, neverSpawned });
+    // Absent (an older build), null (an Option-shaped future), or a truthy non-boolean: none of
+    // these proves nothing was written, so each fails CLOSED.
+    expect(createFailureVerdict({ kind: "storeBusy", message: "busy", exitCode: null })).toBe(
+      "unknown",
+    );
+    expect(busy(null)).toBe("unknown");
+    expect(busy("true")).toBe("unknown");
+    expect(busy(1)).toBe("unknown");
+    // The flag proves absence ONLY for storeBusy: a timeout is a KILLED bd, whatever it carries.
+    expect(
+      createFailureVerdict({ kind: "timeout", message: "t", exitCode: null, neverSpawned: true }),
+    ).toBe("unknown");
+  });
+
+  it("tells the concierge a never-spawned create filed nothing and is safe to retry", async () => {
+    beadsCreate.mockRejectedValue({
+      kind: "storeBusy",
+      message: "bd was not started within 30s — nothing was run and nothing was written",
+      exitCode: null,
+      neverSpawned: true,
+    });
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("not-created");
+  });
 });
 
 describe("promote_plan_to_build", () => {

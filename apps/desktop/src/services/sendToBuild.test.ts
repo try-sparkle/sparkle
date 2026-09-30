@@ -152,6 +152,7 @@ import {
   AtCapacityError,
   MountRefusedError,
   sendToBuildBlockedReason,
+  EmptySpecError,
 } from "./sendToBuild";
 import { parseHandoffRecord, BINDING_TRAILER_TAG } from "./durableBinding";
 // LEFT REAL, deliberately. `briefForLaunch` is the exact function `AgentPane.prepare` calls to build
@@ -1467,7 +1468,7 @@ describe("sendToBuild — epic goal laddering", () => {
         proj1: {
           beads: [
             { id: "epic-1", title: "E", description: "", status: "open", type: "epic", labels: [] },
-            { id: "task-1", title: "T", description: "", status: "open", parent: "epic-1", labels: [] },
+            { id: "task-1", title: "T", description: "do T", status: "open", parent: "epic-1", labels: [] },
           ] as never,
           board: null as never,
           loadedAt: 1,
@@ -1496,7 +1497,7 @@ describe("sendToBuild — epic goal laddering", () => {
         proj1: {
           beads: [
             { id: "epic-1", title: "E", description: "", status: "open", type: "epic", labels: [] },
-            { id: "task-1", title: "T", description: "", status: "open", parent: "epic-1", labels: [] },
+            { id: "task-1", title: "T", description: "do T", status: "open", parent: "epic-1", labels: [] },
           ] as never,
           board: null as never,
           loadedAt: 1,
@@ -1693,7 +1694,7 @@ describe("sendToBuild — epic goal laddering", () => {
         proj1: {
           beads: [
             { id: "epic-1", title: "E", description: "", status: "open", type: "epic", labels: [] },
-            { id: "task-1", title: "T", description: "", status: "open", parent: "epic-1", labels: [] },
+            { id: "task-1", title: "T", description: "do T", status: "open", parent: "epic-1", labels: [] },
           ] as never,
           board: null as never,
           loadedAt: 1,
@@ -1840,5 +1841,128 @@ describe("sendToBuild records the delegation", () => {
     // The other half: without it this passes just as well against a build with no write site at all.
     sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
     expect(rows()).toHaveLength(1);
+  });
+});
+
+// ══ A TITLE-ONLY BEAD IS NOT A SPEC (bead sparkle-fkvngc) ══════════════════════════════════════
+// A task was dispatched carrying `promoted-to-build` with an EMPTY description — title only — and
+// the agent had to reconstruct the ask from a sibling bead and the prompt. The seed points the
+// orchestrator at the bead's own description as the spec, so promoting one that has none hands it
+// nothing to build from. These drive the real gate AND the real preflight, in pairs: the same bead
+// graph with a description filled in must still promote exactly as before.
+describe("promoting a bead with an EMPTY description", () => {
+  const seedBeads = (beads: Array<Record<string, unknown>>) =>
+    useBeadsStore.setState({
+      byProject: { p1: { beads: beads as never, board: null as never, loadedAt: 1 } },
+    });
+  const epic = (description: string) => ({
+    id: "e1", title: "Make it faster", description, status: "open", type: "epic", labels: [],
+  });
+  const task = (description: string) => ({
+    id: "e1.1", title: "Speed up X", description, status: "open", parent: "e1", labels: [],
+  });
+
+  beforeEach(() => {
+    addAgentMock.mockReset();
+    appendPromptMock.mockReset();
+    setAgentEpicIdMock.mockReset();
+    labelBeadMock.mockClear();
+    addAgentMock.mockReturnValue("build-new");
+    appendPromptMock.mockReturnValue("prompt-id");
+    capacityMock.mockReturnValue({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" });
+    projects = [{ id: "p1", rootPath: "/repo", agents: [] }];
+  });
+  afterEach(() => useBeadsStore.setState({ byProject: {} }));
+
+  it("REFUSES a title-only TASK, creating nothing and stamping nothing", () => {
+    seedBeads([epic("the epic's own text"), task("   \n")]);
+    expect(() =>
+      sendToBuild({ projectId: "p1", epicId: "e1.1", prdPath: null, mode: "task" }),
+    ).toThrow(EmptySpecError);
+    expect(addAgentMock).not.toHaveBeenCalled();
+    expect(appendPromptMock).not.toHaveBeenCalled();
+    expect(labelBeadMock).not.toHaveBeenCalled();
+  });
+
+  it("…still refuses the task when a PRD is attached — the PRD is context, the bead is the ask", () => {
+    seedBeads([epic("x"), task("")]);
+    expect(() =>
+      sendToBuild({ projectId: "p1", epicId: "e1.1", prdPath: "PRD/x.md", mode: "task" }),
+    ).toThrow(EmptySpecError);
+  });
+
+  it("PAIRED: the same task WITH a description promotes normally", () => {
+    seedBeads([epic("x"), task("Cut p95 below 200ms.")]);
+    expect(sendToBuild({ projectId: "p1", epicId: "e1.1", prdPath: null, mode: "task" })).toBe(
+      "build-new",
+    );
+    expect(appendPromptMock).toHaveBeenCalled();
+  });
+
+  it("REFUSES a title-only EPIC with no PRD and no children", () => {
+    seedBeads([epic("")]);
+    expect(() => sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null })).toThrow(
+      EmptySpecError,
+    );
+    expect(addAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("PAIRED: an empty-description epic with a PRD, or with children, still promotes", () => {
+    seedBeads([epic("")]);
+    expect(sendToBuild({ projectId: "p1", epicId: "e1", prdPath: "PRD/x.md" })).toBe("build-new");
+    seedBeads([epic(""), task("Cut p95 below 200ms.")]);
+    expect(sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null })).toBe("build-new");
+  });
+
+  it("does not refuse RESUMING an orchestrator already bound — that is not a promotion", () => {
+    projects = [{ id: "p1", rootPath: "/repo", agents: [{ id: "a1", kind: "build", epicId: "e1.1" }] }];
+    seedBeads([epic("x"), task("")]);
+    expect(sendToBuild({ projectId: "p1", epicId: "e1.1", prdPath: null, mode: "task" })).toBe("a1");
+    expect(sendToBuildBlockedReason("p1", "e1.1", "task", null)).toBeNull();
+  });
+
+  it("does not refuse a bead the board snapshot has not loaded — unknown is not empty", () => {
+    useBeadsStore.setState({ byProject: {} });
+    expect(sendToBuild({ projectId: "p1", epicId: "e1.1", prdPath: null, mode: "task" })).toBe(
+      "build-new",
+    );
+  });
+
+  it("the preflight returns the SAME sentence the gate throws, so a click is refused before claimBead", () => {
+    seedBeads([epic("x"), task("")]);
+    const reason = sendToBuildBlockedReason("p1", "e1.1", "task", null);
+    let thrown = "";
+    try {
+      sendToBuild({ projectId: "p1", epicId: "e1.1", prdPath: null, mode: "task" });
+    } catch (e) {
+      thrown = (e as Error).message;
+    }
+    expect(reason).toBeTruthy();
+    expect(reason).toBe(thrown);
+    seedBeads([epic("x"), task("Cut p95 below 200ms.")]);
+    expect(sendToBuildBlockedReason("p1", "e1.1", "task", null)).toBeNull();
+  });
+
+  // COPY IS CODE — a negative with a negation lookbehind, paired with a positive (AGENTS.md). The
+  // honest sentence has to DENY that anything started, so a bare /started/ ban would red it.
+  it("tells the user what to DO, and never claims the build started", () => {
+    seedBeads([epic("x"), task("")]);
+    const task_ = sendToBuildBlockedReason("p1", "e1.1", "task", null) ?? "";
+    // POSITIVE: names the bead, says why, says the fix, and says nothing happened.
+    expect(task_).toContain("e1.1");
+    expect(task_).toMatch(/has no description/);
+    expect(task_).toMatch(/add a description/i);
+    expect(task_).toMatch(/Nothing was started/);
+    // NEGATIVE: never asserts a build is under way.
+    expect(task_).not.toMatch(/(?<!Nothing was )\b(?:started|dispatched|is building)\b/i);
+    expect(task_).not.toMatch(/plan/i);
+
+    seedBeads([epic("")]);
+    const epic_ = sendToBuildBlockedReason("p1", "e1", "epic", null) ?? "";
+    expect(epic_).toMatch(/add a description/i);
+    // An epic has two more ways out, and the message must offer them.
+    expect(epic_).toMatch(/PRD/);
+    expect(epic_).toMatch(/child task/);
+    expect(epic_).not.toMatch(/(?<!Nothing was )\b(?:started|dispatched|is building)\b/i);
   });
 });

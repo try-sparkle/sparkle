@@ -6,7 +6,7 @@
 import { useProjectStore } from "../stores/projectStore";
 import { useBeadsStore } from "../stores/beadsStore";
 import { hasEpicGoalText } from "../engine/epicGoal";
-import { parentEpicOf } from "./beads";
+import { parentEpicOf, childrenOf } from "./beads";
 import { beadReadFallback, beadsProtocol } from "./buildAgent";
 import { landInAgent } from "./landInAgent";
 import { attentionHold } from "../engine/attentionGuard";
@@ -69,6 +69,60 @@ export class MountRefusedError extends Error {
   }
 }
 
+/**
+ * Thrown when the handoff would promote a bead whose description is EMPTY — a title with no ask
+ * behind it (bead sparkle-fkvngc). A named class for the same reason {@link AtCapacityError} is one:
+ * a caller maps it to its own vocabulary rather than string-matching.
+ *
+ * REFUSE, NOT WARN. The seed prompt points the orchestrator at the bead's own description as the
+ * spec, so a title-only bead hands it nothing to build from — measured, a task shipped to build this
+ * way and the agent had to reconstruct the ask from a sibling bead. Every promote path already has a
+ * refusal channel for the capacity gate (the board's click handlers surface the message, the
+ * concierge returns a refusal), and a warning buried in a brief nobody reads before dispatch would
+ * still have spent the agent. The fix is one the human can make in seconds and nothing here can
+ * make for them: this deliberately does NOT invent a description.
+ */
+export class EmptySpecError extends Error {
+  readonly emptySpec = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "EmptySpecError";
+  }
+}
+
+/**
+ * Why promoting this bead would hand a build agent nothing to build from, or null.
+ *
+ * WHEN THE BEAD IS THE SPEC. A task's description IS its ask — a PRD beside it is only "surrounding
+ * context" in the task seed — so an empty one refuses whatever else is attached. An epic has two
+ * other specs the seed can point at: a PRD (the seed reads it INSTEAD of the description), and child
+ * tasks (the orchestrator's job is to execute them). An empty-description epic with either is a
+ * real plan and is left alone.
+ *
+ * UNKNOWN IS NOT EMPTY. Reads the board snapshot the app already polls — the same read
+ * {@link epicGoalLadder} makes, for the same click-path reason — and a bead the snapshot does not
+ * hold is let through rather than refused on no evidence.
+ */
+function emptySpecReason(
+  projectId: string,
+  beadId: string,
+  mode: SendToBuildArgs["mode"],
+  prdPath: string | null,
+): string | null {
+  const beads = useBeadsStore.getState().byProject[projectId]?.beads ?? [];
+  const bead = beads.find((b) => b.id === beadId);
+  if (!bead || (bead.description ?? "").trim() !== "") return null;
+  if (mode === "task") {
+    return `Task ${beadId} has no description — only a title — so a build agent would have`
+      + ` nothing to build from. Add a description saying what to change and how to tell it is`
+      + ` done, then Build it again. Nothing was started.`;
+  }
+  if (prdPath !== null || childrenOf(beads, beadId).length > 0) return null;
+  return `Epic ${beadId} has no description, no PRD and no child tasks — only a title — so a build`
+    + ` agent would have nothing to build from. Add a description saying what the epic should`
+    + ` deliver, attach a PRD, or break it into child tasks, then Start it again. Nothing was started.`;
+}
+
 // `agentRowPresent` USED TO LIVE HERE, and its removal is the point rather than tidying. It re-read
 // the store to ask whether a `Project.agents` row named the id — a question `prepareHandoff` has
 // just answered by either finding that row or calling `addAgent` to insert one. So it could only
@@ -109,11 +163,14 @@ export function sendToBuildBlockedReason(
   projectId: string,
   epicId: string,
   mode: SendToBuildArgs["mode"] = "epic",
+  prdPath: string | null = null,
 ): string | null {
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
   if (!project) return null; // not our error to report; sendToBuild throws its own for this
   const existing = project.agents.find((a) => a.kind === "build" && a.epicId === epicId);
-  if (existing) return null; // resuming a bound orchestrator consumes no slot
+  if (existing) return null; // resuming a bound orchestrator consumes no slot, and promotes nothing
+  const empty = emptySpecReason(projectId, epicId, mode, prdPath);
+  if (empty) return empty;
   const capacity = localAgentCapacity();
   return capacity.atCapacity ? atCapacitySentence(capacity, capacityLead(mode)) : null;
 }
@@ -383,6 +440,12 @@ function prepareHandoff(args: SendToBuildArgs): PreparedHandoff {
   // typed `at-capacity` refusal, and the board's click handlers surface it the way they surface any
   // other handoff failure. Returning null would have been silently ignored by the click paths.
   if (!existing) {
+    // A TITLE-ONLY BEAD IS NOT A SPEC (bead sparkle-fkvngc) — see `EmptySpecError`. Checked before
+    // capacity so a user who frees a slot is not then refused for a second, unrelated reason, and
+    // only for a NEW orchestrator: resuming one already bound is not a promotion, and refusing it
+    // would strand work that was already handed over.
+    const empty = emptySpecReason(args.projectId, args.epicId, args.mode, args.prdPath);
+    if (empty) throw new EmptySpecError(empty);
     const capacity = localAgentCapacity();
     if (capacity.atCapacity) {
       throw new AtCapacityError(atCapacitySentence(capacity, capacityLead(args.mode)));

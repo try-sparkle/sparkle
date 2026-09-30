@@ -1017,7 +1017,134 @@ fn create_bead_full_inner(
     let args = build_create_bead_args(title, body, issue_type, priority, parent, deps, labels);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_bd_env(project_path, &arg_refs, env)?;
-    select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
+    let raw = select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())?;
+    if let Some(id) = created_id_to_verify(&raw, issue_type, priority) {
+        verify_created_bead(&id, issue_type, priority, &mut |a: &[&str]| {
+            run_bd_env(project_path, a, env)
+        })?;
+    }
+    Ok(raw)
+}
+
+/// The id of a FRESHLY created bead worth reading back, or `None` when there is nothing to check.
+///
+/// Only a create that asked for something bd could silently drop is verified: an explicit priority,
+/// or a type other than bd's own default `task`. That keeps the extra `bd show` off the hot
+/// task-minting paths (`buildAgentSpawn`, `createChildTasks`), which ask for neither. A caught bd
+/// error (`{"error":…}`) or a payload with no id is left for the caller to report as it always has.
+fn created_id_to_verify(raw: &str, issue_type: &str, priority: &str) -> Option<String> {
+    let asks_type = !issue_type.trim().is_empty() && issue_type.trim() != "task";
+    if !asks_type && priority.trim().is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let row = if v.is_array() { v.get(0)?.clone() } else { v };
+    if row.get("error").is_some() {
+        return None;
+    }
+    row.get("id").and_then(|i| i.as_str()).map(str::to_string)
+}
+
+/// Parse a requested priority the way bd accepts it (`1` or `P1`) into its number.
+fn wanted_priority(priority: &str) -> Option<i64> {
+    let p = priority.trim();
+    let p = p.strip_prefix('P').or_else(|| p.strip_prefix('p')).unwrap_or(p);
+    p.parse::<i64>().ok()
+}
+
+/// Compare a `bd show <id> --json` payload against what the create asked for. Returns one line per
+/// field that differs; empty means the stored record matches. `Err` when the payload is not a
+/// readable bead row — an unreadable answer is never taken as a match.
+fn created_bead_drift(shown: &str, issue_type: &str, priority: &str) -> Result<Vec<String>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(shown.trim()).map_err(|e| format!("bd show was not JSON: {e}"))?;
+    let row = if v.is_array() { v.get(0).cloned().unwrap_or(serde_json::Value::Null) } else { v };
+    if !row.is_object() {
+        return Err("bd show returned no bead row".into());
+    }
+    let mut drift = Vec::new();
+    let want_type = if issue_type.trim().is_empty() { "task" } else { issue_type.trim() };
+    let got_type = row.get("issue_type").or_else(|| row.get("type")).and_then(|t| t.as_str());
+    if got_type != Some(want_type) {
+        drift.push(format!("type: asked {want_type}, stored {}", got_type.unwrap_or("<none>")));
+    }
+    if let Some(want_p) = wanted_priority(priority) {
+        let got_p = row.get("priority").and_then(|p| p.as_i64());
+        if got_p != Some(want_p) {
+            let got = got_p.map_or("<none>".to_string(), |p| format!("P{p}"));
+            drift.push(format!("priority: asked P{want_p}, stored {got}"));
+        }
+    }
+    Ok(drift)
+}
+
+/// READ THE NEW BEAD BACK ONCE, AND NEVER REPORT SUCCESS ON A SILENTLY WRONG RECORD
+/// (`sparkle-1abg72`).
+///
+/// An epic created at P1 persisted as a P2 `task`, so it never appeared in the Epics column — the
+/// one surface it was created for — and nothing errored at create time. So after the create: show
+/// the bead; if its type or priority differs from what was asked, correct it with one `bd update`
+/// and show it again. If it STILL differs, this is an `Err` that names the bead id and says it
+/// exists, so the caller neither reports success nor re-creates it.
+///
+/// An UNREADABLE read-back (a busy single-writer store is routine here) is logged and passed: the
+/// create itself succeeded, and failing it would push callers into a retry that files a duplicate,
+/// which is worse than an unverified row. Only a CONFIRMED mismatch fails the call.
+///
+/// `run` is the bd runner — `run_bd_env` in production, a scripted fake in the tests — so the
+/// correction path is testable without a bd that misbehaves on demand.
+fn verify_created_bead(
+    id: &str,
+    issue_type: &str,
+    priority: &str,
+    run: &mut dyn FnMut(&[&str]) -> Result<BdOutput, String>,
+) -> Result<(), String> {
+    let show = |run: &mut dyn FnMut(&[&str]) -> Result<BdOutput, String>| {
+        let out = run(&["show", id, "--json"])?;
+        let raw = select_bd_raw(out.success, out.stdout.trim(), out.stderr.trim())?;
+        created_bead_drift(&raw, issue_type, priority)
+    };
+    let drift = match show(run) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("bead {id}: created but read-back could not be read ({e}); unverified");
+            return Ok(());
+        }
+    };
+    if drift.is_empty() {
+        return Ok(());
+    }
+    let want_type = if issue_type.trim().is_empty() { "task" } else { issue_type.trim() };
+    let mut args: Vec<String> = vec!["update".into(), id.into(), "-t".into(), want_type.into()];
+    if let Some(p) = wanted_priority(priority) {
+        args.push("-p".into());
+        args.push(p.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let fixed = run(&refs).and_then(|o| {
+        if o.success {
+            Ok(())
+        } else {
+            Err(if o.stderr.trim().is_empty() { o.stdout } else { o.stderr })
+        }
+    });
+    let after = fixed.and_then(|()| show(run));
+    match after {
+        Ok(d) if d.is_empty() => {
+            tracing::warn!("bead {id}: read back wrong ({}); corrected", drift.join("; "));
+            Ok(())
+        }
+        Ok(d) => Err(format!(
+            "bead {id} WAS created but reads back wrong ({}) and a correcting `bd update` did not \
+             fix it. Do not create it again — fix it with `bd update {id}`.",
+            d.join("; ")
+        )),
+        Err(e) => Err(format!(
+            "bead {id} WAS created but reads back wrong ({}) and could not be corrected: {e}. Do \
+             not create it again — fix it with `bd update {id}`.",
+            drift.join("; ")
+        )),
+    }
 }
 
 /// Add a dependency: `bd dep add <blocked> <blocker>` — `blocked_id` depends on (is blocked by)
@@ -1740,6 +1867,95 @@ mod tests {
         );
     }
 
+    // ── sparkle-1abg72: the create read-back ─────────────────────────────────────────────────
+
+    fn bd_ok(stdout: &str) -> BdOutput {
+        BdOutput { status: Some(0), success: true, stdout: stdout.into(), stderr: String::new() }
+    }
+
+    /// A scripted bd: answers each call from `replies` in order and records every argv it saw.
+    fn scripted(
+        replies: Vec<BdOutput>,
+    ) -> (std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>, impl FnMut(&[&str]) -> Result<BdOutput, String>) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let mut replies = replies.into_iter();
+        let run = move |a: &[&str]| {
+            log.borrow_mut().push(a.iter().map(|s| s.to_string()).collect());
+            replies.next().ok_or_else(|| "scripted bd ran out of replies".to_string())
+        };
+        (seen, run)
+    }
+
+    const EPIC_P1: &str = r#"[{"id":"sp-1","issue_type":"epic","priority":1}]"#;
+    const TASK_P2: &str = r#"[{"id":"sp-1","issue_type":"task","priority":2}]"#;
+
+    #[test]
+    fn created_bead_drift_names_the_exact_incident() {
+        let d = created_bead_drift(TASK_P2, "epic", "1").unwrap();
+        assert_eq!(d, vec!["type: asked epic, stored task", "priority: asked P1, stored P2"]);
+        assert!(created_bead_drift(EPIC_P1, "epic", "1").unwrap().is_empty());
+        assert!(created_bead_drift(EPIC_P1, "epic", "P1").unwrap().is_empty(), "bd's P1 spelling");
+        // No priority asked → priority is not judged; P0 is a real value, not "absent".
+        assert!(created_bead_drift(TASK_P2, "task", "").unwrap().is_empty());
+        assert_eq!(created_bead_drift(TASK_P2, "task", "0").unwrap().len(), 1);
+        // An unreadable answer is never a match.
+        assert!(created_bead_drift("not json", "epic", "1").is_err());
+        assert!(created_bead_drift("[]", "epic", "1").is_err());
+    }
+
+    #[test]
+    fn only_a_create_that_asked_for_something_is_read_back() {
+        let row = r#"{"id":"sp-9","title":"t"}"#;
+        assert_eq!(created_id_to_verify(row, "epic", "").as_deref(), Some("sp-9"));
+        assert_eq!(created_id_to_verify(row, "task", "1").as_deref(), Some("sp-9"));
+        assert_eq!(created_id_to_verify(row, "task", ""), None, "plain task creates stay one call");
+        assert_eq!(created_id_to_verify(row, "", " "), None);
+        assert_eq!(created_id_to_verify(r#"{"error":"boom"}"#, "epic", "1"), None);
+    }
+
+    #[test]
+    fn a_wrong_read_back_is_corrected_with_one_update_and_re_checked() {
+        let (seen, mut run) = scripted(vec![bd_ok(TASK_P2), bd_ok("{}"), bd_ok(EPIC_P1)]);
+        verify_created_bead("sp-1", "epic", "1", &mut run).expect("corrected");
+        let seen = seen.borrow();
+        assert_eq!(seen[0], vec!["show", "sp-1", "--json"]);
+        assert_eq!(seen[1], vec!["update", "sp-1", "-t", "epic", "-p", "1"]);
+        assert_eq!(seen[2], vec!["show", "sp-1", "--json"]);
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn a_correct_read_back_writes_nothing() {
+        let (seen, mut run) = scripted(vec![bd_ok(EPIC_P1)]);
+        verify_created_bead("sp-1", "epic", "1", &mut run).expect("matches");
+        assert_eq!(seen.borrow().len(), 1, "no update when the record is right");
+    }
+
+    #[test]
+    fn a_mismatch_that_survives_the_update_is_an_error_naming_the_bead() {
+        let (_seen, mut run) = scripted(vec![bd_ok(TASK_P2), bd_ok("{}"), bd_ok(TASK_P2)]);
+        let err = verify_created_bead("sp-1", "epic", "1", &mut run).unwrap_err();
+        assert!(err.contains("sp-1") && err.contains("WAS created"), "{err}");
+        assert!(err.contains("asked epic, stored task"), "{err}");
+        let failed_update = BdOutput {
+            status: Some(1),
+            success: false,
+            stdout: String::new(),
+            stderr: "locked".into(),
+        };
+        let (_seen, mut run) = scripted(vec![bd_ok(TASK_P2), failed_update]);
+        let err = verify_created_bead("sp-1", "epic", "1", &mut run).unwrap_err();
+        assert!(err.contains("locked") && err.contains("Do not create it again"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_read_back_does_not_fail_a_create_that_succeeded() {
+        let (seen, mut run) = scripted(vec![bd_ok("")]);
+        verify_created_bead("sp-1", "epic", "1", &mut run).expect("unverified, not failed");
+        assert_eq!(seen.borrow().len(), 1, "no blind update on an unread record");
+    }
+
     #[test]
     fn build_create_bead_args_skips_omitted_optionals() {
         // Only labels provided: parent/deps flags are absent, `-l docs` still appended.
@@ -2199,6 +2415,7 @@ mod tests {
             kind: BeadsErrorKind::Timeout,
             message: "bd did not finish within 30s and was terminated".to_string(),
             exit_code: None,
+            never_spawned: false,
         };
         let msg = describe_bd_failure(&timed_out, true);
         assert!(msg.contains("30s") && msg.contains("terminated"), "must name the bound: {msg}");
@@ -2219,6 +2436,7 @@ mod tests {
             kind: BeadsErrorKind::BdFailed,
             message: "issue not found: sparkle-nope".to_string(),
             exit_code: Some(1),
+            never_spawned: false,
         };
         let msg = describe_bd_failure(&failed, true);
         assert_eq!(msg, "issue not found: sparkle-nope");
@@ -2238,6 +2456,7 @@ mod tests {
             kind: BeadsErrorKind::Timeout,
             message: "bd did not finish within 30s and was terminated".to_string(),
             exit_code: None,
+            never_spawned: false,
         };
         let msg = describe_bd_failure(&timed_out, false);
         assert!(msg.contains("retrying is safe"), "a read must be told to retry: {msg}");
@@ -2307,6 +2526,7 @@ mod tests {
             kind: BeadsErrorKind::Timeout,
             message: "bd exited but its output pipe stayed open".to_string(),
             exit_code: Some(0),
+            never_spawned: false,
         };
         let msg = describe_bd_failure(&drained, true);
         assert!(msg.contains("most likely LANDED"), "must not overstate the doubt: {msg}");
@@ -2333,6 +2553,7 @@ mod tests {
             kind: BeadsErrorKind::Timeout,
             message: "bd exited but its output pipe stayed open".to_string(),
             exit_code: Some(1),
+            never_spawned: false,
         };
         let msg = describe_bd_failure(&failed_drain, true);
         assert!(msg.contains("did NOT"), "a failing exit must not claim the write landed: {msg}");
@@ -2354,6 +2575,7 @@ mod tests {
             kind: BeadsErrorKind::Timeout,
             message: "bd exited but its output pipe stayed open".to_string(),
             exit_code: None,
+            never_spawned: false,
         };
         let msg = describe_bd_failure(&signalled, true);
         assert!(msg.contains("UNKNOWN"), "an unreadable outcome must be called unknown: {msg}");
@@ -2928,6 +3150,34 @@ mod tests {
         assert_ne!(ids[0], ids[1], "two decomposition siblings collapsed onto one bead");
         assert!(!ids.contains(&epic_id), "a child was folded onto its own epic");
         assert_eq!(bead_ids(&ws, &bd).len(), 3, "every child must be filed in its own right");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_epic_created_at_p1_reads_back_as_an_epic_at_p1() {
+        let Some(ws) = crate::beads_cmd::tests::TempWorkspace::new("notes-epic-p1") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let Some(bd) = cached_bd_path() else { return };
+        let path = ws.dir.to_string_lossy().to_string();
+        let row = create_bead_full_inner(
+            &path,
+            "An epic the Epics column must show at the priority it was filed at",
+            "",
+            "epic",
+            "1",
+            "",
+            "",
+            "think-build-loop",
+            beads_cmd::NO_EXTRA_ENV,
+        )
+        .expect("epic create ran");
+        let id = crate::bead_dup::tests::id_of(&row);
+        let shown = ws.bd(&bd, &["show", &id, "--json"]).expect("bd show");
+        let drift = created_bead_drift(&String::from_utf8_lossy(&shown.stdout), "epic", "1")
+            .expect("readable");
+        assert!(drift.is_empty(), "epic persisted wrong: {drift:?}");
     }
 
     #[cfg(unix)]

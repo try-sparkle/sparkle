@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 // pipelineHealthEscalation — the EDGE is the whole feature. These tests assert the SIDE EFFECTS
 // (which channel was called, with what text), never merely that a handler exists, and they drive the
 // real detector so a mutation to the gate or the routing reds one of them.
@@ -595,6 +596,47 @@ describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is 
     // …and with the dedupe labels the hourly scan folds onto, so the fix did not disturb them.
     expect(args.labels).toContain("phc-roborev");
     expect(args.labels).toContain("pipeline-health");
+  });
+});
+
+describe("liveEscalationDeps.fileDurableBead — sends EVERY argument create_bead_full requires (roborev 83515)", () => {
+  // Tauri rejects a command call missing ANY non-Option argument before the command body runs, so a
+  // payload that omits one files nothing at all — and every injected-deps case above is blind to it.
+  // The required keys are read from the Rust signature itself, so the next argument added there
+  // reds this test instead of silently breaking the real-time escalation path.
+  const rustRequiredKeys = (): string[] => {
+    const src = readFileSync(new URL("../../src-tauri/src/notes.rs", import.meta.url), "utf8");
+    const m = /pub async fn create_bead_full\(([\s\S]*?)\)\s*->/.exec(src);
+    const sig = m?.[1];
+    if (!sig) throw new Error("create_bead_full signature not found in notes.rs — update this test");
+    return sig
+      .split(",")
+      .map((p) => p.trim())
+      .filter((p) => p && !/:\s*Option</.test(p))
+      .map((p) => (p.split(":")[0] ?? "").trim().replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()));
+  };
+
+  it("the payload carries every required key, and a blocking event is filed at P1", async () => {
+    const required = rustRequiredKeys();
+    expect(required, "signature parse is anchored on real arguments").toContain("priority");
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    invokeImpl = async (cmd: unknown, args: unknown) => {
+      calls.push([cmd as string, args as Record<string, unknown>]);
+      return `{"id":"sparkle-abc12"}`;
+    };
+    const deps: EscalationDeps = {
+      ...liveEscalationDeps("/tmp/project"),
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+    };
+    await escalateBlocking(snap("healthy"), snap("blocking", "wedged"), deps);
+
+    const create = calls.find(([cmd]) => cmd === "create_bead_full");
+    expect(create, "create_bead_full was invoked").toBeDefined();
+    const args = create![1];
+    for (const key of required) expect(args, `missing required arg ${key}`).toHaveProperty(key);
+    expect(args.priority).toBe("1");
   });
 });
 

@@ -308,19 +308,40 @@ describe("decideEpicSweep — asking for a plan for an epic that has none", () =
 // bead sparkle-5wjy5a: "no child moved in N hours" also describes an epic whose remaining children
 // were fixed by PRs that already merged. The sweep restarted exactly that epic and spent its budget.
 describe("decideEpicSweep — the remaining work appears to have landed", () => {
-  it("ESCALATES instead of restarting an epic whose every open child is named by a landed commit", () => {
+  it("routes an epic whose every open child is named by a landed commit to READY-TO-CLOSE, not Blocked", () => {
     // Not a skip (roborev 83233): a trailer can name a partial increment, and a Refs:-only child is
-    // never closed by anything, so a silent skip would hide a stalled epic forever.
+    // never closed by anything, so a silent skip would hide the epic forever. And not `escalate`
+    // either: that writes the `stalled` mark the board routes to BLOCKED, and this epic is not
+    // blocked — it is finished-pending-a-human-close.
     expect(act()).toBe("restart"); // paired: the same epic restarts without the reading
-    expect(act({ openChildrenLanded: true })).toBe("escalate");
+    expect(act({ openChildrenLanded: true })).toBe("ready-to-close");
+    expect(act({ openChildrenLanded: true })).not.toBe("escalate");
   });
 
-  it("never goes silent on it — an already-spent restart still escalates", () => {
-    expect(act({ lastSweepRestartAt: STALE + 1, openChildrenLanded: true })).toBe("escalate");
+  it("never goes silent on it — an already-spent restart still reads ready-to-close, not Blocked", () => {
+    expect(act({ lastSweepRestartAt: STALE + 1, openChildrenLanded: true })).toBe("ready-to-close");
+    // paired: the same spent budget WITHOUT the reading is a genuine escalation
+    expect(act({ lastSweepRestartAt: STALE + 1 })).toBe("escalate");
   });
 
   it("stays terminal once escalated — waits for the human instead of re-marking", () => {
     expect(why({ alreadyEscalated: true, openChildrenLanded: true })).toBe("already-escalated");
+  });
+
+  it("is terminal once flagged — a flagged epic is skipped, never re-flagged or restarted", () => {
+    expect(why({ awaitingClose: true })).toBe("awaiting-close");
+    expect(why({ awaitingClose: true, openChildrenLanded: true })).toBe("awaiting-close");
+    // paired: without the flag the same stalled epic restarts
+    expect(act({ awaitingClose: false })).toBe("restart");
+  });
+
+  it("retracts the ready-to-close flag once the epic moves again or finishes", () => {
+    expect(act({ awaitingClose: true, lastChildProgressAt: FRESH })).toBe("clear");
+    expect(act({ awaitingClose: true, status: "done" })).toBe("clear");
+    expect(act({ awaitingClose: true, orchestratorAlive: true })).toBe("clear");
+    // paired: nothing to retract ⇒ plain skips
+    expect(why({ lastChildProgressAt: FRESH })).toBe("too-soon");
+    expect(why({ status: "done" })).toBe("already-done");
   });
 
   it("PAIRED — a partial landing, no reading, or an unreadable one leaves the restart exactly as it was", () => {

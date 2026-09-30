@@ -4,6 +4,7 @@ import {
   generateTasks,
   decomposeEpic,
   parsePrdRef,
+  DEFAULT_EPIC_PRIORITY,
   TASK_PLAN_SYSTEM,
   EPIC_PLAN_SYSTEM,
   type GenerateDeps,
@@ -103,6 +104,8 @@ describe("generateTasks", () => {
       "",
       "",
       "think-build-loop",
+      // sparkle-1abg72: the epic's priority is SENT, never left to bd's default.
+      DEFAULT_EPIC_PRIORITY,
     );
     // each child parented to the epic.
     expect(createBeadFull).toHaveBeenNthCalledWith(2, "/repo", "T0", "first", "task", "sparkle-ep", "", "");
@@ -256,6 +259,30 @@ function makeMultiEpicDeps(plan: EpicPlan, over: Partial<GenerateDeps> = {}) {
   return { deps, structuredJson, createBeadFull, beadDepAdd, writePrd };
 }
 
+describe("generateTasks — epic priority (sparkle-1abg72)", () => {
+  // An epic created at P1 persisted at bd's default P2 because NO caller ever passed a priority to
+  // create_bead_full. These pin that the value reaches the create call — the seventh positional
+  // argument is labels, the eighth is priority.
+  it("sends the caller's epicPriority on every epic create, and none on child tasks", async () => {
+    const { deps, createBeadFull } = makeDeps();
+    await generateTasks(deps, { ...args, epicPriority: "1" });
+    const epicCalls = createBeadFull.mock.calls.filter((c) => c[3] === "epic");
+    expect(epicCalls.length).toBeGreaterThan(0);
+    for (const c of epicCalls) expect(c[7]).toBe("1");
+    for (const c of createBeadFull.mock.calls.filter((c) => c[3] === "task")) {
+      expect(c[7] ?? "").toBe("");
+    }
+  });
+
+  it("sends an EXPLICIT default when the caller names none, so the read-back has a value to check", async () => {
+    const { deps, createBeadFull } = makeDeps();
+    await generateTasks(deps, args);
+    const epicCall = createBeadFull.mock.calls.find((c) => c[3] === "epic")!;
+    expect(epicCall[7]).toBe(DEFAULT_EPIC_PRIORITY);
+    expect(DEFAULT_EPIC_PRIORITY).toMatch(/^[0-4]$/);
+  });
+});
+
 describe("generateTasks (multi-epic EpicPlan)", () => {
   const twoEpicPlan: EpicPlan = {
     epics: [
@@ -297,13 +324,13 @@ describe("generateTasks (multi-epic EpicPlan)", () => {
     // Two epic beads, each with the SAME PRD back-link; children parented to their own epic.
     expect(createBeadFull).toHaveBeenNthCalledWith(
       1, "/repo", "Epic One", expect.stringContaining("PRD file: PRD/2026-06-27-foo.md"),
-      "epic", "", "", "think-build-loop",
+      "epic", "", "", "think-build-loop", DEFAULT_EPIC_PRIORITY,
     );
     expect(createBeadFull).toHaveBeenNthCalledWith(2, "/repo", "A0", "a0", "task", "ep-1", "", "");
     expect(createBeadFull).toHaveBeenNthCalledWith(3, "/repo", "A1", "a1", "task", "ep-1", "", "");
     expect(createBeadFull).toHaveBeenNthCalledWith(
       4, "/repo", "Epic Two", expect.stringContaining("PRD file: PRD/2026-06-27-foo.md"),
-      "epic", "", "", "think-build-loop",
+      "epic", "", "", "think-build-loop", DEFAULT_EPIC_PRIORITY,
     );
     expect(createBeadFull).toHaveBeenNthCalledWith(5, "/repo", "B0", "b0", "task", "ep-2", "", "");
 
