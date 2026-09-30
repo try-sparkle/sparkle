@@ -13,6 +13,7 @@ vi.mock("./beads", () => ({
   markBeadDelivered: vi.fn(),
   recordBeadMergeSha: vi.fn(),
   deleteBead: vi.fn(),
+  unclaimBead: vi.fn(),
 }));
 vi.mock("./worktree", () => ({ removeAgentWorkspace: vi.fn() }));
 
@@ -32,6 +33,7 @@ beforeEach(() => {
   vi.mocked(beads.markBeadDelivered).mockResolvedValue(undefined);
   vi.mocked(beads.recordBeadMergeSha).mockResolvedValue(undefined);
   vi.mocked(beads.deleteBead).mockResolvedValue(undefined);
+  vi.mocked(beads.unclaimBead).mockResolvedValue(undefined);
   vi.mocked(worktree.removeAgentWorkspace).mockResolvedValue(undefined);
 });
 
@@ -236,18 +238,36 @@ describe("spinDownAgentGit (close a shipped build agent)", () => {
     expect(beads.deleteBead).not.toHaveBeenCalled(); // close is reversible; delete is not
   });
 
-  // An UNMERGED branch still closes its bead. The agent is gone either way, so nothing can ever
-  // advance the bead again — leaving it open is not "preserving work", it is the orphan bug.
-  it("closes the bead even when the branch was kept (not merged)", async () => {
+  // THIS TEST USED TO PIN THE DEFECT (bead sparkle-aoqzzo): "closes the bead even when the branch was
+  // kept (not merged)". Closing unlanded work makes a teardown read as a fix. The orphan it guarded
+  // against is now handled by RELEASING the bead to `open`, so the assertion is on both writes.
+  it("RELEASES an unlanded bead to open and never closes it", async () => {
     vi.mocked(branch.deleteAgentBranchIfMerged).mockResolvedValue("kept-not-merged");
     await spinDownAgentGit({
       root: "/r",
       projectId: "p1",
-      ids: ["parent"],
-      beadIds: ["bd-parent"],
+      ids: ["parent", "w1", "w2"],
+      beadIds: ["bd-landed"],
+      releaseBeadIds: ["bd-unlanded"],
       deleteBranch: true,
     });
-    expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-parent");
+    expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-landed");
+    expect(beads.closeBead).not.toHaveBeenCalledWith("/r", "bd-unlanded");
+    expect(beads.unclaimBead).toHaveBeenCalledWith("/r", "bd-unlanded");
+    expect(beads.unclaimBead).not.toHaveBeenCalledWith("/r", "bd-landed");
+  });
+
+  it("never releases (reopens) a bead it was also told to close", async () => {
+    await spinDownAgentGit({
+      root: "/r",
+      projectId: "p1",
+      ids: ["parent"],
+      beadIds: ["bd-x"],
+      releaseBeadIds: ["bd-x"],
+      deleteBranch: false,
+    });
+    expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-x");
+    expect(beads.unclaimBead).not.toHaveBeenCalled();
   });
 
   it("is best-effort: a bead close failure never breaks the git teardown", async () => {

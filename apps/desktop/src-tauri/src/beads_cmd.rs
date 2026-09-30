@@ -2764,6 +2764,117 @@ pub(crate) mod tests {
         }
     }
 
+    /// `bd comment --help`, captured VERBATIM from the installed bd (1.2.2). Beads sparkle-suip4q /
+    /// sparkle-kq5v0k: a comment writer passed its text as `-m`, a flag bd does not define, and
+    /// failed at runtime with `unknown shorthand flag` while an argv-shape test stayed green — an
+    /// argv assertion only restates the author's belief about the CLI. These tests judge the argv
+    /// against bd's own published surface instead. Re-capture the fixture when bd is upgraded.
+    const BD_COMMENT_HELP: &str = include_str!("testdata/bd-comment-help.txt");
+
+    /// Every flag spelling (`-h`, `--help`, `--file`, …) the help text declares, local and global.
+    fn help_flags(help: &str) -> std::collections::HashSet<String> {
+        let mut flags = std::collections::HashSet::new();
+        for line in help.lines() {
+            let line = line.trim_start();
+            if !line.starts_with('-') {
+                continue;
+            }
+            for tok in line.split_whitespace() {
+                let tok = tok.trim_end_matches(',');
+                if !tok.starts_with('-') {
+                    break;
+                }
+                flags.insert(tok.to_string());
+            }
+        }
+        flags
+    }
+
+    /// Does `argv` (without the program name) parse under `bd comment`'s published surface, AND
+    /// carry the comment text as a positional? `Err` names the first violation.
+    fn conforms_to_comment_help(argv: &[String], help: &str) -> Result<(), String> {
+        if !help.contains("bd comment <id> [text...]") {
+            return Err("fixture no longer documents `bd comment <id> [text...]`".into());
+        }
+        if argv.first().map(String::as_str) != Some("comment") {
+            return Err(format!("argv[0] is not `comment`: {argv:?}"));
+        }
+        let flags = help_flags(help);
+        let mut positionals = 0;
+        let mut terminated = false;
+        for tok in &argv[1..] {
+            if terminated {
+                positionals += 1;
+            } else if tok == "--" {
+                terminated = true;
+            } else if tok.len() > 1 && tok.starts_with('-') {
+                let name = tok.split('=').next().unwrap_or(tok);
+                if !flags.contains(name) {
+                    return Err(format!("`{name}` is not a flag `bd comment` accepts"));
+                }
+                return Err(format!("`{name}` is a flag; the text must be passed positionally"));
+            } else {
+                positionals += 1;
+            }
+        }
+        if positionals < 2 {
+            return Err(format!("expected `<id> <text>` positionals, got {positionals} in {argv:?}"));
+        }
+        Ok(())
+    }
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn bd_comment_argv_fixture_is_a_real_help_capture() {
+        let flags = help_flags(BD_COMMENT_HELP);
+        // Anchors that only a genuine `bd comment --help` carries — so a truncated or wrong fixture
+        // cannot make every argv "conform" by declaring nothing.
+        assert!(BD_COMMENT_HELP.contains("Usage:"), "fixture lost its Usage block");
+        for f in ["--stdin", "--file", "-h", "--help"] {
+            assert!(flags.contains(f), "fixture should declare {f}; parsed {flags:?}");
+        }
+        assert!(!flags.contains("-m"), "bd comment defines no -m; the fixture says otherwise");
+    }
+
+    #[test]
+    fn bd_comment_argv_builder_conforms_to_the_installed_cli() {
+        for text in ["plain note", "- a bullet", "-m looks like a flag", "--json"] {
+            let a = build_comment_args("sparkle-4562", text);
+            conforms_to_comment_help(&a, BD_COMMENT_HELP)
+                .unwrap_or_else(|e| panic!("build_comment_args({text:?}) = {a:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn bd_comment_argv_old_flag_forms_are_rejected() {
+        // The sparkle-s8n643 / sparkle-suip4q shape. If this passes the validator, the test above
+        // is vacuous — it would accept the very argv that failed in production.
+        for bad in [
+            argv(&["comment", "sparkle-4562", "-m", "note"]),
+            argv(&["comment", "sparkle-4562", "--message", "note"]),
+            argv(&["comment", "sparkle-4562", "--file", "note"]),
+            argv(&["comment", "sparkle-4562"]),
+        ] {
+            assert!(
+                conforms_to_comment_help(&bad, BD_COMMENT_HELP).is_err(),
+                "{bad:?} must be rejected against the captured help"
+            );
+        }
+    }
+
+    #[test]
+    fn bd_comment_argv_notes_inline_form_conforms() {
+        // `notes.rs::bead_comment_inner` still spells its own `["comment", id, "--", text]` rather
+        // than calling `build_comment_args` (it could not be routed in the change that added these
+        // tests — the file was in flight elsewhere). Pin that second live shape against the same
+        // fixture so it cannot drift to a flag form unnoticed until it is folded in.
+        conforms_to_comment_help(&argv(&["comment", "sparkle-4562", "--", "- a note"]), BD_COMMENT_HELP)
+            .expect("notes.rs comment argv conforms");
+    }
+
     #[test]
     fn close_args_pass_the_reason_as_a_flag_value_and_omit_a_blank_one() {
         assert_eq!(build_close_args("b-1", "done"), vec!["close", "b-1", "--reason", "done"]);

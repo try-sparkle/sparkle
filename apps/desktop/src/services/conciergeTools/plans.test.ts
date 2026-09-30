@@ -158,31 +158,41 @@ describe("list_plans", () => {
   // of them invisible here while their children rendered as loose tasks. Asserting the SIDE EFFECT
   // — the plan is listed, with its children counted and its status rolled up — not merely that some
   // predicate returns true.
-  it("lists a parent bead that is NOT typed 'epic' as a plan, with its children", async () => {
+  // sparkle-8clekz: a parent edge means plan membership OR follow-up-of, so only a DECLARED epic is a
+  // plan. The untyped parents sit in the same store as a typed one, so an empty answer cannot pass.
+  it("lists a typed epic with its children, and NOT a parent that is merely typed feature/bug", async () => {
     const projectId = seedProject();
     listBeads.mockResolvedValue([
-      bead("f1", { type: "feature" }), // a de-facto epic: never typed 'epic', but things point at it
-      child("f1c1", "f1", { status: "closed" }),
-      child("f1c2", "f1", { status: "in_progress" }),
-      bead("b1", { type: "bug" }), // a bug that is also a parent
+      bead("e1", { type: "epic" }),
+      child("e1c1", "e1", { status: "closed" }),
+      child("e1c2", "e1", { status: "in_progress" }),
+      bead("f1", { type: "feature" }), // has children, never declared a plan
+      child("f1c1", "f1"),
+      bead("b1", { type: "bug", status: "closed" }), // a closed bug with a follow-up child
       child("b1c1", "b1"),
-      bead("solo", { type: "task" }), // parentless and childless — NOT a plan, and that is normal
+      bead("solo", { type: "task" }),
     ]);
 
     const r = await listPlans(ROOT, projectId);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.data.map((p) => p.id).sort()).toEqual(["b1", "f1"]);
-    const f1 = r.data.find((p) => p.id === "f1");
-    expect(f1?.childCount).toBe(2);
+    expect(r.data.map((p) => p.id)).toEqual(["e1"]);
+    const e1 = r.data.find((p) => p.id === "e1");
+    expect(e1?.childCount).toBe(2);
     // Rolled up by the REAL planView.epicStatus — a mix of closed and in_progress is in_progress.
-    expect(f1?.status).toBe("in_progress");
+    expect(e1?.status).toBe("in_progress");
   });
 
-  // The dotted id is bd's display form of the same edge, so it must confer plan-hood identically.
-  it("lists a parent whose children carry only dotted ids", async () => {
+  // The dotted id is bd's display form of the same edge: it counts children, not plan-hood.
+  it("counts dotted-id children under a typed epic, and does not list an untyped dotted parent", async () => {
     const projectId = seedProject();
-    listBeads.mockResolvedValue([bead("d1", { type: "chore" }), bead("d1.1"), bead("d1.2")]);
+    listBeads.mockResolvedValue([
+      bead("d1", { type: "epic" }),
+      bead("d1.1"),
+      bead("d1.2"),
+      bead("c1", { type: "chore" }),
+      bead("c1.1"),
+    ]);
 
     const r = await listPlans(ROOT, projectId);
     expect(r.ok && r.data.map((p) => p.id)).toEqual(["d1"]);

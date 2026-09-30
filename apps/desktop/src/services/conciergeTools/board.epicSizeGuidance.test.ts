@@ -91,7 +91,7 @@ function summary(id: string, over: Partial<BeadSummary> = {}): BeadSummary {
  *  STRUCTURE, so the real resolver has to do the work. */
 function storeWithAFatEpic(): Bead[] {
   return [
-    bead("", { title: "Board column rendering" }),
+    bead("", { type: "epic", title: "Board column rendering" }),
     ...Array.from({ length: 8 }, (_, i) =>
       bead(`.${i + 1}`, { title: `Board chore ${i + 1}`, parent: "" }),
     ),
@@ -141,7 +141,7 @@ describe("guidance, never enforcement", () => {
   // which the advice becomes a gate — the sentence sharpens and the bead is still filed.
   it("still files when the epic is far past the flex allowance", async () => {
     listBeads.mockResolvedValue([
-      bead("sparkle-huge", { title: "Board column rendering" }),
+      bead("sparkle-huge", { type: "epic", title: "Board column rendering" }),
       ...Array.from({ length: 30 }, (_, i) =>
         bead(`sparkle-huge.${i + 1}`, { title: `Board chore ${i + 1}`, parent: "sparkle-huge" }),
       ),

@@ -911,26 +911,25 @@ export function descendantsOf(beads: readonly Bead[], epicId: string): Bead[] {
 /**
  * Is this bead an epic? THE one predicate — every surface calls this.
  *
- * A bead is an epic when it HAS CHILDREN, whatever its `issue_type` says, OR when it is explicitly
- * typed `epic`. Structure first: the type field is a label someone did or did not remember to set,
- * while a parent edge is a fact another bead asserted.
+ * A bead is an epic when it is DECLARED one — `issue_type = 'epic'` — and never merely because
+ * something points at it (bead sparkle-8clekz).
  *
- * THE SECOND HALF IS A UNION, NOT A LEFTOVER — dropping it would break the create→decompose→promote
- * workflow at its first step. `createPlan` files a typed epic that has NO children yet and only
- * then decomposes it; if children were REQUIRED, that fresh plan would fail this predicate the
- * instant it was created — invisible to `list_plans`, refused as `not-a-plan` by `get_plan` and
- * `promote_plan_to_build`. So a childless typed epic stays an epic: it is a plan that has not been
- * broken down yet, which is a stage of an epic's life, not a different kind of thing.
+ * ── WHY HAVING CHILDREN IS NOT ENOUGH ────────────────────────────────────────────────────────
+ * This used to be `typed epic OR has children`. But bd's parent edge carries TWO meanings: plan
+ * membership ("this task is part of that epic") and follow-up-of ("this was filed off the back of
+ * that bug"). Reading every parent as a plan turned each ordinary bug that grew a follow-up — open
+ * or closed — into a plan card in the Epics column, and the parity guard then told the reader to
+ * retype it `epic`, which would have made the mislabel permanent. The declared type is the only
+ * field that says "this is a plan"; the edge says only that two beads are related.
  *
- * Takes the full bead list because children are a property of the SET, not of the bead — a bead
- * cannot tell you whether anything points at it. `readonly` so the board's frozen `allBeads` and a
- * plain array are both callable without either side copying.
+ * A childless typed epic is still an epic — `createPlan` files one and only then decomposes it, and
+ * `list_plans` / `get_plan` / `promote_plan_to_build` must see it at that first step.
+ *
+ * Still takes the full bead list so the ~every-surface call shape is unchanged; the list no longer
+ * affects the answer.
  */
-export function isEpic(beads: readonly Bead[], bead: Pick<Bead, "id" | "type">): boolean {
-  // Reads `childrenByParent` directly rather than going through `childrenOf`, which would allocate
-  // a copy per call purely to ask whether it is empty — and this is the predicate the whole-store
-  // sweeps run per bead.
-  return isTypedEpic(bead) || epicIndexFor(beads).childrenByParent.has(bead.id);
+export function isEpic(_beads: readonly Bead[], bead: Pick<Bead, "id" | "type">): boolean {
+  return isTypedEpic(bead);
 }
 
 /**
@@ -1065,7 +1064,8 @@ export function parentEpicOf(beads: readonly Bead[], bead: Pick<Bead, "id" | "pa
  * (roborev 65662).
  */
 export interface EpicIndex {
-  /** Ids that at least one other bead points at — the structural half of {@link isEpic}.
+  /** Ids that at least one other bead points at. NOT epic-ness: a child edge may be a follow-up, so
+   *  {@link isEpic} does not read this (bead sparkle-8clekz).
    *  EXISTENCE-FILTERED: only ids that are themselves beads. See the note above. */
   hasChildren: ReadonlySet<string>;
   /** Each id's children's statuses, in input order, ready for a roll-up. EXISTENCE-FILTERED. */
@@ -1192,22 +1192,20 @@ export function parentEpicOfIndexed(
   return null;
 }
 
-/** {@link isEpic}'s answer, read from an {@link EpicIndex} instead of re-scanning. Same union, same
- *  order: structure first, then the declared type. */
-export function isEpicIndexed(index: EpicIndex, bead: Pick<Bead, "id" | "type">): boolean {
-  return isTypedEpic(bead) || index.hasChildren.has(bead.id);
+/** {@link isEpic}'s answer for callers holding an {@link EpicIndex}: the declared type alone. A
+ *  child edge does NOT make a bead an epic — see {@link isEpic} (bead sparkle-8clekz). */
+export function isEpicIndexed(_index: EpicIndex, bead: Pick<Bead, "id" | "type">): boolean {
+  return isTypedEpic(bead);
 }
 
 /**
  * Was this bead DECLARED an epic (`issue_type = 'epic'`), regardless of whether anything points at
- * it yet? Deliberately NOT a membership test — use {@link isEpic} for "should this render as a
- * plan".
+ * it yet? Since sparkle-8clekz this is also exactly what {@link isEpic} answers — a child edge no
+ * longer makes a bead an epic — but prefer `isEpic` for "should this render as a plan", so the one
+ * predicate stays the one place that rule can change.
  *
- * It exists for exactly one caller shape: the decompose pipeline, which looks for a bead that was
- * declared an epic and has NO children yet, in order to give it some. Asking `isEpic` there would
- * be a contradiction — a structural epic has children by definition, so it can never be a
- * decomposition candidate — and inlining `type === "epic"` there would be the fourth condition this
- * section exists to prevent.
+ * Inlining `type === "epic"` at a call site instead would be the fourth condition this section
+ * exists to prevent.
  *
  * bd's type field is tolerant and loosely cased; `normalizeBead` already lowercases what it can, so
  * this lowercases again rather than trusting it.

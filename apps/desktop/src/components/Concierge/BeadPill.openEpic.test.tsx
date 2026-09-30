@@ -66,7 +66,7 @@ function bead(over: Partial<Bead> & { id: string }): Bead {
 const DECLARED = bead({ id: "sparkle-decl", type: "epic" });
 /** A STRUCTURAL epic — never declared one, but something points at it. `isEpicIndexed` says yes;
  *  `bead.type === "epic"` says no. A local gate would silently drop this card's links. */
-const STRUCTURAL = bead({ id: "sparkle-struct", type: "feature" });
+const STRUCTURAL = bead({ id: "sparkle-struct", type: "epic" });
 const STRUCTURAL_CHILD = bead({ id: "", parent: "sparkle-struct" });
 /** A plain task — no children, not declared. It gets the destinations too: the column can narrow to
  *  a task, so withholding them hid a view it could already render. */

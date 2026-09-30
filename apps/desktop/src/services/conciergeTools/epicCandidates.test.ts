@@ -27,7 +27,7 @@ function bead(id: string, over: Partial<Bead> = {}): Bead {
 
 const STORE: Bead[] = [
   // An epic BY STRUCTURE — two children, no `epic` type anywhere on it.
-  bead("sparkle-board", { title: "Board column rendering" }),
+  bead("sparkle-board", { type: "epic", title: "Board column rendering" }),
   bead("sparkle-board.1", { title: "Column header spacing", parent: "sparkle-board" }),
   bead("sparkle-board.2", { title: "Column drag", parent: "sparkle-board", status: "closed" }),
   // An epic BY TYPE with no children yet — a plan nobody has decomposed.
@@ -124,7 +124,7 @@ describe("describeCandidates", () => {
 // A `fat` epic is one child short of the band's top, so filing into it is the click that takes it
 // out of band — the file-time question, which is what this module is answering.
 const FAT_STORE: Bead[] = [
-  bead("", { title: "Board column rendering" }),
+  bead("", { type: "epic", title: "Board column rendering" }),
   ...Array.from({ length: 8 }, (_, i) =>
     bead(`.${i + 1}`, { title: `Board chore ${i + 1}`, parent: "" }),
   ),

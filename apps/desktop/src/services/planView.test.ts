@@ -247,7 +247,8 @@ describe("epicChildViews — the live epic detail rows", () => {
 
 describe("orchestratorNameForEpic — reverse §8 linkage for the live view", () => {
   const beads = [
-    bead("e1", "open", null, "Build the mobile app"),
+    // Typed `epic`: a child edge alone no longer makes a plan (sparkle-8clekz).
+    { ...bead("e1", "open", null, "Build the mobile app"), type: "epic" },
     bead("e1.1", "in_progress", "e1"),
   ];
   const buildAgent = (
@@ -303,9 +304,9 @@ describe("orchestratorNameForEpic — reverse §8 linkage for the live view", ()
   // a ladder arm that returned the first build agent unconditionally would pass the case above.
   it("does not claim a task orchestrator bound under a different epic", () => {
     const otherEpic = [
-      bead("e1", "open", null),
+      { ...bead("e1", "open", null), type: "epic" },
       bead("e1.1", "open", "e1"),
-      bead("e2", "open", null),
+      { ...bead("e2", "open", null), type: "epic" },
       bead("e2.1", "open", "e2"),
     ];
     const onE2 = buildAgent({ id: "b2", name: "Other", epicId: "e2.1" });

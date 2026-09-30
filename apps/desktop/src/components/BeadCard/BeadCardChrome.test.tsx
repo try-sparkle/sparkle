@@ -380,3 +380,49 @@ describe("item 22 — the blue bar comes off the epic card and stays everywhere 
     }
   });
 });
+
+// ── THE SURFACE-OWNED FOOTER SLOT (bead sparkle-0qcsqd) ────────────────────────────────────────
+
+describe("the surface-owned footer slot", () => {
+  // The Epics column is the one surface whose CARD carries the border, so a block it owns must be
+  // nested INSIDE that bordered element — a sibling would hang below the edge. `footer` is the seam.
+  it("epics: renders the caller's block INSIDE the bordered card element", () => {
+    const t = ID("epics");
+    mount("epics", { footer: <span data-testid="surface-block">tasks</span> });
+    assertCardIsReallyThere(t, EPIC);
+    const card = screen.getByTestId(t);
+    // The element holding the block IS the bordered one — not a wrapper outside the edge.
+    expect(borderedSides(card)).toEqual(["right", "bottom", "left"]);
+    expect(card.contains(screen.getByTestId("surface-block"))).toBe(true);
+  });
+
+  // MOUNT EVERY CANDIDATE AT ONCE (AGENTS.md): only the surface that filled the slot shows the
+  // block, and the surfaces that pass nothing still render their real content and their own edges.
+  it("only the surface that passes a footer draws one; the others are unchanged", () => {
+    render(
+      <>
+        <BeadCard bead={EPIC} chrome="board" stage="planned" workers={[]} />
+        <BeadCard bead={EPIC} chrome="concierge" stage="planned" workers={[]} />
+        <BeadCard
+          bead={EPIC}
+          chrome="epics"
+          stage="planned"
+          workers={[]}
+          footer={<span data-testid="surface-block">tasks</span>}
+        />
+      </>,
+    );
+    const blocks = screen.getAllByTestId("surface-block");
+    expect(blocks).toHaveLength(1);
+    expect(screen.getByTestId(ID("epics")).contains(blocks[0]!)).toBe(true);
+
+    const board = screen.getByTestId(ID("board"));
+    const concierge = screen.getByTestId(ID("concierge"));
+    expect(board.textContent).toContain(EPIC.title);
+    expect(concierge.textContent).toContain(EPIC.title);
+    expect(board.contains(blocks[0]!)).toBe(false);
+    expect(concierge.contains(blocks[0]!)).toBe(false);
+    expect(borderedSides(board)).toEqual([]);
+    expect(borderedSides(concierge)).toEqual(["top", "right", "bottom", "left"]);
+  });
+});

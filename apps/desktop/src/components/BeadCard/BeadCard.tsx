@@ -50,6 +50,15 @@
 // `tabIndex`: ARIA gives the `button` role presentational children, so one on the root deletes the
 // announced semantics of every control inside the card and displaces the chrome's `role="status"`.
 // The disclosure semantics live on the TITLE BUTTON instead — see the root element and the title.
+//
+// ══ A SURFACE'S OWN BLOCK GOES THROUGH `footer`, NEVER INTO THIS FILE ═══════════════════════════
+// Content that belongs to ONE surface — the Epics column's task cards today — is passed by that
+// surface as `footer` and rendered INSIDE this card's root, so inside whatever edge the chrome
+// paints. Surfaces whose FRAME carries the border (the board's overlay) can render such a block as a
+// sibling; the epics chrome is the one where the CARD carries the border, so a sibling would hang
+// below the edge. That is why the slot exists (bead sparkle-0qcsqd): the next surface-owned block is
+// a caller-side prop, not another reach into the shared card. The card never decides from where it
+// is mounted what goes there. Pinned by `BeadCardChrome.test.tsx` ("the surface-owned footer slot").
 import {
   useEffect,
   useState,

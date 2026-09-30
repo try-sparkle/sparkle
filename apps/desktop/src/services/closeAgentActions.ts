@@ -9,7 +9,7 @@ import {
   deleteAgentBranch,
   deleteAgentBranchIfMerged,
 } from "./branchStatus";
-import { closeBead, markBeadDelivered, recordBeadMergeSha, deleteBead } from "./beads";
+import { closeBead, markBeadDelivered, recordBeadMergeSha, deleteBead, unclaimBead } from "./beads";
 import { removeAgentWorkspace } from "./worktree";
 import { ciBudgetGovernor } from "./ciBudgetGovernor";
 
@@ -181,9 +181,14 @@ export interface SpinDownGitParams {
   root: string;
   projectId: string;
   ids: string[]; // the build agent + its workers — every worktree to remove
-  /** The agent's AND its workers' beads — all CLOSED (not deleted; close is reversible). Optional
-   *  because an agent that never reached `building_unsaved` never got a bead. */
+  /** Beads to CLOSE (not delete; close is reversible). Optional because an agent that never reached
+   *  `building_unsaved` never got a bead. The CALLER decides which beads belong here — see
+   *  `engine/beadLifecycle.teardownBeadWrites` — and it must be only beads whose own work landed, or
+   *  app telemetry. A finding nobody fixed must not leave the board looking fixed (sparkle-aoqzzo). */
   beadIds?: string[];
+  /** Beads to RELEASE back to `open` (`bd update --status open --assignee ""`): claimed by an agent
+   *  that is going away without landing them. Visible and re-dispatchable, which a close is not. */
+  releaseBeadIds?: string[];
   deleteBranch: boolean; // safe-delete each merged branch after its worktree is gone
 }
 
@@ -201,9 +206,15 @@ export interface SpinDownGitParams {
  *  store — so this is the last moment anything can advance the bead. Skipping it left 74 beads
  *  parked at `in_progress` forever (86% of the board's "Being built" column, cleaned up 2026-07-29).
  *  Closed, not DELETED: `bd reopen` makes a wrong call recoverable, and unlike Discard this path is
- *  not a "throw the work away" gesture. Unmerged branches close their bead too — the agent is gone
- *  either way, so an open bead would just be an orphan nobody can act on. Best-effort like the rest,
- *  so a project without a beads DB (bd is optional) never breaks the git teardown. */
+ *  not a "throw the work away" gesture.
+ *
+ *  UNLANDED WORK IS RELEASED, NOT CLOSED (bead sparkle-aoqzzo). This used to close every bead here,
+ *  "unmerged branches too — the agent is gone either way". That made a teardown indistinguishable
+ *  from a fix: a worker's bead for a child the merged PR explicitly did NOT address was closed with
+ *  its siblings, and the finding left the board silently. The orphan the old rule prevented was an
+ *  `in_progress` bead nothing could reach; `releaseBeadIds` fixes that too, by handing it back to
+ *  `open`, where the ready queue sees it. Best-effort like the rest, so a project without a beads DB
+ *  (bd is optional) never breaks the git teardown. */
 export async function spinDownAgentGit(p: SpinDownGitParams): Promise<void> {
   for (const cid of p.ids) {
     // `snapshotWip` — this path KEEPS every branch (that is what distinguishes it from discard), so
@@ -216,4 +227,10 @@ export async function spinDownAgentGit(p: SpinDownGitParams): Promise<void> {
     if (p.deleteBranch) await deleteAgentBranchIfMerged(p.root, cid).catch(() => {});
   }
   for (const bid of p.beadIds ?? []) await closeBead(p.root, bid).catch(() => {});
+  const closing = new Set(p.beadIds ?? []);
+  for (const bid of p.releaseBeadIds ?? []) {
+    // A bead on BOTH lists is closed and left closed: releasing it afterwards would reopen it.
+    if (closing.has(bid)) continue;
+    await unclaimBead(p.root, bid).catch(() => {});
+  }
 }

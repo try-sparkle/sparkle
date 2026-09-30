@@ -422,6 +422,42 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     });
   });
 
+  // AN UNTYPED PARENT IS NOT AN EPIC HERE EITHER (roborev 83199, bead sparkle-8clekz).
+  //
+  // The staffing half of this reader resolves an agent to an epic through `isEpicIndexed`, which is the
+  // declared `epic` TYPE alone. So counting an untyped bead as buildable work produces a row nothing can
+  // ever staff: the bound-agent list comes back empty whatever the roster says, the liveness join reads a
+  // confident `false`, and an ordinary bug with one follow-up child fires the loudest nudge there is on
+  // every cadence, forever. The pair below is why one assertion is not enough — the bug must drop OUT while
+  // a real typed epic beside it still counts, or a guard that simply silenced the whole alarm would pass.
+  it("does NOT count an UNTYPED parent bug, even with a follow-up child and an agent on it", () => {
+    seedEpicBoard([
+      bead({ id: "bug1", status: "in_progress" }), // no `type` — an ordinary bug
+      bead({ id: "bug1.f1", status: "open" }), // …with a follow-up child
+    ]);
+    // Bound by the bug's OWN id, which is the shape `epicIdForAgent` can no longer resolve.
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "bug1", runtime: "local" }]);
+    useRuntimeStore.setState({ status: {} });
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  it("…and counts an unstaffed TYPED epic sitting beside that same bug (the guard is not a mute)", () => {
+    seedEpicBoard([
+      bead({ id: "bug1", status: "in_progress" }),
+      bead({ id: "bug1.f1", status: "open" }),
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([]); // nobody bound to either
+    useRuntimeStore.setState({ status: {} });
+    // EXACTLY 1: the typed epic. A count of 2 is the pre-fix behaviour; 0 would be a muted alarm.
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
   // THE RELEASE-TIME LEDGER MUST REACH THE ALARM (roborev 79285, bead sparkle-hrzitj spec F).
   //
   // `noteEpicRelease` records an epic the moment its orchestrator leaves — which is EARLIER than the

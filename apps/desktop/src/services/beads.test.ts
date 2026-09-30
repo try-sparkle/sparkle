@@ -499,21 +499,31 @@ describe("descendantsOf", () => {
 });
 
 describe("isEpic", () => {
-  // THE POINT OF THE PREDICATE. Eight real parents in this repo's store are typed feature/bug/task
-  // and carry between 2 and 19 children apiece; keying epic-ness on `type` alone made every one of
-  // them invisible as a plan while their children rendered as loose tasks.
-  it("treats a bead with children as an epic whatever its issue_type says", () => {
-    const parent = bead({ id: "p1", type: "feature" });
-    const loose = bead({ id: "loose", type: "task" });
-    const beads = [parent, bead({ id: "c1", parent: "p1" }), loose];
-    expect(isEpic(beads, parent)).toBe(true);
-    expect(isEpic(beads, loose)).toBe(false);
+  // sparkle-8clekz. bd's parent edge means plan membership OR follow-up-of, so a child is not
+  // evidence of a plan: a closed bug with a follow-up child rendered as a plan card. Paired with a
+  // typed epic in the SAME store, so the negative cannot pass on a predicate that answers false for
+  // everything.
+  it("does not treat a bug with a follow-up child as an epic, closed or open", () => {
+    const closedBug = bead({ id: "p1", type: "bug", status: "closed" });
+    const openFeature = bead({ id: "p3", type: "feature" });
+    const plan = bead({ id: "plan", type: "epic" });
+    const beads = [
+      closedBug,
+      bead({ id: "c1", parent: "p1" }),
+      openFeature,
+      bead({ id: "c3", parent: "p3" }),
+      plan,
+      bead({ id: "c4", parent: "plan" }),
+    ];
+    expect(isEpic(beads, closedBug)).toBe(false);
+    expect(isEpic(beads, openFeature)).toBe(false);
+    expect(isEpic(beads, plan)).toBe(true);
   });
 
-  // The dotted id is bd's DISPLAY form of the same parent edge, so it has to count the same way.
-  it("counts a dotted-id child as making its prefix an epic", () => {
+  // The dotted id is bd's DISPLAY form of the same parent edge, so it does not count either.
+  it("does not count a dotted-id child as making its prefix an epic", () => {
     const parent = bead({ id: "p2", type: "bug" });
-    expect(isEpic([parent, bead({ id: "p2.1" })], parent)).toBe(true);
+    expect(isEpic([parent, bead({ id: "p2.1" })], parent)).toBe(false);
   });
 
   // UNION, NOT REPLACEMENT. `create_plan` files a typed epic with no children yet and only then

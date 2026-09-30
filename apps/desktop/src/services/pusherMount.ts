@@ -70,7 +70,7 @@ import {
 import { localAgentCapacity } from "./agentCapacity";
 import { goalStateOf, type AgentGoal } from "../engine/agentGoal";
 import type { AgentTabStatus } from "../types";
-import { epicIndexOf } from "./beads";
+import { epicIndexOf, isEpicIndexed } from "./beads";
 // `staffingAgentsFor` is main's rename of `boundAgentsFor` (sparkle-n2feho.5) — theirs wins, and the
 // body below already calls it with its new signature. The epicStaffing import is this branch's and
 // is additive; the two changes are in the same file for unrelated reasons.
@@ -536,6 +536,16 @@ function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number | null }
   for (const b of beads) {
     // "supposed to be ACTIVELY built" — the epic's own status, stamped once at promote-to-build.
     if (b.status !== "in_progress") continue;
+    // DECLARED EPICS ONLY, and this guard is load-bearing rather than tidy (roborev 83199). The
+    // staffing half below reaches `epicIdForAgent`, which since sparkle-8clekz resolves an agent to an
+    // epic only through `isEpicIndexed` — the declared `epic` TYPE. So an untyped bead counted here
+    // can never be matched to the agent working it: `staffingAgentsFor` returns [], the liveness join
+    // reads a confident `false`, and an ordinary bug with one follow-up child fires the LOUDEST nudge
+    // there is, every cadence, pre-empting the concierge notice, the respin and the generic reminder.
+    // Nothing clears it either — `list_plans` does not list it and `promote_plan_to_build` refuses it
+    // as not-an-epic — so it is the same never-self-clearing alarm roborev 79589 fixed in another form.
+    // The two halves must ask ONE question about what an epic is.
+    if (!isEpicIndexed(index, b)) continue;
     // Buildable = has children. A childless typed epic is an un-decomposed plan, not unstaffed WORK.
     if (!index.childrenByParent.has(b.id)) continue;
     // Staffed iff a bound orchestrator is LIVE **and still working** — the two narrowings of this

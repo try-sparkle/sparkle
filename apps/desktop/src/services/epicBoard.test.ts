@@ -84,7 +84,7 @@ describe("bucketEpics — which ladder column an epic lands in", () => {
     // The whole point of the column. `planning` is the state sparkle-xelans.8 shipped as a derived
     // status and that nothing has ever rendered; before this it sat in Backlog, visually identical
     // to an epic nobody has thought about yet.
-    const all = [bead("e", "open"), bead("e.1", "open", "e"), bead("e.2", "open", "e")];
+    const all = [bead("e", "open", null, { type: "epic" }), bead("e.1", "open", "e"), bead("e.2", "open", "e")];
     only(bucketEpics(bucketBeads(all), all), "planning", ["e"]);
   });
 
@@ -94,12 +94,12 @@ describe("bucketEpics — which ladder column an epic lands in", () => {
   });
 
   it("puts an open epic with a mix of open and closed children in Building", () => {
-    const all = [bead("e", "open"), bead("e.1", "closed", "e"), bead("e.2", "open", "e")];
+    const all = [bead("e", "open", null, { type: "epic" }), bead("e.1", "closed", "e"), bead("e.2", "open", "e")];
     only(bucketEpics(bucketBeads(all), all), "inProgress", ["e"]);
   });
 
   it("puts an open epic whose children are ALL CLOSED in Done — the work finished, the bead did not", () => {
-    const all = [bead("e", "open"), bead("e.1", "closed", "e"), bead("e.2", "closed", "e")];
+    const all = [bead("e", "open", null, { type: "epic" }), bead("e.1", "closed", "e"), bead("e.2", "closed", "e")];
     only(bucketEpics(bucketBeads(all), all), "done", ["e"]);
   });
 
@@ -111,7 +111,7 @@ describe("bucketEpics — which ladder column an epic lands in", () => {
   // `planning` if anything ever routed the blocked pile through the split. Measured — doing
   // exactly that reds this case and only this case.
   it("lets the epic's OWN blocked state win over a child roll-up that says planning", () => {
-    const all = [bead("e", "open", null, { labels: ["stalled"] }), bead("e.1", "open", "e")];
+    const all = [bead("e", "open", null, { type: "epic", labels: ["stalled"] }), bead("e.1", "open", "e")];
     const board = bucketBeads(all);
     expect(board.blocked.map((b) => b.id)).toEqual(["e"]); // precondition: it really is blocked
     only(bucketEpics(board, all), "blocked", ["e"]);
@@ -119,9 +119,9 @@ describe("bucketEpics — which ladder column an epic lands in", () => {
 
   it("maps a delivered epic to Shipped and an archived one to Archived", () => {
     const all = [
-      bead("s", "closed", null, { labels: ["delivered"] }),
+      bead("s", "closed", null, { type: "epic", labels: ["delivered"] }),
       bead("s.1", "closed", "s"),
-      bead("a", "closed", null, { labels: ["archived"] }),
+      bead("a", "closed", null, { type: "epic", labels: ["archived"] }),
       bead("a.1", "closed", "a"),
     ];
     const got = idsIn(bucketEpics(bucketBeads(all), all));
@@ -146,7 +146,7 @@ describe("bucketEpics — which ladder column an epic lands in", () => {
   });
 
   it("shows the epic and hides the task from the SAME bucket — both mounted, one chosen", () => {
-    const all = [bead("e", "open"), bead("e.1", "open", "e"), bead("t", "open")];
+    const all = [bead("e", "open", null, { type: "epic" }), bead("e.1", "open", "e"), bead("t", "open")];
     const got = idsIn(bucketEpics(bucketBeads(all), all));
     expect(got.planning).toEqual(["e"]);
     expect(got.backlog).toEqual([]); // neither the task nor the epic is left behind here
@@ -220,10 +220,10 @@ describe("bucketEpics — the Unstaffed rung, derived from the live roster", () 
     // Being built — a different code path into the same rung, and one a fix covering only the
     // `board.inProgress` copy-through would leave dishonest. Both routes are mounted at once.
     const all = [
-      bead("e-kids-staffed", "open"),
+      bead("e-kids-staffed", "open", null, { type: "epic" }),
       bead("e-kids-staffed.1", "closed", "e-kids-staffed"),
       bead("e-kids-staffed.2", "open", "e-kids-staffed"),
-      bead("e-kids-bare", "open"),
+      bead("e-kids-bare", "open", null, { type: "epic" }),
       bead("e-kids-bare.1", "closed", "e-kids-bare"),
       bead("e-kids-bare.2", "open", "e-kids-bare"),
     ];
@@ -247,14 +247,14 @@ describe("bucketEpics — the Unstaffed rung, derived from the live roster", () 
     // still passes every case above. Every candidate rung is mounted at once so absence is a real
     // observation rather than an empty column.
     const all = [
-      bead("e-blocked", "open", null, { labels: ["stalled"] }),
+      bead("e-blocked", "open", null, { type: "epic", labels: ["stalled"] }),
       bead("e-blocked.1", "open", "e-blocked"),
-      bead("e-planning", "open"),
+      bead("e-planning", "open", null, { type: "epic" }),
       bead("e-planning.1", "open", "e-planning"),
       bead("e-backlog", "open", null, { type: "epic" }),
-      bead("e-done", "open"),
+      bead("e-done", "open", null, { type: "epic" }),
       bead("e-done.1", "closed", "e-done"),
-      bead("e-shipped", "closed", null, { labels: ["delivered"] }),
+      bead("e-shipped", "closed", null, { type: "epic", labels: ["delivered"] }),
       bead("e-shipped.1", "closed", "e-shipped"),
       bead("e-live", "in_progress", null, { type: "epic" }),
     ];
@@ -274,7 +274,7 @@ describe("bucketEpics — the Unstaffed rung, derived from the live roster", () 
     // Both routes into Being built are seeded, so this is not satisfied by an empty board.
     const all = [
       bead("e-own", "in_progress", null, { type: "epic" }),
-      bead("e-kids", "open"),
+      bead("e-kids", "open", null, { type: "epic" }),
       bead("e-kids.1", "closed", "e-kids"),
       bead("e-kids.2", "open", "e-kids"),
     ];
@@ -322,7 +322,7 @@ describe("bucketEpics — the Unstaffed rung, derived from the live roster", () 
 });
 
 describe("tasksOnly + bucketEpics — the two halves the Tasks and Epics modes render", () => {
-  const all = [bead("e", "open"), bead("e.1", "open", "e"), bead("t", "open")];
+  const all = [bead("e", "open", null, { type: "epic" }), bead("e.1", "open", "e"), bead("t", "open")];
   const board: Board = bucketBeads(all);
 
   it("tasksOnly drops the epic and keeps its children and plain tasks", () => {
@@ -373,7 +373,7 @@ describe("bucketEpics / tasksOnly read the CACHED index", () => {
 
   const store = (): Bead[] => {
     const out: Bead[] = [];
-    for (let e = 0; e < 8; e++) out.push(bead(`e${e}`, "open"));
+    for (let e = 0; e < 8; e++) out.push(bead(`e${e}`, "open", null, { type: "epic" }));
     for (let i = 0; out.length < N; i++) out.push(bead(`t${i}`, "open", `e${i % 8}`));
     return out;
   };
@@ -467,7 +467,7 @@ describe("STAGE_LABELS — the one place a stage is put into words", () => {
 // it, which is the only way the chip can agree with the header above it in BOTH modes.
 describe("ladderKeyOf", () => {
   const beads = [
-    bead("e1", "open"),
+    bead("e1", "open", null, { type: "epic" }),
     bead("e1.1", "open", "e1"), // all children open → the epic rolls up to Planning
     bead("t1", "in_progress"),
     bead("t2", "closed"),

@@ -76,6 +76,7 @@ mod drainer;
 mod fleet;
 mod gh_rest;
 mod goal_landed_probe;
+mod bead_landed;
 mod folder_picker;
 mod frontmost;
 mod github;
@@ -1596,6 +1597,8 @@ pub fn run() {
             // silent rejection here reads as "we could not tell", which is precisely the state that
             // leaves a finished agent unable to close its goal.
             goal_landed_probe::agent_landed_probe,
+            // The epic sweep's "is the remaining work already merged?" reading (sparkle-5wjy5a).
+            bead_landed::bead_landed_ids,
             worktree::project_agents_status,
             worktree::project_open_pr_count,
             worktree::project_pr_list_url,

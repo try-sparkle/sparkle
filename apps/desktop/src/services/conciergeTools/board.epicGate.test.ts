@@ -84,7 +84,7 @@ function summary(id: string, over: Partial<BeadSummary> = {}): BeadSummary {
 function storeWithEpics(): Bead[] {
   return [
     bead("sparkle-relay", { title: "Relay reconnect backoff", type: "epic" }),
-    bead("sparkle-board", { title: "Board column rendering" }),
+    bead("sparkle-board", { type: "epic", title: "Board column rendering" }),
     bead("sparkle-board.1", { title: "Column header spacing", parent: "sparkle-board" }),
     bead("sparkle-board.2", {
       title: "Column drag target",

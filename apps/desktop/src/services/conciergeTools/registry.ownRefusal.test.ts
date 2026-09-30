@@ -65,7 +65,7 @@ function bead(id: string, over: Partial<Bead> = {}): Bead {
 
 /** An epic BY MEMBERSHIP (it has a child), so nothing here depends on a `type` field. */
 const STORE: Bead[] = [
-  bead("sparkle-column", { title: "Board column drag and drop" }),
+  bead("sparkle-column", { type: "epic", title: "Board column drag and drop" }),
   bead("sparkle-column.1", { title: "drag handle", parent: "sparkle-column" }),
 ];
 

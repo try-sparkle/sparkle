@@ -84,15 +84,12 @@ export function EpicInlineCard({
   // `services/planView.ts` and as `EpicsColumn.tsx` for the label-treatment ratchet. Do not
   // "restore" the example.
   //
-  // IT IS ALSO THE WRONG ANSWER, not merely a duplicated one. `isEpic` is `isTypedEpic(bead) ||
-  // has children`: structure first, because `issue_type` is a label someone did or did not remember
-  // to set while a parent edge is a fact another bead asserted. A raw type test therefore denies the
-  // goal field to every epic that was never typed but has children — and those render in this very
-  // column, so the card would show no goal on a card the Epics column had already called an epic.
+  // A raw type test would also drift from the column: whatever `isEpic` decides is what the Epics
+  // column renders as a plan, so this card must ask the same predicate. (It is the declared type
+  // alone since sparkle-8clekz — a child edge may be a follow-up, not plan membership.)
   //
-  // Computed ONCE rather than at each of the two props below: `isEpic` walks the memoised epic index
-  // per call, and two identical reads per render is the shape that later drifts into two different
-  // answers.
+  // Computed ONCE rather than at each of the two props below: two identical reads per render is the
+  // shape that later drifts into two different answers.
   const beadIsEpic = isEpic(allBeads, bead);
 
   // ── THIS CARD'S LINEAGE: THE `Tasks:` AND `Build agents:` ROWS ───────────────────────────────

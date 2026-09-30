@@ -59,6 +59,35 @@ import { terminateIfCloud } from "./cloudAgents/terminate";
 import { spinDownAgentGit } from "./closeAgentActions";
 import { closeDecision } from "../engine/closeAgent";
 import { resolveStage } from "../engine/workflowStage";
+import { teardownBeadWrites, beadTargetLevel, BEAD_LEVEL } from "../engine/beadLifecycle";
+import { AUTO_LABEL, beadShow } from "./beads";
+
+/** Deadline for the WHOLE teardown read phase, not per bead (roborev 83352): serial reads under a
+ *  per-read bound made the worst case N × bound. Each read is a single `bd show <id> --json`
+ *  (roborev 83346). A bead not read before the deadline is "could not read", which writes NOTHING. */
+const TEARDOWN_BEAD_READ_PHASE_MS = 30_000;
+
+async function readBeadNow(
+  projectPath: string,
+  id: string,
+  budgetMs: number,
+): Promise<{ status: string; labels: string[] } | undefined> {
+  if (budgetMs <= 0) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const bead = await Promise.race([
+      beadShow(projectPath, id),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), budgetMs);
+      }),
+    ]);
+    return bead && typeof bead.status === "string" ? { status: bead.status, labels: bead.labels ?? [] } : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 import { retroSettled } from "../engine/retroReceiptTypes";
 import { cachedReceipt } from "./retroReceipts";
 
@@ -115,22 +144,57 @@ export async function closeBuildAgent(
   // for N deadlines on a black-holed connection (roborev 47220).
   await Promise.all(ids.map((id) => terminateIfCloud(project.agents.find((a) => a.id === id))));
 
+  // Collect the beads BEFORE removeAgent drops the rows that carry the ids, and read each agent's
+  // stage BEFORE `close` below tears its runtime state down. Without this the beads are orphaned at
+  // `in_progress` forever — nothing re-reaches them once the agent leaves the store.
+  //
+  // EACH BEAD IS JUDGED ON ITS OWN AGENT'S WORK (bead sparkle-aoqzzo). This used to close every
+  // bead in the subtree, so a worker's child bead that never landed was closed alongside the
+  // siblings that did — and a close reads exactly like a fix. See `teardownBeadWrites`.
+  //
+  // Status and labels come from a FRESH read per bead, never the cached board (roborev 83232): the
+  // board is polled only while someone views it, and machine closes happen for projects nobody is
+  // viewing. Stages are captured synchronously first, before any await lets the runtime move.
+  const rtBefore = useRuntimeStore.getState();
+  const staged = ids.flatMap((id) => {
+    const beadId = project.agents.find((a) => a.id === id)?.beadId;
+    return beadId
+      ? [{ beadId, stage: resolveStage(rtBefore.branchStatus[id], rtBefore.workflowStage[id]) }]
+      : [];
+  });
   // Store teardown first: drop each from the open set (unmounts the pane → kills PTY + stops the
   // orchestration bridge). Keep this before the git teardown so nothing is mid-write on the worktree.
+  // It also runs BEFORE the bead reads below (roborev 83352): the stages are already captured, and
+  // the reads need only the root and the ids, so a busy store must never hold the visible close.
   const { close } = useRuntimeStore.getState();
   for (const id of ids) close(id);
 
-  // Collect the beads BEFORE removeAgent drops the rows that carry the ids. Without this the beads
-  // are orphaned at `in_progress` forever — nothing re-reaches them once the agent leaves the store.
-  const beadIds = ids
-    .map((id) => project.agents.find((a) => a.id === id)?.beadId)
-    .filter((b): b is string => !!b);
+  // ONE AT A TIME, not Promise.all: bd is a single-writer store, so N parallel reads queue on its
+  // lock and the later ones expire for no reason but their position (roborev 83346). A LANDED bead
+  // is not read at all — it closes whatever the store says — and the whole phase shares ONE
+  // deadline, so the worst case is one bd timeout rather than one per bead (roborev 83352).
+  const readDeadline = Date.now() + TEARDOWN_BEAD_READ_PHASE_MS;
+  const bound = [];
+  for (const s of staged) {
+    if (beadTargetLevel(s.stage) >= BEAD_LEVEL.closed) {
+      bound.push({ ...s, telemetry: undefined, status: undefined });
+      continue;
+    }
+    const now = await readBeadNow(project.rootPath, s.beadId, readDeadline - Date.now());
+    bound.push({
+      ...s,
+      telemetry: now ? now.labels.includes(AUTO_LABEL) : undefined,
+      status: now?.status,
+    });
+  }
+  const beadWrites = teardownBeadWrites(bound);
 
   await spinDownAgentGit({
     root: project.rootPath,
     projectId: project.id,
     ids,
-    beadIds,
+    beadIds: beadWrites.close,
+    releaseBeadIds: beadWrites.release,
     deleteBranch: useSettingsStore.getState().deleteMergedBranch,
   });
 

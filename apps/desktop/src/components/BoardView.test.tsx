@@ -2242,9 +2242,9 @@ describe("BoardView — Tasks / Epics kind toggles", () => {
     const beads: Bead[] = [
       // NOT "The epic": a trailing bare word `epic` is now scrubbed from the DISPLAYED title
       // (epicDisplayTitle), and these tests locate cards BY their rendered text. The title is
-      // incidental here — what is under test is bucketing by epic-ness, which comes from having a
-      // child, not from the name. The scrub itself is pinned in services/beads.epicTitle.test.ts.
-      bead({ id: "p1-epic", title: "Parent rollup" }),
+      // incidental here — what is under test is bucketing by epic-ness, which comes from the declared
+      // type, not from the name. The scrub itself is pinned in services/beads.epicTitle.test.ts.
+      bead({ id: "p1-epic", title: "Parent rollup", type: "epic" }),
       bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
       bead({ id: "p1-task", title: "Plain task" }),
     ];
@@ -2453,7 +2453,7 @@ describe("BoardView — Tasks / Epics kind toggles", () => {
     // with the epic written first would pass against no implementation at all.
     const beads: Bead[] = [
       bead({ id: "p1-task", title: "Plain task" }),
-      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic", title: "Parent rollup", type: "epic" }),
       bead({ id: "p1-epic.1", title: "Epic child" }),
       bead({ id: "p1-task2", title: "Second task" }),
     ];
@@ -3484,7 +3484,7 @@ describe("BoardView — column order", () => {
   // leave the rest sorting like tasks — a card that visually says EPIC and sorts like a task,
   // which is worse than the interleaving this bead is about.
   const cards = [
-    bead({ id: "p1-e0", title: "Structural epic", priority: 0, updatedAt: "2026-01-01T00:00:00Z" }),
+    bead({ id: "p1-e0", title: "Untyped-looking epic", type: "epic", priority: 0, updatedAt: "2026-01-01T00:00:00Z" }),
     bead({ id: "p1-e1", title: "Typed epic one", priority: 1, type: "epic", updatedAt: "2026-02-01T00:00:00Z" }),
     bead({ id: "p1-e2", title: "Typed epic two", priority: 2, type: "epic", updatedAt: "2026-03-01T00:00:00Z" }),
     bead({ id: "p1-t0", title: "Task zero", priority: 0, updatedAt: "2026-04-01T00:00:00Z" }),
@@ -3817,7 +3817,7 @@ describe("BoardView — the bead card's status chip is the board stage, not the 
   // which is why both halves are asserted: one alone would pass for a chip wired to either rule.
   it("mirrors the EPIC LADDER's rung in Epics-only mode — 'Planning', not 'Backlog'", () => {
     const beads: Bead[] = [
-      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic", title: "Parent rollup", type: "epic" }),
       bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
     ];
     snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
@@ -3836,7 +3836,7 @@ describe("BoardView — the bead card's status chip is the board stage, not the 
 
   it("says 'Backlog' for that SAME epic on the task board — the chip follows the mode", () => {
     const beads: Bead[] = [
-      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic", title: "Parent rollup", type: "epic" }),
       bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
     ];
     snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
@@ -3857,7 +3857,7 @@ describe("BoardView — the bead card's status chip is the board stage, not the 
   // implementation, and a third hand-written list could reintroduce the drift without touching them.
   it("names the in-progress column identically on the task board and the epic ladder", () => {
     const beads: Bead[] = [
-      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic", title: "Parent rollup", type: "epic" }),
       bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
     ];
     snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };

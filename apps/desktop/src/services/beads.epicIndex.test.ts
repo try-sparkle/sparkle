@@ -36,7 +36,9 @@ function naiveChildrenOf(beads: readonly Bead[], epicId: string): Bead[] {
 
 function naiveIsEpic(beads: readonly Bead[], bead: Pick<Bead, "id" | "type">): boolean {
   // `isTypedEpic` inlined so this file re-derives NOTHING from the module under test.
-  return (bead.type ?? "").toLowerCase() === "epic" || naiveChildrenOf(beads, bead.id).length > 0;
+  // The declared type alone — a child edge may be a follow-up, not plan membership (sparkle-8clekz).
+  void beads;
+  return (bead.type ?? "").toLowerCase() === "epic";
 }
 
 function naiveOpenChildCount(beads: readonly Bead[], epicId: string): number {
@@ -329,11 +331,12 @@ describe("the WeakMap index cache", () => {
   const epic = mk("cache-ep", { type: "feature" });
   const kid = mk("cache-ep.1", { status: "open" });
 
+  // `isEpic` no longer reads the index (it is the declared type alone — sparkle-8clekz), so the
+  // cache is observed through `childrenOf` / `openChildCount` / `parentEpicOf` below.
   it("gives the same answers on a second call with the same array", () => {
     const beads = [epic, kid];
-    expect(isEpic(beads, epic)).toBe(true);
     expect(childrenOf(beads, "cache-ep").map((b) => b.id)).toEqual(["cache-ep.1"]);
-    expect(isEpic(beads, epic)).toBe(true);
+    expect(openChildCount(beads, "cache-ep")).toBe(1);
     expect(childrenOf(beads, "cache-ep").map((b) => b.id)).toEqual(["cache-ep.1"]);
     expect(openChildCount(beads, "cache-ep")).toBe(1);
   });
@@ -344,9 +347,9 @@ describe("the WeakMap index cache", () => {
   it("does not leak one array's answers to a different array", () => {
     const withKid = [epic, kid];
     const withoutKid = [mk("cache-ep", { type: "feature" })];
-    expect(isEpic(withKid, epic)).toBe(true);
-    expect(isEpic(withoutKid, epic)).toBe(false);
-    expect(isEpic(withKid, epic)).toBe(true); // and back again — neither poisons the other
+    expect(openChildCount(withKid, "cache-ep")).toBe(1);
+    expect(openChildCount(withoutKid, "cache-ep")).toBe(0);
+    expect(openChildCount(withKid, "cache-ep")).toBe(1); // and back again — neither poisons the other
     expect(childrenOf(withoutKid, "cache-ep")).toEqual([]);
     expect(childrenOf(withKid, "cache-ep").map((b) => b.id)).toEqual(["cache-ep.1"]);
   });
@@ -362,15 +365,14 @@ describe("the WeakMap index cache", () => {
   // THE LENGTH GUARD. A `push` keeps the array's identity, so a cache that trusted identity alone
   // would keep answering from the pre-push index forever.
   it("picks up an in-place push that changes the array's length", () => {
-    const growEp = mk("grow-ep", { type: "feature" });
+    const growEp = mk("grow-ep", { type: "epic" });
     const growKid = mk("grow-ep.1");
     const beads: Bead[] = [growEp];
-    expect(isEpic(beads, growEp)).toBe(false); // index built here, with no children
+    expect(openChildCount(beads, "grow-ep")).toBe(0); // index built here, with no children
     expect(childrenOf(beads, "grow-ep")).toEqual([]);
 
     beads.push(growKid); // same array object, new length
 
-    expect(isEpic(beads, growEp)).toBe(true);
     expect(childrenOf(beads, "grow-ep").map((b) => b.id)).toEqual(["grow-ep.1"]);
     expect(openChildCount(beads, "grow-ep")).toBe(1);
     expect(parentEpicOf(beads, growKid)).toBe(growEp);
@@ -400,12 +402,12 @@ describe("the WeakMap index cache", () => {
     const mutEp = mk("mut-ep", { type: "feature" });
     const mutRow = mk("orphan-row");
     const beads: Bead[] = [mutEp, mutRow];
-    expect(isEpic(beads, mutEp)).toBe(false);
+    expect(openChildCount(beads, "mut-ep")).toBe(0);
 
     mutRow.parent = "mut-ep"; // same array identity, same length
 
-    expect(isEpic(beads, mutEp)).toBe(false); // stale, by documented design
-    expect(isEpic([...beads], mutEp)).toBe(true); // the contract: one fresh array per snapshot
+    expect(openChildCount(beads, "mut-ep")).toBe(0); // stale, by documented design
+    expect(openChildCount([...beads], "mut-ep")).toBe(1); // the contract: one fresh array per snapshot
   });
 });
 
@@ -592,9 +594,9 @@ describe("epic index — a bead whose id is the empty string", () => {
   it("isEpicIndexed matches the naive isEpic for the empty-id bead", () => {
     const index = buildEpicIndex(store);
     const blank = store[0]!;
-    // Naive says epic (childrenOf("") matches the parent === "" bead); indexed must say the same.
-    expect(naiveIsEpic(store, blank)).toBe(true);
-    expect(isEpicIndexed(index, blank)).toBe(true);
+    // It has a child but is not typed `epic`, so neither says epic (sparkle-8clekz) — and they agree.
+    expect(naiveIsEpic(store, blank)).toBe(false);
+    expect(isEpicIndexed(index, blank)).toBe(false);
   });
 
   it("childrenOfIndexed still matches the naive scan here", () => {

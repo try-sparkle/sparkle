@@ -113,14 +113,17 @@ describe("parentEpicOf — the inverse of childrenOf", () => {
     expect(parentEpicOf(beads, beads[2]!)?.id).toBe("a.b");
   });
 
-  // The founder: several real parents are typed feature/bug/task — sparkle-xnjil is a `feature`
-  // with 19 children. Keying off issue_type would return null here and the label would never show.
-  it("resolves a parent that HAS CHILDREN but is not typed 'epic'", () => {
+  // sparkle-8clekz: a parent edge may be a follow-up, so a follow-up of a bug is not "Part of Epic".
+  // Paired with a typed parent in the same store, so null cannot come from a resolver that is broken.
+  it("does not name a parent that HAS CHILDREN but is not typed 'epic'", () => {
     const beads = [
-      bead({ id: "f1", title: "Social Coding", type: "feature" }),
-      bead({ id: "f1.1", parent: "f1" }),
+      bead({ id: "b1", title: "A closed bug", type: "bug", status: "closed" }),
+      bead({ id: "b1.1", parent: "b1" }),
+      bead({ id: "e1", title: "Social Coding", type: "epic" }),
+      bead({ id: "e1.1", parent: "e1" }),
     ];
-    expect(parentEpicOf(beads, beads[1]!)?.title).toBe("Social Coding");
+    expect(parentEpicOf(beads, beads[1]!)).toBeNull();
+    expect(parentEpicOf(beads, beads[3]!)?.title).toBe("Social Coding");
   });
 
   // Orphan tasks are normal, not an error state.

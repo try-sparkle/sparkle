@@ -297,6 +297,28 @@ export interface EpicSweepCandidate {
    * to authorize a paid call.
    */
   hollowSinceAt?: number | null;
+  /**
+   * Is EVERY still-open child named, in a `Refs:`/`Fixes:` trailer, by a commit that is already an
+   * ancestor of the default branch? (bead `sparkle-5wjy5a`)
+   *
+   * `true` turns a RESTART into an ESCALATION — never into a skip. A trailer naming a bead says the
+   * commit is ABOUT it, not that the bead is finished: `Refs:` means "related to" and every worker
+   * increment carries one (bead `sparkle-50pjf8`, roborev 83233). So this is evidence against
+   * spending a restart on an orchestrator that may have nothing to dispatch, and NOT evidence that
+   * the epic needs no human: the founder is shown it in the Blocked lane, where "close the landed
+   * children or re-plan" is a decision only he can make. A silent skip here hid a partly-fixed
+   * epic permanently, because a `Refs:`-only child is never closed by anything.
+   *
+   * Three states, and only `true` changes anything. `false` (some open child has no landed commit)
+   * and `null`/absent (the reading was not taken, or could not be) both leave the decision exactly
+   * as it was before this field existed. That is deliberate: this is a reason NOT to spend, so its
+   * absence must never manufacture one — and an unreadable git history must not silently disable
+   * every restart in the app either.
+   *
+   * Per CHILD, never per epic. One landed sibling says nothing about the child next to it, which is
+   * the mirror of bead `sparkle-aoqzzo` (a bead closed because its SIBLINGS landed).
+   */
+  openChildrenLanded?: boolean | null;
 }
 
 /**
@@ -452,6 +474,12 @@ export function decideEpicSweep(
   // Escalated and STILL not moving ⇒ wait for the human. That is the whole point of escalating: it
   // stops the retry loop rather than slowing it down.
   if (c.alreadyEscalated) return skip("already-escalated");
+
+  // THE REMAINING WORK APPEARS TO HAVE MERGED (bead `sparkle-5wjy5a`). Checked here — after every
+  // rule that clears or waits, before the restart — because a restart would hand an orchestrator a
+  // plan that may have nothing left in it. It ESCALATES rather than skipping (roborev 83233): the
+  // evidence is a trailer, which can name a partial increment, so the human must still see it.
+  if (c.openChildrenLanded === true) return { epicId: c.epicId, action: "escalate" };
 
   // THE SWEEP restarted this epic more recently than anything moved on it — its one restart was
   // spent and bought nothing. Stop, and put it in front of the human.

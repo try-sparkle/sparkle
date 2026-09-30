@@ -103,19 +103,12 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
     expect(field.value).toBe("A goal written before this card was opened");
   });
 
-  it("draws the field on an UNTYPED bead that HAS CHILDREN — structure beats the type label", async () => {
-    // THE BEHAVIOURAL CONTENT OF SWITCHING TO `isEpic`. The gate used to be a raw type-field test,
-    // which denies the goal to every epic nobody remembered to type `epic` — and `isEpic` is
-    // deliberately `isTypedEpic(bead) || has children`, structure first, because a parent edge is a
-    // fact another bead asserted while the type field is a label someone did or did not set. Such a
-    // bead renders in the Epics column already, so the raw test produced a card the column calls an
-    // epic with no goal field on it.
-    //
-    // ALL THREE MOUNTED AT ONCE, for the reason the case below states: absence on a card rendered
-    // alone proves nothing about the gate.
-    const parent = beadOf("sparkle-untyped", { type: "task" });
+  it("draws NO field on an untyped bead that merely HAS CHILDREN — a follow-up is not a plan", async () => {
+    // sparkle-8clekz: the gate is `isEpic`, and `isEpic` is the declared type alone, because bd's
+    // parent edge also means follow-up-of. MOUNTED BESIDE A TYPED EPIC, whose field must appear, so
+    // the absence below cannot pass on a gate that is simply closed for everything.
+    const parent = beadOf("sparkle-untyped", { type: "bug" });
     const child = beadOf("sparkle-untyped.1", { type: "task", parent: "sparkle-untyped" });
-    const lone = beadOf("sparkle-lone", { type: "task" });
 
     const { container: parentBox } = render(
       <EpicInlineCard
@@ -125,21 +118,19 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         allBeads={[parent, child]}
       />,
     );
-    const { container: loneBox } = render(
+    const { container: epicBox } = render(
       <EpicInlineCard
-        bead={lone}
+        bead={EPIC}
         projectId={PROJECT}
         rootPath={ROOT}
-        allBeads={[lone]}
+        allBeads={[EPIC]}
       />,
     );
 
     await waitFor(() => {
-      expect(parentBox.querySelector(`[data-testid="${FIELD}"]`)).not.toBeNull();
+      expect(epicBox.querySelector(`[data-testid="${FIELD}"]`)).not.toBeNull();
     });
-    // The childless task beside it still has no field, so this is the CHILDREN doing the work
-    // rather than the gate having been opened for everything.
-    expect(loneBox.querySelector(`[data-testid="${FIELD}"]`)).toBeNull();
+    expect(parentBox.querySelector(`[data-testid="${FIELD}"]`)).toBeNull();
   });
 
   it("draws the field on an EPIC and not on a task — both mounted at once", async () => {

@@ -56,6 +56,7 @@ import {
   resolveEpicPrdPath,
   type EpicPrdIndex,
 } from "./epicPrd";
+import { landedBeadIds } from "./beadLanded";
 import { freshnessControl, resolveProbe } from "../engine/probeOutcome";
 import {
   epicOrchestratorLiveness,
@@ -515,6 +516,13 @@ export interface EpicSweepOptions {
    *  resumed orchestrator the epic's PRD by path. Defaults to the real (cached, never-throwing)
    *  `loadEpicPrdIndex`; injected by tests. */
   prdIndexFor?: (projectPath: string) => Promise<EpicPrdIndex>;
+  /**
+   * Which of these bead ids a LANDED commit already names (bead `sparkle-5wjy5a`). Defaults to
+   * `beadLanded.landedBeadIds`, which runs `scripts/bead-landed-check.sh` through Rust. `null` means
+   * could-not-tell and leaves the decision as it was. Asked ONLY for an epic already decided
+   * `restart` or `escalate`, so a quiet tick costs no git reads.
+   */
+  landedBeadIdsFor?: (projectPath: string, ids: readonly string[]) => Promise<ReadonlySet<string> | null>;
 }
 
 /** Parse a bd ISO-8601 timestamp. Returns null on anything unreadable, which the engine then
@@ -943,6 +951,7 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
   const notify = opts.notify ?? ((text: string) => notifyConcierge(text, "pusher"));
   const canNotify = opts.canNotify ?? conciergeNotifierAvailable;
   const prdIndexFor = opts.prdIndexFor ?? loadEpicPrdIndex;
+  const landedBeadIdsFor = opts.landedBeadIdsFor ?? landedBeadIds;
   const restart =
     opts.restart ??
     (async (projectId: string, epicId: string) =>
@@ -1175,7 +1184,40 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
         candidate.orchestratorAlive,
         beadsObserved ? beads : undefined,
       );
-      const decision = decideEpicSweep(candidate, now, stallMs, maxAgeMs, hollowMs);
+      let decision = decideEpicSweep(candidate, now, stallMs, maxAgeMs, hollowMs);
+      // ── IS THERE ANYTHING LEFT TO BUILD? (bead sparkle-5wjy5a) ─────────────────────────────────
+      // "No child moved" is a proxy. Before SPENDING a restart on it, ask the real signal: has every
+      // still-open child already been named by a commit on the default branch? Measured: an epic
+      // with six open children, all fixed by two merged PRs, was restarted and its one restart spent
+      // on an orchestrator with nothing to dispatch. When they all read landed, the restart becomes
+      // an ESCALATION, never a silent skip (roborev 83233 — a trailer can name a partial increment).
+      // Asked only for a decided restart, so a quiet tick pays no git read; `null` changes nothing.
+      if (decision.action === "restart") {
+        const open = childrenOf(beads, epic.id).filter((c) => c.status !== "closed");
+        if (open.length > 0) {
+          let landed: ReadonlySet<string> | null = null;
+          try {
+            landed = await landedBeadIdsFor(
+              project.rootPath,
+              open.map((c) => c.id),
+            );
+          } catch (e) {
+            log.warn("epics", "could not read which children already landed", {
+              epic: epic.id,
+              error: String(e),
+            });
+          }
+          if (landed && open.every((c) => landed.has(c.id))) {
+            decision = decideEpicSweep(
+              { ...candidate, openChildrenLanded: true },
+              now,
+              stallMs,
+              maxAgeMs,
+              hollowMs,
+            );
+          }
+        }
+      }
       const out: EpicSweepOutcome = { ...decision, projectId: project.id, performed: "none" };
 
       // ── A STAND-IN IS RETRACTED THE MOMENT THE REAL THING IS AVAILABLE ──────────────────────

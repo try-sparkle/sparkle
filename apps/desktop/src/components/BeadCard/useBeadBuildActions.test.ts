@@ -558,7 +558,7 @@ describe("the epic index is beads.ts's, not a second private copy", () => {
   // closed, re-entered through a cache. The subject MUST be a non-epic that BECOMES one; the two
   // tests above both use `type: "epic"`, where the answer is true before and after the push and
   // the memo's dep list cannot matter (roborev 65777).
-  it("re-reads epic-ness on an in-place push, so a bead that gains a child is not built as a task", async () => {
+  it("keeps building a task as a task after it gains a follow-up child (sparkle-8clekz)", async () => {
     const t = bead({ id: "tk", type: "task" });
     const all = [t];
 
@@ -571,8 +571,8 @@ describe("the epic index is beads.ts's, not a second private copy", () => {
     });
     expect(sendToBuild).toHaveBeenCalledWith(expect.objectContaining({ epicId: "tk", mode: "task" }));
 
-    // It acquires its first child by in-place push — same array object, length 1 -> 2. `isEpic`
-    // keys on CHILDREN, not on `type`, so this bead is an epic from here on.
+    // It acquires a child by in-place push. A parent edge may be a follow-up, not plan membership,
+    // so `isEpic` reads the declared type alone and this bead is still a task.
     sendToBuild.mockClear();
     all.push(bead({ id: "tk.1", parent: "tk", status: "open" }));
     r.rerender({ list: all });
@@ -580,6 +580,6 @@ describe("the epic index is beads.ts's, not a second private copy", () => {
     await act(async () => {
       await r.result.current.buildIt?.();
     });
-    expect(sendToBuild).toHaveBeenCalledWith(expect.objectContaining({ epicId: "tk", mode: "epic" }));
+    expect(sendToBuild).toHaveBeenCalledWith(expect.objectContaining({ epicId: "tk", mode: "task" }));
   });
 });

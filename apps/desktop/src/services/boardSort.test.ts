@@ -34,7 +34,7 @@ const order = (beads: readonly Bead[]) => beads.map((b) => b.id);
 // at it) and `e1`/`e2` are typed epics. Mixing them is the point — the board's orange EPIC chip
 // resolves through the same `isEpicIndexed`, so a sort that understood only one encoding would
 // promote a strict SUBSET of the chipped cards and leave the rest sorting like tasks.
-const e0 = bead({ id: "e0", priority: 0, updatedAt: "2026-01-01T00:00:00Z", createdAt: "2026-01-01T00:00:00Z" });
+const e0 = bead({ id: "e0", type: "epic", priority: 0, updatedAt: "2026-01-01T00:00:00Z", createdAt: "2026-01-01T00:00:00Z" });
 const e1 = bead({ id: "e1", priority: 1, type: "epic", updatedAt: "2026-02-01T00:00:00Z", createdAt: "2026-02-01T00:00:00Z" });
 const e2 = bead({ id: "e2", priority: 2, type: "epic", updatedAt: "2026-03-01T00:00:00Z", createdAt: "2026-03-01T00:00:00Z" });
 const t0 = bead({ id: "t0", priority: 0, updatedAt: "2026-04-01T00:00:00Z", createdAt: "2026-04-01T00:00:00Z" });

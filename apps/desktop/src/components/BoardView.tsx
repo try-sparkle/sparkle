@@ -1628,7 +1628,8 @@ const Card = memo(function Card({
   const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
 
   // ── EPIC vs TASK — ONE RESOLVER, BOTH DIRECTIONS ─────────────────────────────────────────────
-  // `isEpic` is the single predicate (typed `epic` OR has children); `parentEpicOf` is its inverse.
+  // `isEpic` is the single predicate (declared `epic` — a child edge alone may be a follow-up, see
+  // sparkle-8clekz); `parentEpicOf` is its inverse.
   // Keying either off `type === "epic"` is the mistake this codebase already made three times: // epic-guard-ok — this line only NAMES the anti-pattern in prose; it is not a condition.
   // several real parents are typed `feature`/`bug`/`task` and one of them has 19 children, so a
   // type check would leave every one of those children unlabelled.

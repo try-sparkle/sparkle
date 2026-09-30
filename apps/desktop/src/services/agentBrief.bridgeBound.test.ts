@@ -19,27 +19,37 @@
 // control op. These are constants in two packages that cannot import each other, so nothing but this
 // test stops them drifting across each other — and it parses the source rather than trusting a copied
 // number, because a copied number is exactly what drifts.
+//
+// THE READING AND THE ARITHMETIC ARE SHARED, NOT LOCAL (bead sparkle-fcdmh0). This file pins the
+// transport bound's CEILING; `apps/mcp-control/src/conciergeToolFailure.test.ts` pins its FLOOR, and
+// at today's values they are the same number. Each used to be blind to the other, so a one-second
+// move passed here and red there. Both now read every rung through `@sparkle/core/testing/
+// timeoutLadder` and assert the WHOLE ladder, so a red in either package reports the whole system.
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  describeTimeoutLadder,
+  readLadderValue,
+  readTimeoutLadder,
+  solveTimeoutLadder,
+} from "@sparkle/core/testing/timeoutLadder";
 import { BRIEF_DELIVERY_TIMEOUT_MS } from "./agentBrief";
 
-function readConst(relPath: string, name: string): number {
-  const src = readFileSync(resolve(__dirname, relPath), "utf8");
-  const m = src.match(new RegExp(`${name}\\s*=\\s*([\\d_]+)`));
-  if (!m) throw new Error(`could not find ${name} in ${relPath}`);
-  return Number(m[1]!.replace(/_/g, ""));
-}
-
 /** The bound a `concierge_tool` round trip actually gets — the override, not the bridge default. */
-const conciergeToolTimeoutMs = () =>
-  readConst("../../../mcp-control/src/tools.ts", "CONCIERGE_TOOL_TIMEOUT_MS");
-const bridgeDefaultTimeoutMs = () =>
-  readConst("../../../mcp-control/src/bridgeClient.ts", "DEFAULT_TIMEOUT_MS");
+const conciergeToolTimeoutMs = () => readLadderValue("conciergeToolTimeout");
+const bridgeDefaultTimeoutMs = () => readLadderValue("bridgeDefaultTimeout");
 /** The liveness stall threshold, read from its own source for the same anti-drift reason. */
-const stalledAfterMs = () => readConst("../engine/conciergeLiveness.ts", "STALLED_AFTER_MS");
+const stalledAfterMs = () => readLadderValue("stalledAfter");
 
 describe("brief-delivery bound vs the MCP bridge bound", () => {
+  // The rungs this file never used to see — the bd bound and its reader drain — are part of the same
+  // system. Solved together, so moving any rung reports feasibility here AND in mcp-control.
+  it("fits the WHOLE timeout ladder, including the bd rung pinned from mcp-control", () => {
+    const ladder = readTimeoutLadder();
+    expect(solveTimeoutLadder(ladder).violations, describeTimeoutLadder(ladder)).toEqual([]);
+    // The shared reader parses the same declaration this module exports, not a stale copy.
+    expect(ladder.briefDeliveryTimeout).toBe(BRIEF_DELIVERY_TIMEOUT_MS);
+  });
+
   it("gives up well before the transport does, so the honest outcome can actually be delivered", () => {
     const transport = conciergeToolTimeoutMs();
     expect(transport).toBeGreaterThan(0);

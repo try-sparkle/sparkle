@@ -304,3 +304,33 @@ describe("decideEpicSweep — asking for a plan for an epic that has none", () =
     expect(why(hollow({ hollowSinceAt: undefined }))).toBe("unknown-age");
   });
 });
+
+// bead sparkle-5wjy5a: "no child moved in N hours" also describes an epic whose remaining children
+// were fixed by PRs that already merged. The sweep restarted exactly that epic and spent its budget.
+describe("decideEpicSweep — the remaining work appears to have landed", () => {
+  it("ESCALATES instead of restarting an epic whose every open child is named by a landed commit", () => {
+    // Not a skip (roborev 83233): a trailer can name a partial increment, and a Refs:-only child is
+    // never closed by anything, so a silent skip would hide a stalled epic forever.
+    expect(act()).toBe("restart"); // paired: the same epic restarts without the reading
+    expect(act({ openChildrenLanded: true })).toBe("escalate");
+  });
+
+  it("never goes silent on it — an already-spent restart still escalates", () => {
+    expect(act({ lastSweepRestartAt: STALE + 1, openChildrenLanded: true })).toBe("escalate");
+  });
+
+  it("stays terminal once escalated — waits for the human instead of re-marking", () => {
+    expect(why({ alreadyEscalated: true, openChildrenLanded: true })).toBe("already-escalated");
+  });
+
+  it("PAIRED — a partial landing, no reading, or an unreadable one leaves the restart exactly as it was", () => {
+    // Only `true` is a reason not to spend. An unreadable git history must not disable every restart.
+    expect(act({ openChildrenLanded: false })).toBe("restart");
+    expect(act({ openChildrenLanded: null })).toBe("restart");
+    expect(act({ openChildrenLanded: undefined })).toBe("restart");
+  });
+
+  it("still CLEARS a stale escalation on an epic that started moving again", () => {
+    expect(act({ alreadyEscalated: true, lastChildProgressAt: FRESH, openChildrenLanded: true })).toBe("clear");
+  });
+});

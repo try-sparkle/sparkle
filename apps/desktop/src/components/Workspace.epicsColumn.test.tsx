@@ -178,7 +178,7 @@ function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", labels: [], ...over } as Bead;
 }
 /** An epic with one child, so at least one ladder row has something to render. */
-const BEADS: Bead[] = [bead("ep-1"), bead("ep-1.a", { status: "in_progress" })];
+const BEADS: Bead[] = [bead("ep-1", { type: "epic" }), bead("ep-1.a", { status: "in_progress" })];
 
 function seedBeads() {
   useBeadsStore.setState({
@@ -422,11 +422,11 @@ describe("the epics column is mounted between the concierge and the build column
 describe("clicking an epic opens its card inline", () => {
   /** Three epics in ONE stage group, so "between this row and the next" is a real claim. */
   const MANY: Bead[] = [
-    bead("ep-1"),
+    bead("ep-1", { type: "epic" }),
     bead("ep-1.a", { status: "in_progress" }),
-    bead("ep-2"),
+    bead("ep-2", { type: "epic" }),
     bead("ep-2.a", { status: "in_progress" }),
-    bead("ep-3"),
+    bead("ep-3", { type: "epic" }),
     bead("ep-3.a", { status: "in_progress" }),
   ];
   function seedMany() {
@@ -539,9 +539,9 @@ describe("an epic that HAS a goal opens its card, exactly like one that does not
   // tell "the goal broke the click" apart from "clicks are broken for every epic", and testing the
   // plain one alone is the branch that already worked (AGENTS.md, the N-targets rule).
   const PAIR: Bead[] = [
-    bead("ep-goal"),
+    bead("ep-goal", { type: "epic" }),
     bead("ep-goal.a", { status: "in_progress" }),
-    bead("ep-plain"),
+    bead("ep-plain", { type: "epic" }),
     bead("ep-plain.a", { status: "in_progress" }),
   ];
   const rowFor = (id: string) => document.querySelector<HTMLElement>(`[data-epic-id="${id}"]`);
@@ -703,7 +703,7 @@ describe("the epic row's child ratio counts COMPLETED work, not remaining work",
   // `closed`, so work in flight must count as NOT done. A fixture using `open` for it would pass
   // for a rule that treated `in_progress` as finished.
   const MIXED: Bead[] = [
-    bead("ep-ratio"),
+    bead("ep-ratio", { type: "epic" }),
     bead("ep-ratio.a", { status: "closed" }),
     bead("ep-ratio.b", { status: "closed" }),
     bead("ep-ratio.c", { status: "in_progress" }),
@@ -737,7 +737,7 @@ describe("the epic row's child ratio counts COMPLETED work, not remaining work",
     // this rendered `3/3` and looked complete; it must now read `0/3` and look untouched, which is
     // the truth about it and the reason it has not moved off the build rung.
     const NONE: Bead[] = [
-      bead("ep-none"),
+      bead("ep-none", { type: "epic" }),
       bead("ep-none.a", { status: "in_progress" }),
       bead("ep-none.b", { status: "open" }),
       bead("ep-none.c", { status: "in_progress" }),
@@ -763,7 +763,7 @@ describe("the epic row's child ratio counts COMPLETED work, not remaining work",
     // own bead nobody closed, which is precisely the stamped-not-derived class of bug this whole
     // change is about.
     const ALL: Bead[] = [
-      bead("ep-all", { status: "in_progress" }),
+      bead("ep-all", { type: "epic", status: "in_progress" }),
       bead("ep-all.a", { status: "closed" }),
       bead("ep-all.b", { status: "closed" }),
     ];

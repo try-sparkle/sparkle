@@ -81,16 +81,14 @@ describe("revealFor", () => {
     expect(flashTargetId(null)).toBeNull();
   });
 
-  it("treats a bead with children as an epic even when its type says otherwise", () => {
-    // Epic-ness is STRUCTURAL here — `services/beads.isEpic` is "typed epic OR has children" — and
-    // several real epics carry `type: "task"` because nobody set the field. A reveal that trusted
-    // the type field would refuse to open those, which is the same class of bug that made a P0
-    // linkage bead invisible on the epic surface (sparkle-xelans).
-    const untypedParent = bead("par-1", { type: "task" });
+  it("does not reveal an untyped bead with a child as an epic — the child may be a follow-up", () => {
+    // `services/beads.isEpic` is the declared type alone (sparkle-8clekz): bd's parent edge also
+    // means follow-up-of, so a bug with a follow-up child has no epic row to open.
+    const untypedParent = bead("par-1", { type: "bug" });
     const kid = bead("par-1.a", { parent: "par-1" });
     expect(revealFor([untypedParent, kid], untypedParent.id)).toEqual({
-      kind: "epic",
-      epicId: untypedParent.id,
+      kind: "standalone",
+      beadId: untypedParent.id,
     });
   });
 });

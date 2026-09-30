@@ -1006,15 +1006,16 @@ describe("focusEpic / clearEpicFocus", () => {
       ...over,
     };
   }
-  /** A declared epic, a STRUCTURAL epic (children, never declared), and a plain task. */
+  /** Two declared epics, an UNTYPED parent (a bug with a follow-up child), and a plain task. */
   const EPIC = bead({ id: "sparkle-ep", type: "epic" });
-  const STRUCT = bead({ id: "sparkle-st" });
+  const EPIC2 = bead({ id: "", type: "epic" });
+  const STRUCT = bead({ id: "sparkle-st", type: "bug" });
   const KID = bead({ id: "", parent: "sparkle-st" });
   const TASK = bead({ id: "sparkle-tk" });
 
   beforeEach(() => {
     useBeadsStore.setState({
-      byProject: { p1: { beads: [EPIC, STRUCT, KID, TASK], board: {} as never, loadedAt: 1 } },
+      byProject: { p1: { beads: [EPIC, EPIC2, STRUCT, KID, TASK], board: {} as never, loadedAt: 1 } },
     } as never);
     useUiStore.setState({ epicFocusBySide: { left: null, right: null } } as never);
   });
@@ -1025,10 +1026,13 @@ describe("focusEpic / clearEpicFocus", () => {
     expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC.id);
   });
 
-  // MEMBERSHIP, NOT TYPE — a structural epic is one because something points at it.
-  it("accepts a STRUCTURAL epic that was never declared one", () => {
-    value(focusEpic(STRUCT.id));
-    expect(useUiStore.getState().epicFocusBySide.right).toBe(STRUCT.id);
+  // TYPE, NOT A CHILD EDGE (sparkle-8clekz) — a parent edge may be a follow-up, so a bug with a
+  // follow-up child is not a plan to narrow to.
+  it("refuses a bug that merely has a follow-up child", () => {
+    const r = focusEpic(STRUCT.id);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe("not-an-epic");
+    expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
   });
 
   it("refuses a bead that is not an epic — distinctly from one that does not exist", () => {
@@ -1080,7 +1084,7 @@ describe("focusEpic / clearEpicFocus", () => {
 
   it("reports the prior epic, so the change is reversible from its own result", () => {
     value(focusEpic(EPIC.id));
-    const v = value(focusEpic(STRUCT.id));
+    const v = value(focusEpic(EPIC2.id));
     expect(v.priorEpicId).toBe(EPIC.id);
     value(focusEpic(v.priorEpicId!));
     expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC.id);
