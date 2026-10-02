@@ -14,6 +14,7 @@
 // widen its union rather than inlining a fresh cast with a fresh explanation. Two divergent
 // sentences about the same jsdom quirk is exactly what consolidating it was meant to end.
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
+import { statusDotTitle } from "./statusDotTitle";
 
 /** `#34c759` → `rgb(52, 199, 89)`. jsdom normalizes inline colors to rgb(), so comparing against
  *  the raw token fails on FORM rather than on value — and a test that fails for the wrong reason
@@ -26,6 +27,41 @@ export function asRgb(hex: string): string {
 /** The rendered background of the StatusDot for `status`, as jsdom reports it. */
 export function expectedDotColor(status: AgentTabStatus): string {
   return asRgb(AGENT_STATUS[status].color);
+}
+
+/** THE TITLE A DISC IS PAINTED WITH, for a row in `status`.
+ *
+ *  ⚠️ THE COUNTERPART TO `expectedDotColor`, AND ITS ABSENCE WAS THE WHOLE DEFECT (bead
+ *  sparkle-uklivz). Colour had a helper; the title did not, so every assertion hardcoded one of the
+ *  candidate strings and got it right or wrong by luck. The disc renders exactly ONE title, chosen
+ *  by an override chain that ends in a fallback — so a `queryByTitle(...)` that names the OTHER
+ *  candidate returns `null` whether or not the row is in the state being ruled out. That is an
+ *  ABSENCE ASSERTION THAT CANNOT FAIL, and two shipped in this suite:
+ *  `AGENT_STATUS.blocked.label` ("Blocked") and `AGENT_STATUS.waiting.label` ("Needs you") are
+ *  never painted on a build row at all, because both statuses raise a founder-ask and the ask wins.
+ *
+ *  So never write `AGENT_STATUS[st].label` or `FOUNDER_ASK_LABEL[ask]` into a by-title query. Ask
+ *  for the status you mean and let this resolve it — through the SAME function `StatusDot` and
+ *  `AgentRow` paint from, so the test and the component cannot disagree about which string exists.
+ *
+ *  `dotLabel` is for the one row that has an override: an orchestrator head whose disc summarizes
+ *  its folded workers. Pass it to query that head, omit it for everything else.
+ *
+ *  THIS IS THE BUILD-ROW SURFACE (`AgentRow`), which overlays the founder-ask. For the Sparkle row,
+ *  the concierge row or the TopBar cluster use {@link expectedPlainDotTitle}. */
+export function expectedDotTitle(status: AgentTabStatus, dotLabel?: string): string {
+  return statusDotTitle({ status, dotLabel, withFounderAsk: true });
+}
+
+/** THE SAME QUESTION FOR A DISC THAT DOES NOT CARRY THE FOUNDER-ASK — the Sparkle row, the concierge
+ *  row, the TopBar cluster. Those report a machine's condition rather than the founder's next
+ *  action, so a red one hovers as "Errored", not "Needs unsticking".
+ *
+ *  Two helpers rather than one because the two surfaces genuinely paint different strings, and the
+ *  alternative is what this bead is about: a single helper that is right for one surface and quietly
+ *  wrong for the other, handing every query on the wrong surface a string painted nowhere. */
+export function expectedPlainDotTitle(status: AgentTabStatus, dotLabel?: string): string {
+  return statusDotTitle({ status, dotLabel });
 }
 
 /** THE COLOR A DISC IS PAINTED, whichever variant it is drawn in.

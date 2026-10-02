@@ -41,7 +41,12 @@
 
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AGENT_STATUS } from "../theme/colors";
+// BY RESOLVED TITLE, NOT BY `AGENT_STATUS[...].label` (bead sparkle-uklivz). The disc renders one
+// title chosen by an override chain, so a by-title query written from the taxonomy table is a guess
+// at which of the candidate strings will be painted — and for every red-tier status that guess is
+// wrong, which makes the ABSENCE half of these pairs trivially true. These rows are calm, so the
+// two spellings agree today; going through the resolver is what keeps them agreeing.
+import { expectedDotTitle } from "./statusDotTestUtils";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -400,8 +405,8 @@ describe("the indexed lookup changes cost, not behaviour", () => {
     for (const name of ["Agent 0", "Agent 29", "Agent 59"]) {
       const row = screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
       // Uncommitted changes is a LIFECYCLE cause: amber `lapsed`, not red.
-      expect(within(row).getByTitle(AGENT_STATUS.lapsed.label)).toBeTruthy();
-      expect(within(row).queryByTitle(AGENT_STATUS.idle.label)).toBeNull();
+      expect(within(row).getByTitle(expectedDotTitle("lapsed"))).toBeTruthy();
+      expect(within(row).queryByTitle(expectedDotTitle("idle"))).toBeNull();
     }
   });
 
@@ -419,10 +424,10 @@ describe("the indexed lookup changes cost, not behaviour", () => {
     render(<AgentSidebar project={project} />);
 
     const calm = screen.getByText("Agent 0").closest('[data-hint="agent"]') as HTMLElement;
-    expect(within(calm).getByTitle(AGENT_STATUS.idle.label)).toBeTruthy();
-    expect(within(calm).queryByTitle(AGENT_STATUS.lapsed.label)).toBeNull();
+    expect(within(calm).getByTitle(expectedDotTitle("idle"))).toBeTruthy();
+    expect(within(calm).queryByTitle(expectedDotTitle("lapsed"))).toBeNull();
 
     const owing = screen.getByText("Agent 1").closest('[data-hint="agent"]') as HTMLElement;
-    expect(within(owing).getByTitle(AGENT_STATUS.lapsed.label)).toBeTruthy();
+    expect(within(owing).getByTitle(expectedDotTitle("lapsed"))).toBeTruthy();
   });
 });

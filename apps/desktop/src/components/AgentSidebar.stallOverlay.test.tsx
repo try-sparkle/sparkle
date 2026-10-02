@@ -15,7 +15,7 @@
 // that the text "PR unmerged" appears inside that agent's row would not.
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AGENT_STATUS, C, DANGER, FONT_WEIGHT } from "../theme/colors";
+import { C, DANGER, FONT_WEIGHT } from "../theme/colors";
 import { alertControlKind } from "../engine/alertDismissal";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -53,7 +53,11 @@ import type { AgentGoal } from "../engine/agentGoal";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 import { openAgentCard } from "../testing/rowGestures";
-import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
+// NO `AGENT_STATUS` / `FOUNDER_ASK_LABEL` IMPORT, and that is deliberate (bead sparkle-uklivz):
+// a by-title query written from either table is a guess at which of the two candidate strings the
+// disc will paint, and two such guesses in this file were wrong and silently green. `expectedDotTitle`
+// is the one spelling — it names the STATUS and resolves it through the function the disc paints from.
+import { expectedDotTitle } from "./statusDotTestUtils";
 
 const CLEAN_BS: BranchStatus = {
   ahead: 0,
@@ -268,10 +272,15 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // causes is his to clear (the agent commits its own dirty tree; auto-continue is still driving
     // the unmet goal), so it leaves calm into AMBER rather than red. The rule never named a colour,
     // only that a row owing work must not look finished.
-    expect(within(row).getByTitle(AGENT_STATUS.lapsed.label)).toBeTruthy();
+    //
+    // EVERY QUERY HERE GOES THROUGH `expectedDotTitle` (bead sparkle-uklivz) — the resolver the
+    // disc itself paints from — rather than spelling a label out. These three happen to name calm
+    // statuses, which raise no founder-ask and so DO paint their taxonomy label; the point is that
+    // the test does not have to know that, and stays correct if the chain ever changes underneath it.
+    expect(within(row).getByTitle(expectedDotTitle("lapsed"))).toBeTruthy();
     // The half that would break if amber quietly became calm: the row must NOT wear a gray label.
-    expect(within(row).queryByTitle(AGENT_STATUS.idle.label)).toBeNull();
-    expect(within(row).queryByTitle(AGENT_STATUS.done.label)).toBeNull();
+    expect(within(row).queryByTitle(expectedDotTitle("idle"))).toBeNull();
+    expect(within(row).queryByTitle(expectedDotTitle("done"))).toBeNull();
   });
 
   it("still says WHAT is outstanding once it has left the calm tier", () => {
@@ -370,12 +379,14 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     //    "Needs merge". ACKNOWLEDGING IS NOT RESOLVING: the chip naming the outstanding work is still
     //    there, so the row still does not read as finished.
     const after = rowFor("Stalled One");
-    // BY THE ASK, for the reason spelled out in the paired negative below: a build row's disc never
-    // carries `AGENT_STATUS.blocked.label`, so asserting THAT absence passes on a red row too. This
-    // line predates roborev 65672 and had the same dead lookup; it is the one that has to fail if a
-    // dismissal ever stops de-escalating the row.
-    expect(within(after).queryByTitle(FOUNDER_ASK_LABEL.unstick)).toBeNull();
-    expect(within(after).getByTitle(AGENT_STATUS.unmerged.label)).toBeTruthy();
+    // THROUGH THE RESOLVER, for the reason spelled out in the paired negative below: a build row's
+    // disc never carries `AGENT_STATUS.blocked.label`, so asserting THAT absence passes on a red row
+    // too. This line predates roborev 65672 and had the same dead lookup; it is the one that has to
+    // fail if a dismissal ever stops de-escalating the row. It no longer spells the ask out either
+    // (bead sparkle-uklivz): `expectedDotTitle("blocked")` asks for the STATUS being ruled out and
+    // lets the one resolver say which of the candidate strings that status actually paints.
+    expect(within(after).queryByTitle(expectedDotTitle("blocked"))).toBeNull();
+    expect(within(after).getByTitle(expectedDotTitle("unmerged"))).toBeTruthy();
     expect(within(after).getByTestId("row-notice-glyph")).toBeTruthy();
     // 4. …and Re-enable is offered, so the dismissal is undoable from the UI.
     expect(alertControlKind(alertOf(), "blocked")).toBe("reenable");
@@ -442,22 +453,24 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // is still raised, so the row keeps its own band, its label and its mark.
     //
     // ⚠️ ORDER IS LOAD-BEARING HERE, and that is the whole of roborev 65695. `StatusDot` renders
-    // exactly ONE title — `label ?? AGENT_STATUS[status].label` — so on this row the amber label and
+    // exactly ONE title — `statusDotTitle({status, dotLabel})` — so on this row the amber label and
     // the red ask are mutually exclusive: whichever is present, the other is absent. Written
     // positive-first, `getByTitle(lapsed)` THROWS in every world the absence could have caught, so
     // the absence never executed and was an assertion that could not fail. Absence FIRST fixes that
     // without weakening anything: in the regression this pair is named for it is the line that
     // fires, and it names the red ask in the failure message, which is the more legible red.
     const row = rowFor("Stalled One");
-    // RED IS QUERIED BY THE ASK, never by `AGENT_STATUS.blocked.label` (roborev 65672). `AgentRow`
-    // renders a build row's disc as `dotLabel ?? FOUNDER_ASK_LABEL[ask]` and `askFor("blocked")` is
-    // "unstick", so a red row's disc title is "Needs unsticking" and the status label appears
-    // NOWHERE on a build row in either tier — asserting ITS absence could not fail either.
-    expect(within(row).queryByTitle(FOUNDER_ASK_LABEL.unstick)).toBeNull();
+    // RED IS QUERIED BY THE STATUS AND RESOLVED (roborev 65672, bead sparkle-uklivz), never by
+    // `AGENT_STATUS.blocked.label` and no longer by spelling the ask out either. `statusDotTitle`
+    // folds `askFor("blocked") === "unstick"` in, so a red row's disc title is "Needs unsticking"
+    // and the status label appears NOWHERE on a build row in either tier — asserting ITS absence
+    // could not fail. Naming the status and resolving it is the only spelling that survives the
+    // chain changing.
+    expect(within(row).queryByTitle(expectedDotTitle("blocked"))).toBeNull();
     // …and then the positive, which is what rules out every OTHER band — gray, unlabelled, or a
     // future one — since `getBy` throws on a miss. Absence alone would pass on a row with no dot to
     // paint at all; this is the line that stops that.
-    expect(within(row).getByTitle(AGENT_STATUS.lapsed.label)).toBeTruthy();
+    expect(within(row).getByTitle(expectedDotTitle("lapsed"))).toBeTruthy();
     // NO GRAY-ABSENCE LINE HERE, and its removal is the finding rather than an omission (roborev
     // 65682). It read `queryByTitle(AGENT_STATUS.idle.label)).toBeNull()` under a comment claiming
     // it was "live where the red one was not". It was not: `ahead: 3` + `BARE_WS` makes
@@ -507,11 +520,11 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // The dot is RED — established first, because the whole finding is that the WORDS disagreed
     // with THIS. Without it the chip assertion below is just a string check.
     //
-    // FOUND BY ITS ASK, NOT BY `AGENT_STATUS.blocked.label`: a blocked row's disc hovers as the
-    // founder-ask ("Needs unsticking"), because `AgentRow` overrides the dot label with
-    // `dotLabel ?? FOUNDER_ASK_LABEL[...]`. The COLOUR is still the red `blocked` tier, which is
-    // what this line is about — the same lookup `AgentSidebar.liveStatusDots.test.tsx` uses.
-    expect(within(row).getByTitle(FOUNDER_ASK_LABEL.unstick)).toBeTruthy();
+    // FOUND BY ITS RESOLVED TITLE, NOT BY `AGENT_STATUS.blocked.label`: a blocked row's disc hovers
+    // as the founder-ask ("Needs unsticking"), because `statusDotTitle` prefers the ask over the
+    // taxonomy label. The COLOUR is still the red `blocked` tier, which is what this line is about —
+    // the same lookup `AgentSidebar.liveStatusDots.test.tsx` uses.
+    expect(within(row).getByTitle(expectedDotTitle("blocked"))).toBeTruthy();
 
     openAgentCard(row);
     const chip = within(screen.getByTestId("agent-hover-card")).getByTestId("row-stall");
@@ -541,9 +554,21 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
         })}
       />,
     );
-    // Nothing escalated it: no red-tier label anywhere in the row. Asserted as an absence because
-    // the dot's own label can be overridden by the worker-rollup, which is a different question.
-    expect(within(rowFor("Finished One")).queryByTitle(AGENT_STATUS.blocked.label)).toBeNull();
+    const row = rowFor("Finished One");
+    // ⚠️ THIS LINE READ `queryByTitle(AGENT_STATUS.blocked.label)` AND COULD NOT FAIL (bead
+    // sparkle-uklivz). A build row's disc resolves `blocked` to its founder-ask, so the string
+    // "Blocked" is painted on NO row in ANY world — the query returned `null` over a screaming red
+    // row exactly as it did over this calm one, and the control this test exists to be was inert.
+    // Resolved, it asks the question it always meant to: nothing red-tier is on this row.
+    // `expectedDotTitle("errored")` resolves to the same ask, so one line covers both stuck reds.
+    expect(within(row).queryByTitle(expectedDotTitle("blocked"))).toBeNull();
+    // …AND THE POSITIVE, which is what the absence alone cannot give. A row that painted no disc at
+    // all — or painted one with no title — satisfies every absence on this page; only a `getBy`
+    // throws on that, and only naming the gray it should be rules out amber and red together.
+    // `idle` rather than `done`: this row finished its turn and merged, and `done` is reserved for
+    // the agent that also EXITED. Both are gray, and asserting the one the row is actually in is
+    // what makes the line a check rather than a second way of saying "not red".
+    expect(within(row).getByTitle(expectedDotTitle("idle"))).toBeTruthy();
   });
 });
 
@@ -628,7 +653,18 @@ describe("the RED tier gets no second alarm", () => {
     const row = rowFor("Busy One");
     const alertOf = () =>
       useProjectStore.getState().projects[0]!.agents.find((a) => a.id === "busy")?.alert;
-    expect(within(row).queryByTitle(AGENT_STATUS.waiting.label)).toBeNull();
+    // ⚠️ AND THIS ONE COULD NOT FAIL EITHER, for the same reason (bead sparkle-uklivz): it read
+    // `queryByTitle(AGENT_STATUS.waiting.label)`, and `askFor("waiting")` is `answer`, so a build
+    // row in `waiting` hovers as "Answer a question ›" and "Needs you" is painted nowhere. The very
+    // setup this block was added to assert — that the dismissal LANDED — was being checked by a line
+    // that held whether it landed or not. Resolved through `expectedDotTitle`, it is now the check
+    // it claims to be.
+    expect(within(row).queryByTitle(expectedDotTitle("waiting"))).toBeNull();
+    // …and the positive, which is the half the absence cannot carry: a dismissed row is not a row
+    // with no disc. `withDismissedAlerts` rewrites the suppressed `waiting` to the calm `idle`, and
+    // that is what the disc hovers as — so a row that lost its disc entirely, or that landed in some
+    // third band, can no longer slip past the absence above.
+    expect(within(row).getByTitle(expectedDotTitle("idle"))).toBeTruthy();
     expect(alertControlKind(alertOf(), "waiting")).toBe("reenable");
 
     // …and only now is the absence meaningful: the row is calm, so `isQuiet` accepts it, and the chip

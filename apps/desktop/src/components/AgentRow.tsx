@@ -25,7 +25,10 @@ import {
   FiMessageSquare,
   FiMonitor,
 } from "react-icons/fi";
-import { C, AGENT_STATUS, FONT_WEIGHT } from "../theme/colors";
+// NO `AGENT_STATUS` — every status PHRASE this file paints now comes from `statusDotTitle`
+// (bead sparkle-uklivz), so there is no second table to read a label out of and no way for the
+// glyph and the disc to name one red row two different things.
+import { C, FONT_WEIGHT } from "../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { anchoredScrollTop } from "./anchoredScroll";
 import { useProjectStore } from "../stores/projectStore";
@@ -41,6 +44,7 @@ import { refreshAgentBranch } from "../services/branchStatus";
 import { cachedReceipt } from "../services/retroReceipts";
 import { retirementPill } from "../engine/retirementReadiness";
 import { askFor, FOUNDER_ASK_LABEL, FOUNDER_ASK_DETAIL } from "../engine/founderAsk";
+import { statusDotTitle } from "./statusDotTitle";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import {
   DEPTH_INDENT,
@@ -1808,11 +1812,11 @@ export const AgentRow = memo(function AgentRow({
               // condition ("Blocked", "Needs you"); the ask describes the FOUNDER's next action,
               // which is what he was missing. Falls back to the status label for every calm row,
               // where there is no ask and the condition is the only thing to say.
-              title={
-                founderAsk
-                  ? `${a.kind} — ${FOUNDER_ASK_LABEL[founderAsk]}`
-                  : `${a.kind} — ${AGENT_STATUS[st].label}`
-              }
+              // Resolved through `statusDotTitle` — the same function the disc below uses — so the
+              // glyph and the disc cannot drift into naming a red row two different things. No
+              // `dotLabel` here on purpose: that override describes a rollup SUBTREE, and this slot
+              // renders INSTEAD of the disc on a shell row, which has none.
+              title={`${a.kind} — ${statusDotTitle({ status: st, withFounderAsk: true })}`}
               style={{
                 fontSize: 12,
                 // STATUS-inked, and it has to be. A shell row renders this glyph INSTEAD of a disc
@@ -1835,12 +1839,19 @@ export const AgentRow = memo(function AgentRow({
             // The disc hovers as the ASK when there is one, so the scannable row is not the one
             // surface that still says only "Blocked". `dotLabel` (the orchestrator rollup override)
             // still wins where it is set — it describes a SUBTREE, which the row's own ask does not.
+            //
+            // THE WHOLE PRECEDENCE IS RESOLVED HERE, ONCE, and handed down already-decided (bead
+            // sparkle-uklivz). It used to be half-resolved on this line and half inside `StatusDot`,
+            // so no single site could say which of the two candidate strings a given row would
+            // paint — and a test querying the disc BY TITLE got `null` whichever way it guessed.
+            // `withFounderAsk` is what makes this the BUILD-ROW surface: the Sparkle row and the
+            // concierge row stay on the taxonomy label.
             <StatusDot
               status={st}
               size={DOT_SIZE}
               color={dotColor}
               variant={dotRing ? "ring" : "fill"}
-              label={dotLabel ?? (founderAsk ? FOUNDER_ASK_LABEL[founderAsk] : undefined)}
+              label={statusDotTitle({ status: st, dotLabel, withFounderAsk: true })}
             />
           )}
         </div>

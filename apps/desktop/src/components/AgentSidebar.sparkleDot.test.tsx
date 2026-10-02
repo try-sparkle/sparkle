@@ -14,7 +14,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
-import { asRgb, dotInk } from "./statusDotTestUtils";
+import { asRgb, dotInk, expectedPlainDotTitle } from "./statusDotTestUtils";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -251,7 +251,12 @@ describe("a red row", () => {
     render(<AgentSidebar project={seedProject({ [SPARKLE_AGENT_ID]: "errored" })} />);
 
     expect(dotInk(sparkleDisc())).toBe(asRgb(AGENT_STATUS.errored.color));
-    expect(hover()).toBe(AGENT_STATUS.errored.label);
+    // `expectedPlainDotTitle`, not `expectedDotTitle` (bead sparkle-uklivz): the Sparkle row does NOT
+    // carry the founder-ask overlay a build row does, so a red disc here hovers as the machine's
+    // condition ("Errored") rather than the founder's next action ("Needs unsticking"). Pinned
+    // through the resolver so the distinction is a claim this line grips — folding the ask in for
+    // every surface reds here, which is how that regression was caught.
+    expect(hover()).toBe(expectedPlainDotTitle("errored"));
   });
 });
 
@@ -280,6 +285,6 @@ describe("the hard rule", () => {
     // The overlay may only add fidelity it has actually observed; with nothing observed the
     // taxonomy label stands, unchanged.
     render(<AgentSidebar project={seedProject({ [SPARKLE_AGENT_ID]: "working" })} />);
-    expect(hover()).toBe(AGENT_STATUS.working.label);
+    expect(hover()).toBe(expectedPlainDotTitle("working"));
   });
 });

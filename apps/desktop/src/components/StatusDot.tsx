@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { AGENT_STATUS } from "@sparkle/ui";
 import type { AgentTabStatus } from "../types";
+import { statusDotTitle } from "./statusDotTitle";
 
 /**
  * A colored mark conveying an agent tab's status (spec §6).
@@ -55,12 +56,17 @@ export const StatusDot = memo(function StatusDot({
 }) {
   const meta = AGENT_STATUS[status];
   const half = shape === "half";
-  const text = label ?? meta.label;
+  // ONE resolver, shared with `AgentRow` and with the tests (`statusDotTitle`, bead sparkle-uklivz).
+  // It used to be `label ?? meta.label` here and `dotLabel ?? FOUNDER_ASK_LABEL[ask]` two files
+  // away, so no single site could say which of the two strings a given row would paint — and a test
+  // querying the disc BY TITLE got `null` both when the row was calm and when it was red under the
+  // other spelling. `label` arrives already-resolved from `AgentRow`, and passing it back in as the
+  // override is what makes that composition a no-op rather than a second chain.
   const ink = color ?? meta.color;
   const ring = variant === "ring";
   return (
     <span
-      title={half ? `${text} (sub-agent)` : text}
+      title={statusDotTitle({ status, dotLabel: label, shape })}
       style={{
         display: "inline-block",
         // A "D": square left corners (flat diameter), fully rounded right corners (the bulge).
