@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   assignToSide,
-  otherSide,
   pairCountFor,
+  pairCountForLayout,
+  CONCIERGE_LAYOUTS,
+  isConciergeLayout,
+  inferConciergeLayout,
+  assignmentForLayout,
+  geometrySideOf,
+  effectiveConciergeLayout,
   projectsOnSide,
   pruneAssignment,
   resolveSideSelection,
@@ -126,9 +132,56 @@ describe("resolveSideSelection", () => {
   });
 });
 
-describe("otherSide", () => {
-  it("is an involution", () => {
-    expect(otherSide("left")).toBe("right");
-    expect(otherSide(otherSide("left"))).toBe("left");
+// ── THE CONCIERGE LAYOUT (Settings → Appearance → Layout, epic sparkle-5ua3br) ─────────────────
+describe("concierge layout", () => {
+  it("only CENTER has two pairs", () => {
+    expect(pairCountForLayout("center")).toBe(2);
+    expect(pairCountForLayout("left")).toBe(1);
+    expect(pairCountForLayout("right")).toBe(1);
+  });
+
+  it("recognises exactly the three layouts", () => {
+    for (const l of CONCIERGE_LAYOUTS) expect(isConciergeLayout(l)).toBe(true);
+    for (const v of ["", "middle", null, undefined, 2, {}]) expect(isConciergeLayout(v)).toBe(false);
+    // The founder's order: right, center, left.
+    expect(CONCIERGE_LAYOUTS).toEqual(["right", "center", "left"]);
+  });
+
+  // THE UPGRADE PATH: a window keeps the shape it already had on the build that adds the picker.
+  it("infers CENTER for a window that had a left pair open, LEFT for every other", () => {
+    expect(inferConciergeLayout({ p1: "left" })).toBe("center");
+    expect(inferConciergeLayout({})).toBe("left");
+    expect(inferConciergeLayout(undefined)).toBe("left");
+    expect(inferConciergeLayout("garbage")).toBe("left");
+    // A non-left entry is not a left pair.
+    expect(inferConciergeLayout({ p1: "right" })).toBe("left");
+  });
+
+  it("clears left assignments for a one-pair layout and keeps them for CENTER", () => {
+    const a = { p1: "left" } as const;
+    expect(assignmentForLayout(a, "center")).toBe(a);
+    expect(assignmentForLayout(a, "left")).toEqual({});
+    expect(assignmentForLayout(a, "right")).toEqual({});
+    // Identity on a no-op, so the shell does not re-render and remount panes.
+    const empty = {};
+    expect(assignmentForLayout(empty, "left")).toBe(empty);
+  });
+
+  it("draws the single pair MIRRORED in the concierge-right layout, and nowhere else", () => {
+    expect(geometrySideOf("right", "right")).toBe("left");
+    expect(geometrySideOf("right", "left")).toBe("right");
+    expect(geometrySideOf("right", "center")).toBe("right");
+    expect(geometrySideOf("left", "center")).toBe("left");
+  });
+
+  // THE MOUNT INVARIANT OUTRANKS THE PREFERENCE — a left-assigned project always has a stage.
+  it("forces CENTER while any project is assigned left, and is the identity otherwise", () => {
+    expect(effectiveConciergeLayout("left", P("a", "b"), { b: "left" })).toBe("center");
+    expect(effectiveConciergeLayout("right", P("a", "b"), { b: "left" })).toBe("center");
+    expect(effectiveConciergeLayout("left", P("a"), {})).toBe("left");
+    expect(effectiveConciergeLayout("right", P("a"), {})).toBe("right");
+    expect(effectiveConciergeLayout("center", P("a"), {})).toBe("center");
+    // A stale entry for a project that no longer exists does not force anything.
+    expect(effectiveConciergeLayout("right", P("a"), { gone: "left" })).toBe("right");
   });
 });

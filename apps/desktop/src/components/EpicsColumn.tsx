@@ -106,6 +106,7 @@ import {
 import { epicDropPlan, type EpicDropPlan } from "../services/epicDrop";
 import { applyEpicDrop } from "../services/applyEpicDrop";
 import { resolveEpicPrdPath, useEpicPrdIndex } from "../services/epicPrd";
+import { useGeometrySide } from "../hooks/useGeometrySide";
 
 /** How much room the ladder leaves for the pull tab on the seam side. The rail is 6px and the grip
  *  chiclet overhangs it slightly, so 10 clears both without eating a readable amount of a 280px
@@ -287,6 +288,8 @@ export function EpicsColumn({
   covered?: boolean;
 }) {
   const windowWidth = useWindowWidth();
+  // The side this column is DRAWN as — only direction decisions read it. See useGeometrySide.
+  const geoSide = useGeometrySide(side);
   const zoomColumn = zoomColumnFor("epics", side);
   const columnZoom = useColumnZoom(zoomColumn);
 
@@ -894,7 +897,7 @@ export function EpicsColumn({
           overflowY: "auto",
           overflowX: "hidden",
           minHeight: 0,
-          [side === "right" ? "paddingRight" : "paddingLeft"]: SEAM_CLEARANCE,
+          [geoSide === "right" ? "paddingRight" : "paddingLeft"]: SEAM_CLEARANCE,
         }}
       >
         {!project && <EmptyNote>Nothing assigned to this side yet.</EmptyNote>}
@@ -1131,7 +1134,7 @@ export function EpicsColumn({
           position: "absolute",
           top: 0,
           bottom: 0,
-          [side === "right" ? "right" : "left"]: 0,
+          [geoSide === "right" ? "right" : "left"]: 0,
           width: 6,
           display: "flex",
           alignItems: "stretch",
@@ -1151,7 +1154,7 @@ export function EpicsColumn({
           // CONCIERGE. Right pair: drag right, away from the concierge, to grow. Left pair: drag
           // left, away from the concierge, to grow. The gesture is the same physical motion on both
           // sides of the row, which is what "mirrored exactly" has to mean for a drag.
-          grows={side === "right" ? "left" : "right"}
+          grows={geoSide === "right" ? "left" : "right"}
           cssVar={epicsWidthVar(side)}
           // ZOOM-CANCELLED, and it is the SAME expression `AgentSidebar` uses on its own tab — this
           // rail sits inside the element carrying `zoom: columnZoom`, so its painted offset is

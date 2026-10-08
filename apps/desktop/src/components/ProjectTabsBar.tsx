@@ -65,6 +65,7 @@ import {
 import { useTornOutProjects } from "../hooks/useTornOutProjects";
 import type { PairSide } from "../engine/cable";
 import { C } from "../theme/colors";
+import { useGeometrySide } from "../hooks/useGeometrySide";
 
 /**
  * Where to put a satellite torn out at `screenPoint`.
@@ -439,8 +440,9 @@ export function ProjectTabsBar({
     }
   };
 
+  const geoSide = useGeometrySide(side);
   return (
-    <div className="ptabstrip" data-side={side} data-testid="project-tabs-strip">
+    <div className="ptabstrip" data-side={geoSide} data-testid="project-tabs-strip">
       <ProjectTabs
         // `rootPath` travels with the tab because the stale badge's panel diagnoses and remedies a
         // DIRECTORY — the badge could always say "1,935 behind", but nothing downstream of it knew
@@ -449,7 +451,8 @@ export function ProjectTabsBar({
         // The left strip paints right-to-left (index.css `.ptabstrip[data-side="left"]`), so the
         // drag resolver has to be told: it compares screen x against tabs given in ARRAY order, and
         // those two disagree exactly when the flow is reversed.
-        reversed={side === "left"}
+        // DRAWN side, not data side: in the concierge-right layout the right strip is mirrored too.
+        reversed={geoSide === "left"}
         selectedProjectId={selectedProjectId}
         pinnedProjectId={pinnedProjectId}
         countsByProject={countsFromFeed(feed)}

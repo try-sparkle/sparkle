@@ -186,8 +186,11 @@ async function mount() {
   });
 }
 
+// A left pair exists only in the concierge-CENTER layout, and the store refuses a left assignment
+// outside it — so sending a project left means choosing CENTER first (epic sparkle-5ua3br).
 const assign = (projectId: string, side: "left" | "right") =>
   act(() => {
+    if (side === "left") useUiStore.getState().setConciergeLayout("center");
     useUiStore.getState().assignProjectToPair(projectId, side);
     if (side === "left") useUiStore.getState().setLeftProject(projectId);
   });
@@ -272,8 +275,9 @@ describe("CLOSING A PAIR is lossless for every project on it", () => {
     expect([...pty.kills.values()]).toEqual([]);
     const tokens = AGENTS.map((id) => pty.instances.get(id));
 
-    assign("p1", "right");
-    assign("p2", "right");
+    // Closing the left pair is choosing a one-pair layout now (Settings → Appearance → Layout),
+    // which sends every left project back in one write.
+    act(() => useUiStore.getState().setConciergeLayout("left"));
 
     // The left pair is gone…
     expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("1");
@@ -285,6 +289,21 @@ describe("CLOSING A PAIR is lossless for every project on it", () => {
       expect(pty.spawns.get(id)).toBe(1);
       expect(stageOf(id)).toBe("terminal-stage");
     }
+  });
+
+  // THE LAYOUT PICKER (Settings → Appearance → Layout, epic sparkle-5ua3br) must be as lossless as
+  // a pair move. RIGHT draws the single pair BEFORE the concierge with CSS `order` rather than by
+  // re-parenting it in JSX — measured here at the PTY, the thing a remount actually destroys.
+  it("cycles every concierge layout with no PTY killed or respawned", async () => {
+    await mount();
+    const tokens = AGENTS.map((id) => pty.instances.get(id));
+    for (const layout of ["right", "center", "left", "right", "left"] as const) {
+      act(() => useUiStore.getState().setConciergeLayout(layout));
+      expect(screen.getByTestId("workspace-shell").getAttribute("data-concierge-layout")).toBe(layout);
+    }
+    expect([...pty.kills.values()]).toEqual([]);
+    expect(AGENTS.map((id) => pty.instances.get(id))).toEqual(tokens);
+    for (const id of AGENTS) expect(pty.spawns.get(id)).toBe(1);
   });
 });
 

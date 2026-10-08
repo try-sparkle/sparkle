@@ -37,7 +37,15 @@ import type { StatusBand } from "../engine/buildSections";
 // TYPE-ONLY for the same reason as StatusBand above: voice/sendMode pulls in components/MicButton
 // for `MicIntent`, which reaches theme/colors — and theme/theme.ts imports this store.
 import type { SendMode } from "../voice/sendMode";
-import { assignToSide, pruneAssignment, type PairSide } from "../engine/pairs";
+import {
+  assignToSide,
+  assignmentForLayout,
+  inferConciergeLayout,
+  isConciergeLayout,
+  pruneAssignment,
+  type ConciergeLayout,
+  type PairSide,
+} from "../engine/pairs";
 // THE work-mode union, declared once in `engine/workMode` and re-exported below for the callers
 // that import it from here. Type-only, so it is erased and cannot participate in a cycle (that
 // module imports nothing at all, so there is no cycle to participate in either).
@@ -740,6 +748,15 @@ interface UiState {
   // Persisted, because which side a project sits on is a deliberate arrangement of the user's
   // workspace, not a transient view state. The rules live in the engine; the store holds the value.
   pairAssignment: Record<string, PairSide>;
+  // WHERE THE CONCIERGE SITS — Settings → Appearance → Layout (engine/pairs `ConciergeLayout`).
+  // Persisted: it is the user's deliberate arrangement of the window, and a relaunch that changed it
+  // would be the exact "a side of the window silently vanished" defect this field exists to end.
+  // A blob that predates it is repaired in `merge` from its `pairAssignment`, so an upgrade keeps
+  // each window's shape.
+  conciergeLayout: ConciergeLayout;
+  /** Choose a layout. A one-pair layout sends every left-assigned project back to the right in the
+   *  SAME write, so no project is ever assigned to a pair that is not on screen. */
+  setConciergeLayout: (layout: ConciergeLayout) => void;
   /** Move a project to a side. A no-op assignment must not churn the map — see engine/pairs. */
   assignProjectToPair: (projectId: string, side: PairSide) => void;
   /** Drop entries for projects that no longer exist, so a stale one cannot strand an empty pair. */
@@ -1223,8 +1240,19 @@ export const useUiStore = create<UiState>()(
       // a no-op. That identity is load-bearing, not tidiness: `Workspace` partitions its live pane
       // list through this map, so a fresh-but-equal object re-renders the stages and REMOUNTS panes
       // that never moved — and a Terminal unmount kills its PTY.
+      conciergeLayout: "left",
+      setConciergeLayout: (layout) =>
+        set((s) => {
+          const next = assignmentForLayout(s.pairAssignment, layout);
+          return next === s.pairAssignment
+            ? { conciergeLayout: layout }
+            : { conciergeLayout: layout, pairAssignment: next };
+        }),
       assignProjectToPair: (projectId, side) =>
         set((s) => {
+          // No left pair on screen in a one-pair layout, so nothing may be assigned to it — the
+          // project's panes would have no stage to portal into.
+          if (side === "left" && s.conciergeLayout !== "center") return {};
           const next = assignToSide(s.pairAssignment, projectId, side);
           return next === s.pairAssignment ? {} : { pairAssignment: next };
         }),
@@ -1342,6 +1370,18 @@ export const useUiStore = create<UiState>()(
         // reaches `term.options.fontSize`, and blanks that column's terminal on every launch until
         // localStorage is edited by hand.
         if ("zoomByColumn" in stored) stored.zoomByColumn = repairZoomByColumn(stored.zoomByColumn);
+        // THE ONE KEY THIS MERGE ADDS RATHER THAN ONLY REPAIRS, and deliberately: a blob written
+        // before the layout picker existed must come up in the layout it was ALREADY showing, which
+        // only its `pairAssignment` can say. The store default ("left") would close the left pair
+        // on every upgrading window that had one open. A garbage value is re-inferred the same way.
+        if (!isConciergeLayout(stored.conciergeLayout)) {
+          stored.conciergeLayout = inferConciergeLayout(stored.pairAssignment);
+        }
+        // And the two must agree on the way in: a one-pair layout carrying left assignments (a
+        // hand-edited blob, or a build that wrote one without the other) would strand those panes.
+        if (stored.conciergeLayout !== "center" && "pairAssignment" in stored) {
+          stored.pairAssignment = {};
+        }
         return { ...current, ...(stored as Partial<UiState>) };
       },
     },

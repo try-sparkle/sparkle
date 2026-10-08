@@ -100,6 +100,7 @@ import {
   NOTICE_GLYPH_ICON,
   RETIRE_COPY,
 } from "./rowAttentionChrome";
+import { useGeometrySide } from "../hooks/useGeometrySide";
 
 /**
  * One agent row. Collapsed (default) it shows: the kind glyph, the status dot, the width-fitted
@@ -2629,6 +2630,8 @@ export const AgentRow = memo(function AgentRow({
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
   const showOverlay = hover && !editing;
+  // The DRAWN side — differs from `paneSide` only in the concierge-right layout. See useGeometrySide.
+  const geoSide = useGeometrySide(paneSide);
 
   // WHICH END OF THIS ROW OPENS INTO WHAT — see engine/rowGeometry. `filletEnds` is pulled out
   // because it names the ends to draw a mouth at, not a CSS property to spread onto the box.
@@ -2637,7 +2640,7 @@ export const AgentRow = memo(function AgentRow({
   // row's own rect, so it has to reproduce THIS row's content offset rather than a constant. See
   // the card strip's padding.
   const { filletEnds, padLeft: rowPadLeft, padRight: rowPadRight, ...boxStyle } = rowBoxFor({
-    paneSide,
+    paneSide: geoSide,
     jointOpen,
     isActive,
     depthIndent: depth * DEPTH_INDENT,
@@ -2795,7 +2798,7 @@ export const AgentRow = memo(function AgentRow({
             pinned Improve Sparkle row draws from too, so the two can never drift apart. Suppressed
             HERE while the card is open (showOverlay): the row is no longer visibility:hidden, so
             these would otherwise show through beside the stand-in card. */}
-        {!showOverlay && <ActiveFillets ends={filletEnds} paneSide={paneSide} />}
+        {!showOverlay && <ActiveFillets ends={filletEnds} paneSide={geoSide} />}
         {/* Drop target — live only while a drag is in flight, only on top-level rows, and only when
             the drag STARTED in this row's own section. Moving a row between sections is not a thing
             the user can do: a row's section is derived from its git state, so "drag it into Merged"

@@ -573,6 +573,10 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // re-asked every launch — and it is a SEPARATE switch from the rail above on purpose: arming
     // auto-send costs nothing, while this spends the user's own Claude subscription quota.
     "conciergeAutoSendTuner",
+    // Where the concierge sits (Settings → Appearance → Layout, epic sparkle-5ua3br). Persisted
+    // because a layout that reset on relaunch IS the defect the picker exists to end: a side of the
+    // window silently gone.
+    "conciergeLayout",
     // Closable project tabs: which projects have a tab MUST survive a relaunch, or every close
     // would silently undo itself on the next launch. Its default is `null` (never seeded = every
     // project open), which is serializable, so it shows up in the blob from the very first write.
@@ -1035,5 +1039,88 @@ describe("uiStore epic focus — toggle vs idempotent open", () => {
     const before = useUiStore.getState().epicFocusBySide;
     useUiStore.getState().openEpicFocus("right", "ep-1");
     expect(useUiStore.getState().epicFocusBySide).toBe(before);
+  });
+});
+
+// ── THE CONCIERGE LAYOUT (epic sparkle-5ua3br) ──────────────────────────────────────────────────
+describe("uiStore conciergeLayout", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ conciergeLayout: "left", pairAssignment: {}, leftProjectId: null });
+  });
+
+  it("defaults to LEFT — the single-pair layout a fresh install has always had", () => {
+    expect(useUiStore.getState().conciergeLayout).toBe("left");
+  });
+
+  it("sends every left project back to the right when a one-pair layout is chosen", () => {
+    for (const layout of ["left", "right"] as const) {
+      useUiStore.setState({ conciergeLayout: "center", pairAssignment: { a: "left", b: "left" } });
+      useUiStore.getState().setConciergeLayout(layout);
+      expect(useUiStore.getState().conciergeLayout).toBe(layout);
+      expect(useUiStore.getState().pairAssignment).toEqual({});
+    }
+  });
+
+  it("keeps the left pair's projects where they are when CENTER is chosen", () => {
+    useUiStore.setState({ conciergeLayout: "center", pairAssignment: { a: "left" } });
+    useUiStore.getState().setConciergeLayout("center");
+    expect(useUiStore.getState().pairAssignment).toEqual({ a: "left" });
+  });
+
+  it("refuses a LEFT assignment outside CENTER, and allows it inside", () => {
+    useUiStore.getState().setConciergeLayout("left");
+    useUiStore.getState().assignProjectToPair("a", "left");
+    expect(useUiStore.getState().pairAssignment).toEqual({});
+    useUiStore.getState().setConciergeLayout("center");
+    useUiStore.getState().assignProjectToPair("a", "left");
+    expect(useUiStore.getState().pairAssignment).toEqual({ a: "left" });
+  });
+
+  // THE UPGRADE: a blob written before the picker existed keeps the shape its window already had.
+  it("rehydrates a pre-picker blob WITH a left pair as CENTER, keeping the assignment", async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ state: { pairAssignment: { p2: "left" } }, version: 4 }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().conciergeLayout).toBe("center");
+    expect(useUiStore.getState().pairAssignment).toEqual({ p2: "left" });
+  });
+
+  it("rehydrates a pre-picker blob WITHOUT a left pair as LEFT", async () => {
+    useUiStore.setState({ conciergeLayout: "right" });
+    localStorage.setItem("sparkle-ui", JSON.stringify({ state: { pairAssignment: {} }, version: 4 }));
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().conciergeLayout).toBe("left");
+  });
+
+  it("restores a chosen layout across a relaunch", async () => {
+    useUiStore.getState().setConciergeLayout("right");
+    useUiStore.setState({ conciergeLayout: "left" });
+    // The blob the setter wrote still says RIGHT; a rehydrate is what a relaunch does.
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ state: { conciergeLayout: "right", pairAssignment: {} }, version: 4 }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().conciergeLayout).toBe("right");
+  });
+
+  it("repairs a garbage layout, and clears left assignments a one-pair layout cannot show", async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ state: { conciergeLayout: "sideways", pairAssignment: {} }, version: 4 }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().conciergeLayout).toBe("left");
+
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ state: { conciergeLayout: "right", pairAssignment: { p2: "left" } }, version: 4 }),
+    );
+    await useUiStore.persist.rehydrate();
+    expect(useUiStore.getState().conciergeLayout).toBe("right");
+    expect(useUiStore.getState().pairAssignment).toEqual({});
   });
 });

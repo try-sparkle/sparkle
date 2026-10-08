@@ -18,7 +18,7 @@ import { liveTasks, recentTasks, useResearchStore } from "../services/research/s
 import { AgentRow } from "./AgentRow";
 import { SidebarScrollContext, type SidebarScrollApi } from "./sidebarScrollContext";
 import { WorkerPeek } from "./WorkerPeek";
-import { PairCountControl, SubtreeDisclosureControl } from "./BuildColumnHeaderControls";
+import { SubtreeDisclosureControl } from "./BuildColumnHeaderControls";
 // Imported here AND re-exported below, never `export { … } from "…"` — see the note on the
 // `formatElapsed` re-export for why the bare form would break this file's own call sites.
 import {
@@ -193,6 +193,7 @@ import { slugForRoot } from "../services/conciergeTools/repoSlug";
 import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { NewAgentButtons } from "./NewAgentButtons";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
+import { useGeometrySide } from "../hooks/useGeometrySide";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
@@ -619,6 +620,8 @@ export function AgentSidebar({
   // about that window. Otherwise the map is the single answer to "where does this project live",
   // falling back to the slot's own side when there is no project to ask (see slotSide).
   const pairSide = forcePairSide ?? (project ? sideOf(pairAssignment, project.id) : slotSide);
+  // The side this column is DRAWN as — only direction decisions read it. See useGeometrySide.
+  const geoSide = useGeometrySide(pairSide);
   // IS THE IMPROVE-SPARKLE PANE COVERING **THIS** COLUMN'S STAGE? Asked once, here, because every
   // consumer below needs the same answer and the raw `activeSpecial` cannot give it: the flag is
   // window-global but the pane mounts in exactly ONE pair's stage (Workspace renders
@@ -847,9 +850,6 @@ export function AgentSidebar({
   // hidden and no `bd` shell-out runs (see beadsStore).
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const [editing, setEditing] = useState<string | null>(null);
-  /** Is the pointer (or focus) anywhere in the column header? Reveals `PairCountControl`, which
-   *  cannot reveal itself — a hidden box takes neither hover nor Tab. */
-  const [headerHover, setHeaderHover] = useState(false);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
   const [closePromptId, setClosePromptId] = useState<string | null>(null);
   // The RETIREMENT confirm (bead sparkle-0l9xk) — a landed build agent the human is removing.
@@ -3154,7 +3154,7 @@ export function AgentSidebar({
         ...(overlay
           ? {
               position: "absolute" as const,
-              [pairSide === "right" ? "left" : "right"]: 0,
+              [geoSide === "right" ? "left" : "right"]: 0,
               top: 0,
               bottom: 0,
               height: "auto",
@@ -3262,27 +3262,13 @@ export function AgentSidebar({
           thing in this column that hides anything; anything global must DRIVE them rather than
           filter alongside them. rev4.html carries the same warning in its own CSS.
 
-          THE MOCK'S `.pm` IS BUILT — `PairCountControl` below, hover/focus-revealed beside the
-          chips. It read "NOT BUILT… there is no second pair for it to create" for as long as the
-          shell had one pair; the left pair closed MAPPING.md's gap #3, so the control adds and
-          removes a pair rather than duplicating anything. */}
+          THE MOCK'S `.pm` (add/remove a pair) IS GONE FROM HERE ON PURPOSE. It shipped as a
+          hover-only +/− at the end of this band, and an accidental − took the whole left half of
+          the window away with nothing visible to bring it back (epic sparkle-5ua3br). Which pairs
+          exist is now the user's explicit choice in Settings → Appearance → Layout. */}
       {project && (
         <div
           data-testid="build-column-header"
-          // THE REVEAL LIVES ON THE HEADER, not on the control it reveals. A `visibility: hidden`
-          // box is not a hit-test target — the pointer passes straight through it, so `mouseenter`
-          // never fires — and it is skipped by sequential focus navigation, so Tab cannot reach it
-          // either. Wiring `onMouseEnter`/`onFocus` to the hidden element made BOTH reveal paths
-          // dead: the control could never be summoned in a real browser, only in a test that
-          // dispatches at the node and bypasses hit-testing entirely (roborev 55349).
-          //
-          // `ColumnPullTab` already documents this exact trap and solves it the same way: hover is
-          // owned by the always-live rail, and only the descendant tab is hidden. React's focus
-          // events bubble, so `onFocus` here also catches a Tab onto the button inside.
-          onMouseEnter={() => setHeaderHover(true)}
-          onMouseLeave={() => setHeaderHover(false)}
-          onFocus={() => setHeaderHover(true)}
-          onBlur={() => setHeaderHover(false)}
           style={{
             display: "flex",
             alignItems: "center",
@@ -3340,8 +3326,7 @@ export function AgentSidebar({
           )}
           {/* Expand-all / collapse-all, where the `«` chevron used to sit. Hidden in Plan (no rows)
               and when NO head has workers — a control that would act on nothing is worse than none.
-              Distinct from `PairCountControl` at the other end of the band: that one adds/removes a
-              whole PAIR, this one only folds worker subtrees. */}
+              It only folds worker subtrees; which PAIRS exist is Settings → Appearance → Layout. */}
           {mode !== "plan" && subtreeHeadIds.length > 0 && (
             <SubtreeDisclosureControl
               headIds={subtreeHeadIds}
@@ -3422,7 +3407,6 @@ export function AgentSidebar({
               onClick={() => setBeadFocus(pairSide, null)}
             />
           )}
-          <PairCountControl projectId={project.id} pairSide={pairSide} shown={headerHover} />
         </div>
       )}
 
@@ -4202,7 +4186,7 @@ export function AgentSidebar({
           // `grows` names where the OWNED column sits relative to the boundary, which is the
           // opposite of the side the terminal is on: in the right pair build is left of the seam
           // (drag right to grow it), in the left pair it is right of it (drag left to grow it).
-          grows={pairSide === "right" ? "left" : "right"}
+          grows={geoSide === "right" ? "left" : "right"}
           cssVar={buildWidthVar(pairSide)}
           // ZOOM-CANCELLED, so this grip holds still against the concierge grip in the row.
           //

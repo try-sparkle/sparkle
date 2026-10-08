@@ -94,6 +94,71 @@ export const SURFACES = [
     },
   },
   {
+    // THE THREE LAYOUTS OF Settings → Appearance → Layout (epic sparkle-5ua3br), one surface each,
+    // so the PR carries a screenshot of every mode and a later change that breaks one is visible.
+    name: "workspace-layout-right",
+    query: "layout=right",
+    description: "Concierge RIGHT — terminal, build agents and epics to its left (mirrored single pair).",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell][data-concierge-layout=right]" },
+        { waitFor: "[data-testid=agent-sidebar-column]" },
+        { cable: "off" },
+      ],
+      clip: null,
+    },
+    mock: null,
+  },
+  {
+    // THE THREE LAYOUTS OF Settings → Appearance → Layout (epic sparkle-5ua3br), one surface each,
+    // so the PR carries a screenshot of every mode and a later change that breaks one is visible.
+    name: "workspace-layout-center",
+    query: "layout=center&pairs=2",
+    description: "Concierge CENTER — a pair on both sides.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell][data-concierge-layout=center]" },
+        { waitFor: "[data-testid=agent-sidebar-column]" },
+        { cable: "off" },
+      ],
+      clip: null,
+    },
+    mock: null,
+  },
+  {
+    // THE THREE LAYOUTS OF Settings → Appearance → Layout (epic sparkle-5ua3br), one surface each,
+    // so the PR carries a screenshot of every mode and a later change that breaks one is visible.
+    name: "workspace-layout-left",
+    query: "layout=left",
+    description: "Concierge LEFT — the single pair to its right.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell][data-concierge-layout=left]" },
+        { waitFor: "[data-testid=agent-sidebar-column]" },
+        { cable: "off" },
+      ],
+      clip: null,
+    },
+    mock: null,
+  },
+  {
+    // Settings → Appearance, where the three layout buttons live (epic sparkle-5ua3br). Opened by
+    // clicking the real affordances, like `settings-voice`.
+    name: "settings-appearance-layout",
+    description: "Settings → Appearance: the Layout picker (concierge right / center / left).",
+    app: {
+      steps: [
+        { waitFor: 'button[aria-label="Settings"]' },
+        { click: 'button[aria-label="Settings"]' },
+        { waitFor: '[role=dialog][aria-label="Settings"]' },
+        { clickText: { sel: '[role=dialog][aria-label="Settings"] button', t: "Appearance" } },
+        { waitFor: "[data-testid=concierge-layout-toggle]" },
+      ],
+      clip: '[role=dialog][aria-label="Settings"]',
+    },
+    mock: null,
+  },
+  {
     name: "agent-sidebar",
     description: "The build column: header, stage group headers, agent rows.",
     app: {

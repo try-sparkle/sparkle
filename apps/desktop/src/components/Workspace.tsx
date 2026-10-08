@@ -113,7 +113,8 @@ import { clearTerminalEscapeToll } from "../services/terminalEscapeRelease";
 import { matchesChord } from "../keyboardHints/keybindings";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import {
-  pairCountFor,
+  effectiveConciergeLayout,
+  pairCountForLayout,
   resolveSideProject,
   sideOf,
   type PairAssignment,
@@ -194,7 +195,7 @@ function PaneFallback() {
 /**
  * HOW MANY PAIRS FLANK THE CONCIERGE — `data-pairs` on the shell root.
  *
- * DERIVED, not a constant: `pairCountFor(projects, pairAssignment)` in the render below. It used to
+ * DERIVED, not a constant: `pairCountForLayout(conciergeLayout)` in the render below. It used to
  * be a hardcoded `1` with a comment explaining why the second pair was real work rather than a
  * render, and that comment named the constraint correctly (MAPPING.md, Gaps §3): pane mounting is
  * keyed per project/agent, **a Terminal unmount kills its PTY**, and every agent must be owned by
@@ -460,8 +461,13 @@ export function Pair({
   tabs,
   children,
   wired = false,
+  leading = false,
 }: {
   side: PairSide;
+  /** Paint this pair BEFORE the concierge — the concierge-right layout. Done with CSS `order`, not by
+   *  moving the element: a pair re-parented in JSX is a remount, and while panes are portalled in
+   *  (see `PaneHost`) the stage they portal into is still inside it. Moving the box costs nothing. */
+  leading?: boolean;
   /** Does this pair hold the live circuit? Marks it as part of the circuit for the unbind gesture. */
   wired?: boolean;
   /** The pair's project tab strip. Above the pair only — never above the concierge. */
@@ -472,11 +478,14 @@ export function Pair({
   children: React.ReactNode;
 }) {
   const tabStripRef = usePairTabsHeightVar(side);
+  // DRAWN side (engine/pairs `geometrySideOf`). `data-side` is read only by index.css's mirroring
+  // rules, so it carries the drawn side; `data-testid` keeps naming the pair's real side.
+  const geoSide = useGeometrySide(side);
   return (
     <div
       className="pair"
       data-pair
-      data-side={side}
+      data-side={geoSide}
       data-wired-pair={String(wired)}
       data-testid={`pair-${side}`}
       // ── EVERY PAIR IS ELASTIC NOW, AND THAT IS THE WHOLE CENTRING MECHANISM ──────────────────
@@ -503,6 +512,7 @@ export function Pair({
         minWidth: 0,
         flex: "1 1 0",
         position: "relative",
+        ...(leading ? { order: -1 } : null),
       }}
     >
       {/* THE STRIP'S HEIGHT IS PUBLISHED, because a grip in ANOTHER column needs it.
@@ -515,7 +525,7 @@ export function Pair({
           strip is content-sized (`flex: 0 0 auto`), so there is no constant to read. */}
       <div
         className="pairtabs"
-        data-side={side}
+        data-side={geoSide}
         data-testid={`pair-tabs-${side}`}
         ref={tabStripRef}
       >
@@ -533,7 +543,7 @@ export function Pair({
           minWidth: 0,
           minHeight: 0,
           position: "relative",
-          flexDirection: side === "left" ? "row-reverse" : "row",
+          flexDirection: geoSide === "left" ? "row-reverse" : "row",
         }}
       >
         {children}
@@ -572,6 +582,8 @@ import { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED } from "../engine/colum
 // from a node-environment test without pulling this module's store/Tauri graph in (roborev 56223).
 export { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
 import { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
+import { useGeometrySide } from "../hooks/useGeometrySide";
+import { LeftPairPicker } from "./LeftPairPicker";
 
 /** Which key a given pair count reads and writes. */
 function conciergeWidthKeyFor(pairCount: number): string {
@@ -724,12 +736,26 @@ export function Workspace() {
   // without this shell paying a state update — and a re-render on the drag's hot path — for a value
   // nothing reads.
 
-  // TWO PAIRS OR ONE — derived from the assignment map, never stored, so a count that disagrees with
-  // what the map says is unrepresentable. Read HERE, above the width plumbing, because which key the
-  // concierge reads and writes is a function of it.
+  // TWO PAIRS OR ONE — a function of the user's chosen LAYOUT (Settings → Appearance → Layout), not
+  // of the assignment map. It used to be derived from the map, and the only control that moved the
+  // map was a hover-only −, which is how a whole side of the window went missing with nothing on
+  // screen to bring it back (epic sparkle-5ua3br). The store keeps the map consistent with the
+  // layout in the same write, so a left-assigned project in a one-pair layout cannot exist. Read
+  // HERE, above the width plumbing, because which key the concierge reads and writes is a function
+  // of it.
   const projects = useProjectStore((s) => s.projects);
   const pairAssignment = useUiStore((s) => s.pairAssignment);
-  const pairCount = pairCountFor(projects, pairAssignment);
+  // EFFECTIVE, not merely chosen: a left-assigned project forces the left pair open so its panes
+  // always have a stage to portal into (engine/pairs `effectiveConciergeLayout`).
+  const chosenConciergeLayout = useUiStore((s) => s.conciergeLayout);
+  const conciergeLayout = effectiveConciergeLayout(chosenConciergeLayout, projects, pairAssignment);
+  const pairCount = pairCountForLayout(conciergeLayout);
+  // Which of the concierge's two edges has a pair beside it. CENTER has both; LEFT only its right
+  // edge; RIGHT only its left edge — the single pair is drawn there, mirrored (engine/pairs
+  // `geometrySideOf`). Each seam's pull tab, and the overlay that floats across it, exists only
+  // where there is a neighbour to float over.
+  const seamHasNeighbour = (seam: "left" | "right") =>
+    seam === "left" ? conciergeLayout !== "left" : conciergeLayout !== "right";
 
   const conciergeWidth = conciergeWidths[pairCount];
   // `useCallback` is not decoration: this is `onWidth` on the pull tab, and the tab reads its config
@@ -1233,8 +1259,11 @@ export function Workspace() {
   //
   // Reached two ways, which is why this is a CLAMP at render and not a one-off reset: overlay left
   // in the two-pair cockpit and then drop to one pair, or simply relaunch with "left" in the store.
-  const conciergeOverlay: ConciergeOverlaySide =
-    storedConciergeOverlay === "left" && pairCount !== 2 ? null : storedConciergeOverlay;
+  // GENERALISED by the layout picker: the same is true of a RIGHT overlay in the concierge-right
+  // layout, where the concierge is pinned to the row's right edge. `seamHasNeighbour` answers both.
+  const overlaySeamGone =
+    storedConciergeOverlay !== null && !seamHasNeighbour(storedConciergeOverlay);
+  const conciergeOverlay: ConciergeOverlaySide = overlaySeamGone ? null : storedConciergeOverlay;
   // …and the STORED value is cleared, so a preference that cannot be honoured here does not come
   // back on a relaunch that also has one pair. The clamp above is what decides the RENDER — this
   // effect deliberately does not also reset the state, because then the clamp would be dead code
@@ -1243,14 +1272,14 @@ export function Workspace() {
   // Leaving the live state alone also means assigning a second pair again in the same session
   // restores what the user last chose in the layout where they chose it.
   useEffect(() => {
-    if (storedConciergeOverlay === "left" && pairCount !== 2) {
+    if (overlaySeamGone) {
       try {
         localStorage.removeItem(CONCIERGE_OVERLAY_KEY);
       } catch {
         /* no store, nothing to clear */
       }
     }
-  }, [storedConciergeOverlay, pairCount]);
+  }, [overlaySeamGone]);
   // A SEAM ASKS, THE ENGINE DECIDES. Each tab passes only which seam was clicked; whether that
   // docks the column or moves the overlay across is `nextConciergeOverlay`'s call, in one place.
   const toggleConciergeOverlay = (seam: "left" | "right") => {
@@ -2177,6 +2206,7 @@ export function Workspace() {
       className="shell"
       data-testid="workspace-shell"
       data-pairs={String(pairCount)}
+      data-concierge-layout={conciergeLayout}
       data-wired={shownWired}
       data-over={overlay}
       style={{
@@ -2305,7 +2335,7 @@ export function Workspace() {
 
                 THREE THINGS FALL OUT OF THAT AND ALL THREE ARE WANTED:
                   • `epics-left` appears exactly when the left pair does, which is the founder's
-                    requirement (5) — `pairCountFor()` already gates this whole `Pair`.
+                    requirement (5) — `pairCount === 2` already gates this whole `Pair`.
                   • `PlanBoardSlot` covers it with ZERO change, which is requirement (4) ("when I'm
                     on the Plan board I should not see the EPICS column"): the board is an absolute
                     `inset: 0` sibling over this same box, so a third column in it is covered on
@@ -2350,12 +2380,9 @@ export function Workspace() {
               data-calm="false"
               style={{ flex: 1, position: "relative", minHeight: 0, background: C.forest }}
             >
-              {!leftProject && (
-                <Hint title="Nothing here yet">
-                  Pick a project in the tab strip above, or move one across with{" "}
-                  <strong>Move to the left pair</strong> in its build column header.
-                </Hint>
-              )}
+              {/* The concierge-CENTER layout shows this pair even with nothing in it — the user
+                  asked for both sides — so an empty one offers the open projects to move here. */}
+              {!leftProject && <LeftPairPicker />}
             </div>
             {/* THE LEFT PAIR'S OWN PLAN BOARD — a THIRD child of the pair, and that placement is
                 the point. This pair used to carry none at all (which is why pressing Plan here
@@ -2394,7 +2421,9 @@ export function Workspace() {
           {...{ [SELECTION_AFFORDANCE_ATTR]: SELECTION_AFFORDANCE_OWN }}
           style={{ display: "flex", minHeight: 0 }}
         >
-        {pairCount === 2 && (
+        {/* PRESENT WHENEVER A PAIR SITS ON THE CONCIERGE'S LEFT — the left pair in CENTER, and the
+            mirrored single pair in the concierge-right layout. */}
+        {seamHasNeighbour("left") && (
           <ColumnPullTab
             // IT OWNS THE CONCIERGE NOW, NOT THE LEFT PAIR — this is "I want to drag out from the
             // middle". The old rule was "one boundary owns the column on its own left", which made
@@ -2410,7 +2439,9 @@ export function Workspace() {
             min={CONCIERGE_MIN_WIDTH}
             max={conciergeMax}
             grows="right"
-            widthPerPx={2}
+            // 2 only when the concierge is CENTRED (both seams move); a one-sided concierge is
+            // pinned to the window edge, so its one seam moves 1:1 like the right seam always has.
+            widthPerPx={pairCount === 2 ? 2 : 1}
             cssVar={CONCIERGE_WIDTH_VAR}
             label="Sparkle column"
             testId="left-pair-pull-tab"
@@ -2430,10 +2461,12 @@ export function Workspace() {
             lifted={conciergeOverlay !== null}
             // DOWN PAST THE LEFT PAIR'S TAB STRIP, so this grip lines up with the build grip in the
             // pair beside it. See `rowGripTop`.
-            topOffset={rowGripTop("left")}
-            // JOINED ONLY WHEN THE LEFT PAIR HOLDS THE CABLE. This rail is the concierge's LEFT
-            // boundary, so it is the one the left pair's mounted row runs into.
-            seamFill={shownWired === "left" ? C.forest : undefined}
+            // In the concierge-right layout the pair beside this seam is the RIGHT pair (drawn
+            // mirrored), so its strip and its cable are the ones that count here.
+            topOffset={rowGripTop(conciergeLayout === "right" ? "right" : "left")}
+            // JOINED ONLY WHEN THE PAIR BESIDE THIS SEAM HOLDS THE CABLE. This rail is the
+            // concierge's LEFT boundary, so it is the one that pair's mounted row runs into.
+            seamFill={shownWired === (conciergeLayout === "right" ? "right" : "left") ? C.forest : undefined}
           />
         )}
         {/* ── THE CONCIERGE'S BOX IS OWNED BY THE SHELL, NOT BY THE COLUMN ────────────────────────
@@ -2555,51 +2588,55 @@ export function Workspace() {
             same keyboard contract, and the 2×3 dot grip that fades in on hover; see
             ColumnResizeTab for why the grip is hidden at rest and why it cannot take pointer
             events. */}
-        <ColumnPullTab
-          // THE RENDERED WIDTH, NOT THE STORED ONE — the gesture has to start from what is on screen.
-          // `ColumnPullTab` records `origin = { x, width }` at mousedown and commits
-          // `clampWidth(origin.width + dx)`, so handing it a width above `max` makes the seam DEAD for
-          // exactly `conciergeWidth - conciergeMax` px of travel, reports an out-of-range
-          // `aria-valuenow`, and collapses the stored preference to the ceiling on the first
-          // pointer-down — destroying the very width `renderedConciergeWidth` exists to preserve
-          // (roborev 55948). Paint, gesture origin and ARIA range all read the same number now.
-          width={renderedConciergeWidth}
-          onWidth={setConciergeWidth}
-          min={CONCIERGE_MIN_WIDTH}
-          // WINDOW-AWARE, like every other seam in the row. A bare 560 here let this one column be
-          // dragged over the primary pair on a narrow window — see `conciergeSingleRowReserve` and
-          // `conciergePairedMax`.
-          max={conciergeMax}
-          // SYMMETRIC ONLY WHEN THERE ARE TWO EDGES TO BE SYMMETRIC ABOUT. With one pair the concierge
-          // is pinned to the row's left and has no left edge to grow from, so doubling the travel
-          // would just make this seam twice as fast for no reason — and that layout is the one that
-          // must not change.
-          widthPerPx={pairCount === 2 ? 2 : 1}
-          cssVar={CONCIERGE_WIDTH_VAR}
-          label="Sparkle column"
-          testId="concierge-pull-tab"
-          // …and the right seam overlays RIGHTWARD, the mirror of the left rail above. The two tabs
-          // read the same state and write through the same rule, so they cannot disagree about
-          // where their own column is.
-          overlaid={conciergeOverlay === "right"}
-          onOverlayToggle={() => toggleConciergeOverlay("right")}
-          lifted={conciergeOverlay !== null}
-          // DOWN PAST THE RIGHT PAIR'S TAB STRIP — the mirror of the left rail above.
-          topOffset={rowGripTop("right")}
-          // THE SEAM THE FOUNDER HAS REPORTED FIVE TIMES, in the single-pair cockpit: this rail is
-          // the concierge's RIGHT boundary and therefore the right pair's joint.
-          //
-          // `shownWired`, not the raw `wired`: it is the same derivation the concierge column paints
-          // its flood from (`hooks/useEffectiveWired`), so the fill cannot appear while the column
-          // beside it is still drawing itself unplugged — the shell-contradicts-itself failure
-          // roborev 55386 and 55490 are both about.
-          //
-          // `C.forest` is the CSS var `--c-forest`, i.e. `BLUEPRINT[mode].term` — the exact token the
-          // concierge floods with and the row paints in. Reading the same token is what makes the
-          // three surfaces provably one plane in BOTH themes rather than three colours that happen to
-          // match in dark.
-          seamFill={shownWired === "right" ? C.forest : undefined}
-        />
+        {/* Absent in the concierge-right layout: the concierge is pinned to the window's right edge
+            there, with nothing beyond it to resize against or float over. */}
+        {seamHasNeighbour("right") && (
+          <ColumnPullTab
+            // THE RENDERED WIDTH, NOT THE STORED ONE — the gesture has to start from what is on screen.
+            // `ColumnPullTab` records `origin = { x, width }` at mousedown and commits
+            // `clampWidth(origin.width + dx)`, so handing it a width above `max` makes the seam DEAD for
+            // exactly `conciergeWidth - conciergeMax` px of travel, reports an out-of-range
+            // `aria-valuenow`, and collapses the stored preference to the ceiling on the first
+            // pointer-down — destroying the very width `renderedConciergeWidth` exists to preserve
+            // (roborev 55948). Paint, gesture origin and ARIA range all read the same number now.
+            width={renderedConciergeWidth}
+            onWidth={setConciergeWidth}
+            min={CONCIERGE_MIN_WIDTH}
+            // WINDOW-AWARE, like every other seam in the row. A bare 560 here let this one column be
+            // dragged over the primary pair on a narrow window — see `conciergeSingleRowReserve` and
+            // `conciergePairedMax`.
+            max={conciergeMax}
+            // SYMMETRIC ONLY WHEN THERE ARE TWO EDGES TO BE SYMMETRIC ABOUT. With one pair the concierge
+            // is pinned to the row's left and has no left edge to grow from, so doubling the travel
+            // would just make this seam twice as fast for no reason — and that layout is the one that
+            // must not change.
+            widthPerPx={pairCount === 2 ? 2 : 1}
+            cssVar={CONCIERGE_WIDTH_VAR}
+            label="Sparkle column"
+            testId="concierge-pull-tab"
+            // …and the right seam overlays RIGHTWARD, the mirror of the left rail above. The two tabs
+            // read the same state and write through the same rule, so they cannot disagree about
+            // where their own column is.
+            overlaid={conciergeOverlay === "right"}
+            onOverlayToggle={() => toggleConciergeOverlay("right")}
+            lifted={conciergeOverlay !== null}
+            // DOWN PAST THE RIGHT PAIR'S TAB STRIP — the mirror of the left rail above.
+            topOffset={rowGripTop("right")}
+            // THE SEAM THE FOUNDER HAS REPORTED FIVE TIMES, in the single-pair cockpit: this rail is
+            // the concierge's RIGHT boundary and therefore the right pair's joint.
+            //
+            // `shownWired`, not the raw `wired`: it is the same derivation the concierge column paints
+            // its flood from (`hooks/useEffectiveWired`), so the fill cannot appear while the column
+            // beside it is still drawing itself unplugged — the shell-contradicts-itself failure
+            // roborev 55386 and 55490 are both about.
+            //
+            // `C.forest` is the CSS var `--c-forest`, i.e. `BLUEPRINT[mode].term` — the exact token the
+            // concierge floods with and the row paints in. Reading the same token is what makes the
+            // three surfaces provably one plane in BOTH themes rather than three colours that happen to
+            // match in dark.
+            seamFill={shownWired === "right" ? C.forest : undefined}
+          />
+        )}
         </div>
         {/* THE PAIR — build + its terminal, one project, never split, with its OWN project tabs.
             The single-pair cockpit is the right half of `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`,
@@ -2607,6 +2644,7 @@ export function Workspace() {
             Children are always [build, terminal]; `Pair` mirrors the flow for a left pair. */}
         <Pair
           side="right"
+          leading={conciergeLayout === "right"}
           wired={wired === "right"}
           tabs={<MemoProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
         >

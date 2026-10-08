@@ -566,8 +566,8 @@ body {
    WHY NOT `overflow: hidden` ALONE. It clips, but it also makes the box a SCROLL CONTAINER: the
    content stays programmatically scrollable and the UA scrolls it to reveal a sequentially-focused
    descendant. Both boxes hold focusable content that is clipped in exactly the state this targets —
-   `PairCountControl` is deliberately kept in the tab order and sits past the spacer at the far end,
-   so it is the FIRST thing to overflow. Tab onto it in a narrow column and WebKit sets `scrollLeft`
+   the measured case was a focusable control past the spacer at the far end (the since-removed
+   `PairCountControl`), the FIRST thing to overflow. Tab onto such a control in a narrow column and WebKit sets `scrollLeft`
    to bring it into view, sliding the Build/Plan segment out of the header — with no scrollbar to
    show it and nothing to reset it, leaving the header displaced until an unrelated relayout.
    `overflow: clip` cannot do that; not being a scroll container is the entire reason it exists.

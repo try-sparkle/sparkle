@@ -44,6 +44,7 @@ import { availabilityLabel } from "./AvailabilityDot";
 import { ActiveFillets, rowBoxFor } from "./rowAnatomy";
 import { DOT_SLOT_W, GLYPH_SLOT_H, type PairSide } from "../engine/rowGeometry";
 import { personName, type Person } from "../stores/socialStore";
+import { useGeometrySide } from "../hooks/useGeometrySide";
 
 /** The avatar's diameter in a sidebar row. 18 inside the 24×20 glyph slot — see the header. */
 export const PERSON_ROW_AVATAR_SIZE = 18;
@@ -129,7 +130,8 @@ export const PersonRow = memo(function PersonRow({
   // junction. `filletEnds` is then empty by construction, which is why the render site below can
   // read this same value rather than re-deriving the condition.
   const claimsPane = isActive && ownsPane;
-  const box = rowBoxFor({ paneSide, jointOpen, isActive: claimsPane });
+  const geoSide = useGeometrySide(paneSide);
+  const box = rowBoxFor({ paneSide: geoSide, jointOpen, isActive: claimsPane });
   const name = personName(person);
   const select = () => onSelect(person.socialId);
 
@@ -248,7 +250,7 @@ export const PersonRow = memo(function PersonRow({
           so this needs no condition of its own — and must not grow one, because a second copy of
           that rule is how the radius and the mouths would end up disagreeing, which is the exact
           half-gated state this row shipped for one commit. */}
-      <ActiveFillets ends={box.filletEnds} paneSide={paneSide} />
+      <ActiveFillets ends={box.filletEnds} paneSide={geoSide} />
     </div>
   );
 });

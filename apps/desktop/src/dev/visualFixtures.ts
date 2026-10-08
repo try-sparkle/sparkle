@@ -62,6 +62,7 @@ import {
   acceptsStoredConciergeWidth,
 } from "../engine/columnResize";
 import { devBypassAuthEnabled } from "./devBypassAuth";
+import { isConciergeLayout, type ConciergeLayout } from "../engine/pairs";
 
 /** The query parameter that turns fixtures on: `?visual=1`. */
 export const VISUAL_FIXTURES_PARAM = "visual";
@@ -123,6 +124,22 @@ export const VISUAL_PAIRS_PARAM = "pairs";
  */
 export function visualPairCount(search: string): 1 | 2 {
   return new URLSearchParams(search).get(VISUAL_PAIRS_PARAM) === "2" ? 2 : 1;
+}
+
+/** The query parameter that picks the concierge layout: `?layout=right|center|left`. */
+export const VISUAL_LAYOUT_PARAM = "layout";
+
+/**
+ * The concierge layout the capture wants (Settings → Appearance → Layout, engine/pairs).
+ *
+ * An explicit `?layout=` wins. Without one it follows `?pairs=`, so every existing surface keeps
+ * the layout it was baselined in: two pairs is CENTER, one pair is LEFT — the same rule an
+ * upgrading install's persisted blob is repaired by (`inferConciergeLayout`).
+ */
+export function visualConciergeLayout(search: string): ConciergeLayout {
+  const raw = new URLSearchParams(search).get(VISUAL_LAYOUT_PARAM);
+  if (isConciergeLayout(raw)) return raw;
+  return visualPairCount(search) === 2 ? "center" : "left";
 }
 
 /** The query parameter that narrows the concierge column: `?concierge=<px>`. */
@@ -1304,16 +1321,21 @@ export function applyVisualFixtures(
   // the same capture. In the single-project case `[project.id]` is behaviourally identical to the
   // `null` the store starts at, so no existing baseline moves.
   //
-  // `pairAssignment` is what `pairCountFor` reads to decide there are two pairs at all, and
+  // `pairAssignment` is what decides which pair each project is in, and
   // `leftProjectId` is what `useEffectiveWired` resolves the LEFT side's selected agent through —
   // without it, `patch("left")` is a no-op as far as the shell is concerned and the capture silently
   // photographs an unwired app. That is the exact bug that let `workspace-wired-left` score the
   // wrong state for its whole life; the harness's `cable` step now verifies `data-wired` agrees, so
   // this being wrong fails loudly instead. They belong to the PAIR opt-in alone: a capture that did
   // not ask for a second pair gets them CLEARED, never inherited.
+  // `conciergeLayout` rides with the pair seed for the same reason: the shell's pair count is read
+  // from the LAYOUT now, so a seeded left project under a one-pair layout would have nowhere to
+  // render. A layout that has no left pair never carries a left assignment.
+  const layout = visualConciergeLayout(search);
   useUiStore.setState({
     openProjectIds: [project.id, ...extras.map((e) => e.project.id)],
-    ...(left
+    conciergeLayout: layout,
+    ...(left && layout === "center"
       ? { pairAssignment: { [left.project.id]: "left" }, leftProjectId: left.project.id }
       : { pairAssignment: {}, leftProjectId: null }),
   });

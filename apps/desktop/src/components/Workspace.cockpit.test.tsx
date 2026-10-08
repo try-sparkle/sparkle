@@ -253,9 +253,9 @@ describe("the shell root carries the whole cockpit state", () => {
     // THE PRECONDITION, ASSERTED IN THE SAME ROW. The stub echoes `slotSide` unconditionally while the
     // real component consults it ONLY when `project` is null — so without this the row would keep
     // passing if the fixture ever drifted into resolving a left project, no longer exercising the state
-    // the setup above carefully builds. The "Nothing here yet" hint renders exactly when `leftProject`
-    // is null, so it IS that state, and it is observable (roborev 55591).
-    expect(screen.getByText("Nothing here yet")).toBeTruthy();
+    // the setup above carefully builds. The empty-side picker renders exactly when `leftProject` is
+    // null, so it IS that state, and it is observable (roborev 55591).
+    expect(screen.getByTestId("left-pair-picker")).toBeTruthy();
 
     // BOUND TO THE COLUMN, not gathered into a set. `toContain` over both values was satisfiable for
     // the "right" half by the stub's own default, and could not tell "the left slot got `slotSide`"
@@ -808,8 +808,13 @@ describe("the second pair", () => {
     markProjectVisited("p1");
     markProjectVisited("p2");
   };
+  // A left pair exists only in the concierge-CENTER layout (Settings → Appearance → Layout), and the
+  // store refuses a left assignment outside it — so sending a project left means choosing CENTER.
   const sendLeft = (id: string) =>
-    act(() => useUiStore.getState().assignProjectToPair(id, "left"));
+    act(() => {
+      useUiStore.getState().setConciergeLayout("center");
+      useUiStore.getState().assignProjectToPair(id, "left");
+    });
 
   it("renders ONE pair until something is assigned to the left", () => {
     // The upgrade path: an install that has never used the left pair must get byte-identical
@@ -861,16 +866,23 @@ describe("the second pair", () => {
     expect(rightPair.textContent).not.toContain("Beta");
   });
 
-  it("collapses back to one pair when the last left project is sent back", () => {
-    // Derived from the assignment map, so "an empty left pair" is unrepresentable rather than a
-    // state someone has to remember to clean up.
+  // THE PAIR COUNT IS THE USER'S CHOICE NOW (epic sparkle-5ua3br), not a side effect of where the
+  // last project went. It used to collapse the moment the last left project was sent back — which is
+  // the mechanism that made a whole side of the founder's window vanish. Emptying the left pair in
+  // CENTER leaves it on screen with its picker; only choosing a one-pair layout closes it.
+  it("keeps an emptied left pair open in CENTER, and closes it only when a one-pair layout is chosen", () => {
     twoProjects();
     render(<Workspace />);
     sendLeft("p2");
     expect(shell().getAttribute("data-pairs")).toBe("2");
     act(() => useUiStore.getState().assignProjectToPair("p2", "right"));
+    expect(shell().getAttribute("data-pairs")).toBe("2");
+    expect(screen.getByTestId("left-pair-picker")).toBeTruthy();
+    sendLeft("p2");
+    act(() => useUiStore.getState().setConciergeLayout("left"));
     expect(shell().getAttribute("data-pairs")).toBe("1");
     expect(screen.queryByTestId("pair-left")).toBeNull();
+    expect(useUiStore.getState().pairAssignment).toEqual({});
     // The panes came back rather than vanishing with the pair.
     expect(screen.getAllByTestId("pane-a2")).toHaveLength(1);
   });
@@ -897,8 +909,10 @@ describe("the second pair", () => {
         selectedProjectId: "p1",
       } as never);
     });
-    expect(shell().getAttribute("data-pairs")).toBe("1");
+    // The ASSIGNMENT is pruned; the left pair stays, because CENTER is what the user chose — it now
+    // offers the remaining projects rather than holding a dead entry open.
     expect(useUiStore.getState().pairAssignment).toEqual({});
+    expect(screen.getByTestId("left-pair-picker")).toBeTruthy();
   });
 
   // THE RELAUNCH SHAPE — the bug the tests above could not see, because `twoProjects()` marks both

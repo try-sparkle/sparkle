@@ -13,6 +13,7 @@ import { ModalLayer } from "./ModalLayer";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { NotificationsMenu } from "./NotificationsMenu";
 import { ThemeToggle } from "./ThemeToggle";
+import { ConciergeLayoutToggle } from "./ConciergeLayoutToggle";
 import { BranchCleanupToggle } from "./BranchCleanupToggle";
 import { WindowSpanControls } from "./WindowSpanControls";
 import { WorkerLimitControl } from "./WorkerLimitControl";
@@ -93,7 +94,7 @@ const CATEGORIES: Category[] = [
   { id: "credits", label: "Credits", Icon: FiCreditCard, blurb: "Your AI credit balance, top-ups, and usage.", keywords: ["balance top-up billing payment"] },
   { id: "spend", label: "History & Spend", Icon: FiTrendingUp, blurb: "Token usage and estimated cost, read locally from your Claude Code transcripts.", keywords: ["tokens spend cost usage analytics history transcripts money dollars burn rate cache model project session"] },
   { id: "notifications", label: "Notifications", Icon: FiBell, blurb: "Which agent transitions raise a desktop banner.", keywords: ["banner alerts desktop"] },
-  { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, text size, window layout across displays, and how agents are ordered.", keywords: ["theme dark light text size zoom agent order window span displays monitors multi-monitor fullscreen wide"] },
+  { id: "appearance", label: "Appearance", Icon: FiEye, blurb: "Theme, where the concierge sits, text size, window layout across displays, and how agents are ordered.", keywords: ["theme dark light layout concierge left right center middle columns sides pair mirror text size zoom agent order window span displays monitors multi-monitor fullscreen wide"] },
   { id: "shortcuts", label: "Shortcuts", Icon: FiCommand, blurb: "Rebind keyboard shortcuts. Tap a modifier or press a combo.", keywords: ["keyboard keybindings hotkeys"] },
   { id: "workers", label: "Workers", Icon: FiCpu, blurb: "How many agents an orchestrator runs in parallel.", keywords: ["concurrency parallel agents"] },
   { id: "accounts", label: "Accounts", Icon: FiUsers, blurb: "Your Sparkle and Claude accounts.", keywords: ["sign in sign out claude sparkle login install id crash report support"] },
@@ -566,6 +567,12 @@ function AppearancePane() {
       <div>
         <div style={subLabel}>Theme</div>
         <ThemeToggle />
+      </div>
+      <div>
+        {/* Where the concierge sits, and so which sides of the window carry epics, build agents and
+            a terminal. Always here, always one click from every other layout — see the component. */}
+        <div style={subLabel}>Layout</div>
+        <ConciergeLayoutToggle />
       </div>
       <div>
         <div style={subLabel}>Text size</div>

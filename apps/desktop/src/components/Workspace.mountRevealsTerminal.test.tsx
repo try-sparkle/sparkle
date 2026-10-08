@@ -892,10 +892,10 @@ describe("Improve Sparkle on the right does not block a left-pair mount from rea
 
 // ══ THE ACTUAL FOUNDER PATH — OPEN THE LEFT PAIR, THEN MOUNT ════════════════════════════════════
 // Above the pair is pre-assigned. But the founder starts single-pair with his build agents on the
-// RIGHT and reaches the left column through the "Open the left pair" control (BuildColumnHeader
-// controls → `assignProjectToPair(projectId, otherSide(pairSide))`). This drives that exact store
-// gesture, then mounts a build row, and asserts the terminal lands in terminal-left — the end-to-end
-// path the report is about.
+// RIGHT and reaches the left column by choosing Concierge CENTER (Settings → Appearance → Layout)
+// and moving a project across — the hover "Open the left pair" control this used to drive is gone
+// (epic sparkle-5ua3br). This drives that store gesture, then mounts a build row, and asserts the
+// terminal lands in terminal-left — the end-to-end path the report is about.
 describe("opening the left pair and THEN mounting a build agent reaches terminal-left", () => {
   beforeEach(() => {
     useProjectStore.setState({
@@ -924,6 +924,8 @@ describe("opening the left pair and THEN mounting a build agent reaches terminal
     await mount();
     // The "Open the left pair" gesture: reassign the current project to the left side.
     act(() => {
+      // A left pair exists only in CENTER (Settings → Appearance → Layout).
+      useUiStore.getState().setConciergeLayout("center");
       useUiStore.getState().assignProjectToPair("p1", "left");
     });
     // The left column now renders; mount a build row in it.

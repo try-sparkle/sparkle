@@ -13,6 +13,7 @@ import { StatusDot } from "./StatusDot";
 import { AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
 import { useRowClock, ElapsedTimer } from "./rowClock";
 import type { AgentTabStatus } from "../types";
+import { useGeometrySide } from "../hooks/useGeometrySide";
 
 /** The pinned, always-present Sparkle self-improvement agent row.
  *
@@ -100,7 +101,8 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
   // than an ever-growing number (see this row's note in PRD/sparkle/improve--parity.md).
   const lastTouchAt = useInteractionStore((s) => s.lastAt[sparkleAgentIdFor(APP_WINDOW_LABEL)]);
   const clockNow = useRowClock(lastTouchAt);
-  const pinBox = rowBoxFor({ paneSide, jointOpen, isActive: active, pinned: true });
+  const geoSide = useGeometrySide(paneSide);
+  const pinBox = rowBoxFor({ paneSide: geoSide, jointOpen, isActive: active, pinned: true });
   return (
     <div
       data-hint="improve"
@@ -294,7 +296,7 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
       {/* THE SAME COMPONENT a selected build row draws, not a copy of it — they are what makes the
           1.08:1 fill step legible as selection, so they are not decoration and must not be dropped.
           No `showOverlay` condition here: this row has no hover card to be stood in for. */}
-      <ActiveFillets ends={pinBox.filletEnds} paneSide={paneSide} />
+      <ActiveFillets ends={pinBox.filletEnds} paneSide={geoSide} />
     </div>
   );
 });

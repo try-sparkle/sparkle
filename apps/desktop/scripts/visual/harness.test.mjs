@@ -303,6 +303,13 @@ describe("surface registry", () => {
       "workspace-unwired",
       "workspace-wired-left",
       "workspace-wired-right",
+      // The three concierge layouts of Settings → Appearance → Layout, and the pane that picks
+      // between them (epic sparkle-5ua3br) — one photograph per mode, so the PR shows each and a
+      // later change that breaks one is visible.
+      "workspace-layout-right",
+      "workspace-layout-center",
+      "workspace-layout-left",
+      "settings-appearance-layout",
       "agent-sidebar",
       // The queued-instruction badge, OPENED (bead sparkle-zm0c8). A concierge message queued for an
       // agent used to render nowhere, so "I sent it" was uncheckable; the badge's popover is where
@@ -358,7 +365,7 @@ describe("surface registry", () => {
   // column, so its opening click has nothing to press and the surface cannot be reached at all.
   it("asks the fixture for the second pair on the surfaces that need it", () => {
     // NAMED, not counted — a bare number cannot tell "a surface was added" from "one was swapped".
-    const twoPair = ["workspace-wired-left", "plan-board-left"];
+    const twoPair = ["workspace-wired-left", "plan-board-left", "workspace-layout-center"];
     for (const name of twoPair) {
       const pairs = new URLSearchParams(surfaceByName(name).query ?? "").get("pairs");
       expect(pairs, `${name} must open the second pair`).toBe("2");

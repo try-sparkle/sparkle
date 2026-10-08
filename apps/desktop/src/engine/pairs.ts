@@ -88,10 +88,94 @@ export function pairCountFor(projects: readonly { id: string }[], assignment: Pa
   return projects.some((p) => sideOf(assignment, p.id) === "left") ? 2 : 1;
 }
 
-/** The other side. */
-export function otherSide(side: PairSide): PairSide {
-  return side === "left" ? "right" : "left";
+/**
+ * WHERE THE CONCIERGE SITS — the user's explicit choice, from Settings → Appearance → Layout.
+ *
+ *   right  — `TERM │ BUILD │ EPICS │ CONCIERGE`                              (one pair, mirrored)
+ *   center — `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`      (both pairs)
+ *   left   — `CONCIERGE │ EPICS │ BUILD │ TERM`                              (one pair)
+ *
+ * THIS REPLACED A DERIVED COUNT AS THE SOURCE OF TRUTH (epic sparkle-5ua3br). The pair count used
+ * to be `pairCountFor(projects, assignment)` alone, and the only thing that changed it was a
+ * hover-only +/− in a build column header. Pressing − by accident took the whole left half of the
+ * window away with nothing on screen to bring it back — the founder's "I seem to have completely
+ * lost the left side". A layout the user picked from a menu cannot vanish that way: it changes only
+ * when they press another of the three buttons, and the buttons are always there.
+ */
+export type ConciergeLayout = "right" | "center" | "left";
+
+export const CONCIERGE_LAYOUTS: readonly ConciergeLayout[] = ["right", "center", "left"];
+
+export function isConciergeLayout(v: unknown): v is ConciergeLayout {
+  return v === "right" || v === "center" || v === "left";
 }
+
+/** How many pairs flank the concierge in a layout. CENTER is the only two-pair layout, and it shows
+ *  the left pair even while nothing is assigned to it — an empty pair is a real state now, with an
+ *  empty-state prompt, because the user ASKED for both sides. */
+export function pairCountForLayout(layout: ConciergeLayout): PairCount {
+  return layout === "center" ? 2 : 1;
+}
+
+/**
+ * The layout an install that has never chosen one is in — the upgrade path. A window that had a
+ * left pair open was in CENTER; anything else was the single-pair layout, LEFT. So nobody's window
+ * changes shape on the build that introduces the picker.
+ */
+export function inferConciergeLayout(assignment: unknown): ConciergeLayout {
+  if (assignment && typeof assignment === "object") {
+    for (const v of Object.values(assignment as Record<string, unknown>)) if (v === "left") return "center";
+  }
+  return "left";
+}
+
+/**
+ * Bring the assignment map in line with a layout: a one-pair layout has no left pair, so every
+ * left-assigned project goes back to the right (absence). Without this a left-assigned project in
+ * a one-pair layout would have no stage to portal its panes into. Same object when nothing changes,
+ * for the identity reason `assignToSide` gives.
+ */
+export function assignmentForLayout(assignment: PairAssignment, layout: ConciergeLayout): PairAssignment {
+  if (layout === "center" || Object.keys(assignment).length === 0) return assignment;
+  return {};
+}
+
+/**
+ * The layout the shell actually RENDERS — the chosen one, except that a left-assigned project
+ * always forces the left pair open (CENTER).
+ *
+ * THE MOUNT INVARIANT OUTRANKS THE PREFERENCE. A project's panes are portalled into its side's
+ * stage, so a left-assigned project with no left stage would have its terminals mounted nowhere —
+ * the one state this module exists to make unrepresentable. The store never produces it (choosing a
+ * one-pair layout clears the left assignments in the same write; `assignProjectToPair` refuses a
+ * left assignment outside CENTER; rehydrate repairs a disagreeing blob), so in practice this returns
+ * `layout` unchanged. It is the backstop for any writer that sets the map directly.
+ */
+export function effectiveConciergeLayout(
+  layout: ConciergeLayout,
+  projects: readonly { id: string }[],
+  assignment: PairAssignment,
+): ConciergeLayout {
+  return layout !== "center" && pairCountFor(projects, assignment) === 2 ? "center" : layout;
+}
+
+/**
+ * WHICH WAY A PAIR IS DRAWN, as opposed to which pair it IS.
+ *
+ * In RIGHT the single pair sits to the concierge's LEFT, so it must be drawn exactly as the left
+ * pair is — terminal outboard, epics nearest the concierge, every pull tab growing the other way,
+ * the selected row's mouth opening leftward into its terminal. That geometry already exists and is
+ * keyed on the side, so RIGHT reuses it wholesale by drawing the right pair with LEFT geometry.
+ *
+ * DATA STAYS ON ITS OWN SIDE. The project assignment, the cable, the Sparkle pane
+ * (`SPARKLE_PANE_SIDE`), per-side focus and widths all keep saying "right": only the call sites that
+ * decide DIRECTION read this. Re-assigning every project to "left" instead would have re-parented
+ * every pane's portal and moved the Sparkle pane off its only side.
+ */
+export function geometrySideOf(side: PairSide, layout: ConciergeLayout): PairSide {
+  return layout === "right" ? "left" : side;
+}
+
 
 /**
  * Move a project to `side`, returning a NEW assignment (or the same object when nothing changes).
