@@ -315,6 +315,65 @@ export function screenIsCredentialField(snapshot: string): boolean {
   return matchesCredentialTail(snapshot);
 }
 
+/**
+ * Is a prompt that must not receive free text ACTUALLY LIVE at the bottom of this screen right now —
+ * as opposed to a credential word merely MENTIONED in an idle agent's finished output?
+ *
+ * ══ WHY THIS IS SEPARATE FROM {@link screenBlocksWrite} / {@link screenIsCredentialField} ════════
+ * Those two are write guards, and they scan the WHOLE grid on purpose: a miss there types a spoken
+ * sentence (hot mic) or a model send into a concealed field, so they block whenever a credential
+ * line is visible anywhere, accepting that this occasionally refuses over ordinary prose (the cost is
+ * one repeated phrase). That broad bias is pinned by test and must not change.
+ *
+ * The GOAL AUTO-RESUME asks a different question with the opposite cost profile. When it cannot
+ * deliver, it escalates to a human — "its terminal is waiting at a prompt that must not receive free
+ * text — a password, a host-key confirmation, or a yes/no" — and LATCHES the goal, spending one of a
+ * finite re-arm allowance. An agent that merely FINISHED a turn after asking the human to rotate a
+ * password secret sits idle at its normal composer with that word still on screen above it; the write
+ * guard refuses (correctly, for its own purpose), and re-using that verdict as grounds to tell the
+ * human a password prompt is live re-fired ~every 2h on an agent that was only waiting on them
+ * (bead sparkle-eou3y0.4). So the escalation is gated on THIS — the live-anchored counterpart that
+ * every arm reads from the live tail, exactly as the `alternate-screen` ladder was gated on
+ * {@link altScreenRefusalVerdict} for the same class of false claim (bead sparkle-phb1h).
+ *
+ * ══ IT MUST COVER EVERY SHAPE THE REFUSAL CAN COME FROM, OR IT FAILS OPEN ON A STUCK AGENT ═══════
+ * `conciergeDispatch` returns `blocked-prompt` from `screenIsCredentialField(text) ||
+ * (!viewportOffersYesNo && screenIsYesNoPrompt(text))`, and from `screenBlocksWrite(text)` on the
+ * Claude-Code-buffer arm. A kind this predicate misses is WORSE than the false alarm it was written
+ * to remove: the escalation then fails open and a genuinely-stuck agent is never surfaced (roborev
+ * 83619/83620, High). So every arm below is the LIVE/bottom-anchored form of one the refusal uses,
+ * and together they are that full set — not a hand-picked subset:
+ *   • {@link screenAwaitsInput} — a live Ink picker, a cursored option row, a bracketed inline
+ *     `(y/n)`, or a bare `password:` / `enter passphrase`, all structurally bottom-anchored already;
+ *   • {@link screenIsYesNoPrompt} — a full-word `(yes/no)` / `yes/no`, a bare `y/n`, the bracketed
+ *     forms, AND ssh's host-key `(yes/no/[fingerprint])?`, matched over the last 5 rows (the shapes
+ *     `YES_NO_INLINE` above does NOT catch — it needs a bare `y/n`);
+ *   • the remaining {@link WRITE_BLOCKING_PROMPTS} arms — a `password`/`passphrase` line and
+ *     `Type "yes" to confirm` — scoped to the live tail rather than the whole grid;
+ *   • {@link matchesCredentialTail} — a credential field whose colon ENDS the live tail (`[sudo]
+ *     password for …:`, `Verification code:`, a git `Username for …:`, a wrapped `my.1password.com:`).
+ * A credential word scrolled ABOVE the live tail — the bead sparkle-eou3y0.4 false positive — ends
+ * none of these tails and matches none of these arms, which is the whole point. When in doubt the
+ * answer is still NOT-a-prompt, but "doubt" here means "no live prompt shape", never "a shape I
+ * forgot to enumerate".
+ */
+export function screenShowsLiveBlockingPrompt(snapshot: string): boolean {
+  // Live picker / cursored option / bracketed (y/n) / bare `password:` — bottom-anchored by the
+  // status classifier itself.
+  if (screenAwaitsInput(snapshot)) return true;
+  // A generic confirmation at the bottom — `(yes/no)`, `yes/no`, bare `y/n`, bracketed forms, and
+  // ssh's host-key question. Already scoped to the last 5 rows, so a quoted one scrolls off.
+  if (screenIsYesNoPrompt(snapshot)) return true;
+  // The credential-field WRITE_BLOCKING_PROMPTS arms (a `password`/`passphrase` line, `Type "yes" to
+  // confirm`), scoped to the live tail — the whole-grid scan is `screenIsCredentialField`'s job, not
+  // this one's. `screenTail` joins with a space, so the `…:\s*$` password arm matches only when the
+  // colon actually ENDS the tail; the yes/no arm is excluded here because the line above owns it.
+  const tail = screenTail(snapshot, 5);
+  if (WRITE_BLOCKING_PROMPTS.some((re) => re !== YES_NO_PROMPT && re.test(tail))) return true;
+  // A credential field whose colon ends the live tail, wrap-tolerant (token / verification / username).
+  return matchesCredentialTail(snapshot);
+}
+
 /** ssh's host-key confirmation, which carries `(yes/no…)` but is NOT picker-answerable: ssh wants
  *  the whole word `yes`, and the detector's Approve sends `y`. Named separately so the yes/no
  *  waiver cannot reach it (roborev 58529).

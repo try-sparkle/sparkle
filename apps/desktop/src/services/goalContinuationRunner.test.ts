@@ -1038,6 +1038,68 @@ describe("the full-screen refusal must not fire on the agent's own screen", () =
     expect(reason).toMatch(/password/i);
   });
 
+  // ══ bead sparkle-eou3y0.4 — an idle agent that MENTIONS a password is not at a password PROMPT ══
+  // The `blocked-prompt` write guard scans the whole grid, so it refuses an idle agent whose finished
+  // output asked the human to rotate a secret. Escalating that re-fired the "waiting at a prompt that
+  // must not receive free text — a password…" alert ~every 2h on an agent that was only waiting on a
+  // human. The ladder now fails open on a `blocked-prompt` whose LIVE screen shows no prompt.
+  const IDLE_AGENT_MENTIONING_A_PASSWORD = [
+    "⏺ The signing work is done. Before I continue, rotate the signing password:",
+    "  ⎿  rotation checklist:",
+    ...Array.from({ length: 12 }, (_, i) => `     done step ${i + 1} of 12`),
+    '     reply "done" once the secret has been rotated.',
+    "",
+    "╭────────────────────────────────────────────╮",
+    "│ >                                          │",
+    "╰────────────────────────────────────────────╯",
+    "  ? for shortcuts",
+  ].join("\n");
+
+  it("does NOT escalate an idle agent whose finished output merely mentions a password", async () => {
+    alwaysRefuse("blocked-prompt");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, IDLE_AGENT_MENTIONING_A_PASSWORD);
+
+    // Twice the bound — three in a row used to latch the goal and page the founder.
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES * 2);
+
+    // ── THE SIDE EFFECTS, not the verdict object ────────────────────────────────────────────────
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(notifyMock).not.toHaveBeenCalled();
+    // The finite re-arm allowance a false escalation would have spent is untouched.
+    expect(rearmsRemaining(goalOf(projectId, agentId))).toBe(MAX_CONCIERGE_REARMS);
+    // …and the ladder KEEPS GOING — a latched goal stops sending, so a count past the bound proves it
+    // did not latch (the same proof the alternate-screen fail-open rows use).
+    expect(sendMock.mock.calls.length).toBeGreaterThan(MAX_UNDELIVERED_CONTINUES);
+  });
+
+  // The paired direction: over-tightening — or missing a kind — would stop escalating a genuine
+  // prompt, which is the one case a human MUST act on. roborev 83619/83620 (High) caught the first
+  // cut failing open on `(yes/no)`, bare `y/n`, and `Type "yes" to confirm:` — every one a shape
+  // `conciergeDispatch` refuses as `blocked-prompt`, none of them a bare bracketed `(y/n)`. Each must
+  // STILL escalate when it sits live at the bottom.
+  it.each([
+    ["a sudo password field", "$ sudo systemctl restart nginx\n[sudo] password for drodio:"],
+    ["a full-word (yes/no)", "Overwrite existing config? (yes/no)\nWaiting for response…"],
+    ["a bare y/n", "Apply this migration? y/n"],
+    ["a type-yes-to-confirm", 'This will delete 12 branches.\nType "yes" to confirm:'],
+    [
+      "ssh's host-key confirmation",
+      "The authenticity of host 'x' can't be established.\nAre you sure you want to continue connecting (yes/no/[fingerprint])?",
+    ],
+  ])("STILL escalates a blocked-prompt that is %s live at the bottom", async (_n, screen) => {
+    alwaysRefuse("blocked-prompt");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, screen);
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const goal = goalOf(projectId, agentId)!;
+    expect(goal.escalatedAt).toBeDefined();
+    expect(goal.escalationReason!).toMatch(/must not receive free text/i);
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+  });
+
   it("gives each refusal REASON its own budget — alternating reasons never reach the bound", async () => {
     // Bead sparkle-phb1h (d). A structural refusal that will never change must not consume the same
     // three strikes as a transient one. The streak is per-REASON, so a pane that flaps between two

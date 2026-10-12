@@ -3,6 +3,8 @@ import {
   classifyTerminalRoute,
   normalizeForTerminal,
   screenBlocksWrite,
+  screenIsCredentialField,
+  screenShowsLiveBlockingPrompt,
   type TerminalRouteInput,
 } from "./dictationTerminalRoute";
 
@@ -298,5 +300,85 @@ describe("screenBlocksWrite — display-ambiguous arms are bounded to the live t
   it("blocks a live 'press enter to continue' on the last row", () => {
     const screen = [...filler(30), "Press enter to continue…"].join("\n");
     expect(screenBlocksWrite(screen)).toBe(true);
+  });
+});
+
+// ── THE LIVE-ANCHORED PROMPT CHECK THE GOAL AUTO-RESUME ESCALATION USES — bead sparkle-eou3y0.4 ──
+//
+// `screenBlocksWrite`/`screenIsCredentialField` scan the whole grid on purpose (dictation hot-mic +
+// model-send safety), so they refuse an idle agent whose finished output merely MENTIONS a password.
+// `screenShowsLiveBlockingPrompt` is the counterpart the auto-resume escalation reads: it fires only
+// on a prompt that is LIVE at the bottom. The two MUST diverge on the mention and AGREE on a real
+// prompt, which is what these pairs pin — a suite that only asserts one direction cannot tell a
+// working live-check from one that always answers the same thing.
+describe("screenShowsLiveBlockingPrompt — the live-anchored counterpart to the write guard", () => {
+  const steps = (n: number) =>
+    Array.from({ length: n }, (_, i) => `     done step ${i + 1} of ${n}`);
+
+  // The measured false positive (bead sparkle-eou3y0.4): a finished turn that asked the human to
+  // rotate a password secret, now idle at its own composer with the request scrolled above the live
+  // tail. A credential word is on the grid, but there is NO prompt awaiting input.
+  const IDLE_AGENT_MENTIONING_A_PASSWORD = [
+    "⏺ The signing work is done. Before I continue, rotate the signing password:",
+    "  ⎿  rotation checklist:",
+    ...steps(12),
+    '     reply "done" once the secret has been rotated.',
+    "",
+    "╭────────────────────────────────────────────╮",
+    "│ >                                          │",
+    "╰────────────────────────────────────────────╯",
+    "  ? for shortcuts",
+  ].join("\n");
+
+  it("is FALSE for an idle agent whose finished output merely mentions a password", () => {
+    expect(screenShowsLiveBlockingPrompt(IDLE_AGENT_MENTIONING_A_PASSWORD)).toBe(false);
+  });
+
+  // …and the write guard, correctly for ITS purpose, still flags the same screen. This is the whole
+  // point — the two diverge, so the auto-resume can stop escalating a screen dictation still refuses.
+  it("…while the whole-grid write guard still refuses that same screen (the divergence)", () => {
+    expect(screenIsCredentialField(IDLE_AGENT_MENTIONING_A_PASSWORD)).toBe(true);
+    expect(screenBlocksWrite(IDLE_AGENT_MENTIONING_A_PASSWORD)).toBe(true);
+  });
+
+  // The AGREEING direction: a prompt genuinely sitting at the bottom is live, so both say so.
+  it.each([
+    ["a sudo password prompt", "$ sudo systemctl restart nginx\n[sudo] password for drodio:"],
+    ["a bare password prompt", "drodio@host's password:"],
+    ["a git credential prompt", "Password for 'https://github.com':"],
+    ["a 2FA code prompt", "Verification code:"],
+    [
+      "ssh's host-key confirmation",
+      "The authenticity of host 'x' can't be established.\nAre you sure you want to continue connecting (yes/no/[fingerprint])?",
+    ],
+    ["a live bracketed (y/n) under two lines of chatter", "Drop the table? (y/n)\nWaiting…\nCtrl-C to abort."],
+    // ── THE KINDS roborev 83619/83620 CAUGHT THE PREDICATE MISSING ──────────────────────────────
+    // conciergeDispatch refuses all of these as `blocked-prompt`, and each was NOT a bare bracketed
+    // `(y/n)` — so `screenAwaitsInput`'s `YES_NO_INLINE` (/[([]y\/n[)\]]/) never matched them and the
+    // escalation failed open on a genuinely-stuck agent. The first test used `(y/n)` precisely because
+    // that is the one shape the gap did not cover, which is why the gap was invisible.
+    ["a full-word (yes/no) confirmation", "Overwrite existing config? (yes/no)\nWaiting for response…"],
+    ["a bare y/n confirmation", "Apply this migration? y/n"],
+    ["a type-yes-to-confirm prompt", 'This will delete 12 branches.\nType "yes" to confirm:'],
+  ])("is TRUE when %s is live at the bottom", (_n, screen) => {
+    expect(screenShowsLiveBlockingPrompt(screen)).toBe(true);
+  });
+
+  // …and the SAME kinds scrolled above the live tail are NOT live — a word on the grid is not a
+  // prompt. This is the paired direction for the three rows above: without it, a predicate that
+  // returned true unconditionally would pass them.
+  it.each([
+    ["a (yes/no) scrolled far above an idle box", "Overwrite config? (yes/no)"],
+    ["a type-yes mention scrolled far above an idle box", 'Type "yes" to confirm the destructive op'],
+  ])("is FALSE when %s has a composer below it", (_n, prompt) => {
+    const filler = Array.from({ length: 14 }, (_, i) => `  ⎿  step ${i + 1} done`);
+    const screen = [`⏺ ${prompt}`, ...filler, "", "╭────────╮", "│ >      │", "╰────────╯", "  ? for shortcuts"].join("\n");
+    expect(screenShowsLiveBlockingPrompt(screen)).toBe(false);
+  });
+
+  // The other half of the idle case: an ordinary finished turn with no credential word at all is
+  // never a live prompt, or the auto-resume would stop escalating everything.
+  it("is FALSE for an ordinary finished turn at the idle box", () => {
+    expect(screenShowsLiveBlockingPrompt(IDLE_SCREEN)).toBe(false);
   });
 });

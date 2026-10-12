@@ -76,6 +76,7 @@ import {
 import type { ConciergeDispatchPath } from "./conciergeDispatch";
 import { altScreenRefusalVerdict, type AltScreenRefusalVerdict } from "../engine/screenReadability";
 import { getAgentViewport } from "./terminalViewport";
+import { screenShowsLiveBlockingPrompt } from "../voice/dictationTerminalRoute";
 import { getRelaySocket } from "./relayClient";
 import { log } from "../logger";
 import { findWindowForProject } from "./windowRegistry";
@@ -1490,7 +1491,25 @@ async function continueAgent(
         result.path === "alternate-screen"
           ? altScreenRefusalVerdict(getAgentViewport(agent.id), result.liveMenuLabels)
           : undefined;
-      noteUndelivered(projectId, agent, result.path, now, result.liveMenuLabels, screenVerdict);
+      // ── IS THE `blocked-prompt` REFUSAL BACKED BY A LIVE PROMPT? (bead sparkle-eou3y0.4) ─────────
+      // The write guard that produced `blocked-prompt` scans the WHOLE grid for its own (dictation /
+      // model-send) safety, so it refuses an idle agent whose finished output merely MENTIONS a
+      // password. Re-read the SAME viewport registry every write guard reads and ask whether a prompt
+      // is actually live at the bottom now; `noteUndelivered` fails open when it is not, exactly as
+      // the `alternate-screen` ladder does for a screen it cannot positively recognise (sparkle-phb1h).
+      const blockedPromptLive =
+        result.path === "blocked-prompt"
+          ? blockedPromptRefusalIsLive(agent.id, result.liveMenuLabels)
+          : undefined;
+      noteUndelivered(
+        projectId,
+        agent,
+        result.path,
+        now,
+        result.liveMenuLabels,
+        screenVerdict,
+        blockedPromptLive,
+      );
     }
   } catch (e) {
     outcome.detail = "threw";
@@ -1519,6 +1538,31 @@ async function continueAgent(
  * retrying; it matters if a human un-escalates the goal, which should start the count over rather
  * than re-escalate on the first refusal.
  */
+/**
+ * Does a `blocked-prompt` refusal correspond to a prompt that is LIVE on the screen right now — a
+ * live menu, or a credential/shell prompt at the live bottom — rather than a credential word merely
+ * MENTIONED in an idle agent's finished output? The auto-resume escalation's counterpart to
+ * {@link altScreenRefusalVerdict}; bead sparkle-eou3y0.4.
+ *
+ *   • `true`      — positive evidence of a live prompt. Escalate.
+ *   • `false`     — the viewport is readable and shows NO live prompt. Fail open: the write guard
+ *                   refused over a mention, not a prompt, so do not re-fire the credential escalation.
+ *   • `undefined` — the window cannot read this terminal (a cloud agent, or no pane mounted here).
+ *                   Absence of evidence is not evidence of a mention, so the existing escalate-anyway
+ *                   behaviour is kept — the dispatcher read a RELAYED viewport we cannot re-read.
+ */
+function blockedPromptRefusalIsLive(
+  agentId: string,
+  liveMenuLabels?: readonly string[],
+): boolean | undefined {
+  // A menu the refusing path actually read is positive evidence of a live question, and outranks
+  // anything re-read here (that read happened at the instant of the refusal; this one a moment later).
+  if (liveMenuLabels !== undefined && liveMenuLabels.length > 0) return true;
+  const viewport = getAgentViewport(agentId);
+  if (!viewport) return undefined;
+  return screenShowsLiveBlockingPrompt(viewport.text);
+}
+
 function noteUndelivered(
   projectId: string,
   agent: AgentTab,
@@ -1534,6 +1578,9 @@ function noteUndelivered(
   /** For `alternate-screen`: what {@link altScreenRefusalVerdict} made of the screen. This decides
    *  BOTH whether a human is told and what they are told — see the fail-open block below. */
   screenVerdict?: AltScreenRefusalVerdict,
+  /** For `blocked-prompt`: whether a prompt is actually LIVE on the screen (see
+   *  {@link blockedPromptRefusalIsLive}). `false` fails open; `true`/`undefined` escalate. */
+  blockedPromptLive?: boolean,
 ): void {
   const reason = refusalReasonKey(path, screenVerdict);
   const prior = undelivered.get(agent.id);
@@ -1562,6 +1609,17 @@ function noteUndelivered(
   // The streak is still counted and still logged, so the condition is visible to anyone reading the
   // log — what is withheld is only the claim that a human is needed.
   if (path === "alternate-screen" && screenVerdict !== "claude-dialog") return;
+  // ══ FAIL OPEN ON A `blocked-prompt` WHOSE LIVE SCREEN SHOWS NO PROMPT — bead sparkle-eou3y0.4 ═══
+  // The `blocked-prompt` write guard scans the whole grid, so it refuses an idle agent whose finished
+  // output merely MENTIONS a password (e.g. it asked the human to rotate a secret and then stopped at
+  // its own composer). Escalating that told the human "its terminal is waiting at a prompt that must
+  // not receive free text — a password, a host-key confirmation, or a yes/no" and latched the goal,
+  // re-firing ~every 2h on an agent that was only waiting on them. So escalate only on POSITIVE
+  // evidence of a live prompt — the same fail-open the `alternate-screen` arm above takes, and for the
+  // same reason: an idle agent waiting on a human action is already visible as a non-escalating row,
+  // and this ladder must not spend a finite re-arm to make a claim the screen does not support.
+  // `undefined` (an unreadable / cloud viewport) still escalates: absence of evidence is not evidence.
+  if (path === "blocked-prompt" && blockedPromptLive === false) return;
   if (count < MAX_UNDELIVERED_CONTINUES) return;
   undelivered.delete(agent.id);
   escalateToHuman(
