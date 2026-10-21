@@ -109,6 +109,44 @@ export interface PrRow {
    * count against the cap so an absent flag still cannot present a truncated list as complete.
    */
   listSaturated?: boolean;
+  /**
+   * The HumaneBench review's state on this PR — "passing" | "pending" | "failing" | "absent" — or
+   * `null`/`undefined` when Rust is not surfacing it: the HumaneBench switch in Settings → Tools
+   * (`[tools].humanebench`) is OFF, the rollup was unreadable, or the build predates the field.
+   * See {@link humanebenchNote}. Display only — merge readiness reads `checks`/`failingChecks`,
+   * which still carry a failing HumaneBench check whatever the switch says.
+   */
+  humanebench?: string | null;
+}
+
+/**
+ * The HumaneBench note a PR row shows, or `null` for none.
+ *
+ * This is what `[tools].humanebench` governs (bead sparkle-9o0649.1): Rust clears the field when
+ * the switch is off, so the row stays silent about HumaneBench. It never governs the REVIEW, which
+ * runs repo-side on every pull request whatever this says — and the title says so, so a reader
+ * cannot mistake hiding the note for opting out. "absent" (no HumaneBench check on the PR) is
+ * silent too: there is nothing to report, and "no check" must not read as a pass.
+ */
+export function humanebenchNote(
+  pr: Pick<PrRow, "humanebench">,
+): { label: string; title: string } | null {
+  const label =
+    pr.humanebench === "passing"
+      ? "HumaneBench passed"
+      : pr.humanebench === "pending"
+        ? "HumaneBench running"
+        : pr.humanebench === "failing"
+          ? "HumaneBench failed"
+          : null;
+  if (!label) return null;
+  return {
+    label,
+    title:
+      `${label} — the humaneness review GitHub runs on this pull request. Shown because the ` +
+      "HumaneBench switch in Settings → Tools is on; turning it off hides this note but does not " +
+      "turn the review off, which runs on every pull request regardless of this switch.",
+  };
 }
 
 /** The open PRs waiting in `root`'s repo, or null when it could not be determined (no `gh`, unauthed,

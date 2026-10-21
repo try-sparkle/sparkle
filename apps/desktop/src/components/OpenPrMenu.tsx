@@ -65,6 +65,7 @@ import { rowButtonStyle } from "./OpenPrMenu.rowButtonStyle";
 import {
   fetchOpenPrs,
   formatPrBadge,
+  humanebenchNote,
   mergePr,
   prListSaturated,
   prMergeReadiness,
@@ -2288,6 +2289,25 @@ export function OpenPrMenu({
                               >
                                 {pr.headRefName}
                               </span>
+                              {/* HUMANEBENCH, only while the [tools].humanebench switch is on —
+                                Rust clears the field when it is off (bead sparkle-9o0649.1). */}
+                              {(() => {
+                                const hb = humanebenchNote(pr);
+                                return hb ? (
+                                  <span
+                                    data-testid={`pr-humanebench-${pr.number}`}
+                                    title={hb.title}
+                                    style={{
+                                      flex: "0 0 auto",
+                                      whiteSpace: "nowrap",
+                                      paddingLeft: 5,
+                                      opacity: 0.75,
+                                    }}
+                                  >
+                                    · {hb.label}
+                                  </span>
+                                ) : null;
+                              })()}
                             </div>
                           </div>
 

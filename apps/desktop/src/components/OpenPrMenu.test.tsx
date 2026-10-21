@@ -1319,6 +1319,25 @@ describe("OpenPrMenu, compact", () => {
     expect(branch.style.minWidth).toBe("0");
   });
 
+  // THE [tools].humanebench CONSUMER, read off the rendered row (bead sparkle-9o0649.1). Rust
+  // fills `humanebench` only while the switch is on and clears it to null when it is off, so the
+  // same failing PR is shown both ways: ON names the HumaneBench state, OFF says nothing about it.
+  // Neither direction may touch the row's real blocker — the failing check is GitHub's reading.
+  it("names the HumaneBench state only while the switch is on", async () => {
+    const on: PrRow = { ...FAILING, humanebench: "failing" };
+    const off: PrRow = { ...FAILING, number: FAILING.number + 1, humanebench: null };
+    stubList([on, off]);
+    render(compact());
+    await openMenu();
+    const note = await screen.findByTestId(`pr-humanebench-${on.number}`);
+    expect(note.textContent).toMatch(/HumaneBench failed/);
+    expect(note.title).toMatch(/does not turn the review off/i);
+    expect(screen.queryByTestId(`pr-humanebench-${off.number}`)).toBeNull();
+    for (const pr of [on, off]) {
+      expect(screen.getByTestId(`pr-state-${pr.number}`).textContent).toMatch(/checks failing/i);
+    }
+  });
+
   it("keeps the wide pill and its own containment clamps when NOT compact", async () => {
     stubList([PASS]);
     render(

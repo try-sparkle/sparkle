@@ -790,8 +790,9 @@ interface SettingsState {
    *
    *  Turning this OFF does not skip the review: it is repo-side
    *  (`.github/workflows/humane-gate.yml`, triggered by the pull request), so it runs whatever
-   *  this says — which is the point of the machine-wide scope, not a gap in it. Nothing reads
-   *  this field yet (bead `sparkle-9o0649.1`). Mirrors [tools].humanebench. */
+   *  this says — which is the point of the machine-wide scope, not a gap in it. What it DOES
+   *  govern (bead `sparkle-9o0649.1`): whether the open-PR menu shows each PR's HumaneBench state
+   *  (see `humanebenchNote` in services/openPrs.ts). Mirrors [tools].humanebench. */
   humanebenchEnabled: boolean;
   /** roborev — the per-commit AI code-review daemon. On (default) → the Tools toggle is on and
    *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-

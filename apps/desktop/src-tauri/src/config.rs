@@ -272,7 +272,7 @@ pub struct ToolsConfig {
     /// the review; this bool is not the thing that turns it on, and the next paragraph is why.
     ///
     /// WHAT THIS FLAG DOES NOT DO, stated precisely because the difference is the whole gate.
-    /// Three things, and every one of them is a claim some earlier copy made and had to retract:
+    /// Two things, and each of them is a claim some earlier copy made and had to retract:
     ///
     /// 1. IT DOES NOT SWITCH THE REVIEW OFF — and it CANNOT, by construction. The review is
     ///    repo-side: `.github/workflows/humane-gate.yml`, triggered by the pull request itself,
@@ -287,16 +287,13 @@ pub struct ToolsConfig {
     ///    deliberately NOT in ruleset 18343818's required contexts yet — bead `sparkle-4eqjil`
     ///    requires it to run green on real pull requests twice before an admin adds it. Until then
     ///    this scores and reports but does not block, and no copy anywhere may say otherwise.
-    /// 3. IT HAS NO CONSUMER AT ALL, today — bead `sparkle-9o0649.1`. Nothing reads it: measured,
-    ///    `grep -rn 'tools\.humanebench' apps/desktop/src-tauri/src/*.rs | grep -v config.rs`
-    ///    returns nothing, while every sibling flag in this table has a real call-site consumer
-    ///    (`tools.roborev` at roborev_probe.rs:443, `tools.builder_index` at builder_index.rs:1979,
-    ///    `tools.straude` at straude.rs:1603). So what IS it for? It is the persisted preference
-    ///    that consumer will read, and it is stated here rather than quietly left implied for the
-    ///    reason `scripts/dormant-modules.allow` gives in its own header: an honest "no consumer
-    ///    yet" note is the difference between a live entry and a stale one. When the consumer
-    ///    lands, delete this point — from here, from `DEFAULT_TEMPLATE`, from `ToolsPane.tsx`,
-    ///    from `services/config.ts` and from `settingsStore.ts`, all in the one change.
+    ///
+    /// WHAT IT DOES DO (bead `sparkle-9o0649.1`): it governs whether Sparkle's own open-PR menu
+    /// SURFACES the HumaneBench state of each pull request. On, `worktree.rs`'s `probe_open_prs`
+    /// keeps each row's `humanebench` state ("passing" | "pending" | "failing" | "absent"), and the
+    /// menu names it; off, `apply_humanebench_switch` clears it and the menu says nothing about
+    /// HumaneBench. That is display only: a failing HumaneBench check still counts among the PR's
+    /// failing checks and still reddens its rollup either way, because that reading is GitHub's.
     ///
     /// Machine-wide like every key in this table, and here that scope is load-bearing rather than
     /// incidental: a cloned repo must not be able to switch off its own humaneness gate simply by
@@ -7085,8 +7082,8 @@ humanebench = true  # score pull requests that change what Sparkle says or does 
                     # adds it to the branch ruleset. NOTE what setting this false does NOT do: the
                     # review is repo-side (.github/workflows/humane-gate.yml, triggered by the pull
                     # request), so it cannot be switched off from here and your PRs are scored and
-                    # commented on either way. Today nothing reads this key at all — it is the
-                    # saved preference a future consumer will read (bead sparkle-9o0649.1).
+                    # commented on either way. What it DOES govern: whether Sparkle's open-PR menu
+                    # shows each PR's HumaneBench state (on) or stays silent about it (off).
 roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
 # One of the two default-OFF tools, and the only one that publishes anything about you. On, Sparkle
 # posts your DAILY TOKEN TOTALS (per day, per model — never file paths, prompts, code, or keys) to the

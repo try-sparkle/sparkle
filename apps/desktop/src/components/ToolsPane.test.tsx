@@ -464,8 +464,8 @@ describe("ToolsPane", () => {
     // Everything above judges what the copy says about the REVIEW. This judges what it lets a
     // reader infer about the TOGGLE beside it, which is a different claim and was the false one:
     // the copy described a review, sat under a switch, and so read as the switch that governs it.
-    // It does not. Measured, `tools.humanebench` has no consumer anywhere — and even once it has
-    // one, that consumer cannot reach this review, which is repo-side
+    // It does not. Its one consumer (bead sparkle-9o0649.1) governs whether the open-PR menu
+    // SHOWS each PR's HumaneBench state — and that consumer cannot reach this review, which is repo-side
     // (.github/workflows/humane-gate.yml, triggered by the pull request) and deliberately out of
     // reach of a machine-wide desktop setting, because a checkout that could disable its own
     // humaneness gate is the thing the machine-wide scope exists to prevent. A user who flips
@@ -485,6 +485,12 @@ describe("ToolsPane", () => {
       /(?<!does not )(?<!doesn't )(?:turns?|switch(?:es)?|shuts?) (?:it|the review|the gate) off|off skips|skips the review|disables the review|opts? you out/i,
     );
     expect(desc).toMatch(/does not turn it off|runs on every pull request|regardless of this/i);
+
+    // AND WHAT THE SWITCH DOES DO, now that it does something (bead sparkle-9o0649.1). Denying the
+    // false effect is half the job; the row must also name the true one, or a reader is left
+    // with a switch that visibly does nothing. And the stale "no consumer" note must not return.
+    expect(desc).toMatch(/open-PR menu shows each pull request's HumaneBench result/i);
+    expect(desc).not.toMatch(/nothing reads it/i);
   });
 
   it("toggles HumaneBench through the [tools].humanebench flag (never AI-locked)", () => {

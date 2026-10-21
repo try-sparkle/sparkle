@@ -5146,6 +5146,11 @@ pub struct PrRow {
     /// Names of the checks still RUNNING, same shape as `failing_checks`. A PR can have both (some
     /// checks red while others are still going).
     pub pending_checks: Vec<String>,
+    /// The HumaneBench review's state on this PR — "passing" | "pending" | "failing" | "absent"
+    /// (see `humanebench_state`) — or `None` when it is not surfaced: the `[tools].humanebench`
+    /// switch is off (`apply_humanebench_switch`), or the rollup could not be read at all. Display
+    /// only: the merge gate reads `checks`/`failing_checks`, which this switch never touches.
+    pub humanebench: Option<String>,
     /// The head commit SHA — the FINGERPRINT a dismissal is judged against (see `pr_dismissal`).
     ///
     /// A dismissal means "not now", so it has to expire when the pull request stops being the one
@@ -5394,6 +5399,40 @@ fn collect_check_names(rollup: &[Value]) -> (Vec<String>, Vec<String>) {
     (without_rollup_echoes(failing), pending)
 }
 
+/// The HumaneBench review's state on this PR, read out of the same rollup: "passing" | "pending" |
+/// "failing" | "absent". Both of the repo-side gate's entries count — the `HumaneBench` job and
+/// the `HumaneBench verdict` check run it publishes (`.github/workflows/humane-gate.yml`) — under
+/// `classify_checks`' precedence. "absent" is the positive observation that no HumaneBench entry
+/// is in the rollup (a repo without the gate, or one whose run has not registered yet).
+fn humanebench_state(rollup: &[Value]) -> &'static str {
+    let entries: Vec<Value> = live_entries(rollup)
+        .into_iter()
+        .filter(|c| check_name(c).starts_with("HumaneBench"))
+        .cloned()
+        .collect();
+    match classify_checks(&entries) {
+        "none" => "absent",
+        word => word,
+    }
+}
+
+/// THE ONE CONSUMER OF `[tools].humanebench` (bead sparkle-9o0649.1). The switch governs whether
+/// Sparkle's PR menu SURFACES the HumaneBench state on each row: on keeps the value read from the
+/// rollup, off clears it to `None` so the menu says nothing about HumaneBench.
+///
+/// IT DOES NOT AND CANNOT SWITCH OFF THE PR REVIEW. That review runs repo-side in GitHub Actions,
+/// which never reads a desktop config — by design, so no machine-wide setting (and no project file)
+/// can disable a repo's humaneness gate. A HumaneBench failure therefore still appears in
+/// `failing_checks` and still colours `checks` red whatever this switch says; it changes what
+/// Sparkle names, never what GitHub enforces.
+fn apply_humanebench_switch(rows: &mut [PrRow], enabled: bool) {
+    if !enabled {
+        for r in rows.iter_mut() {
+            r.humanebench = None;
+        }
+    }
+}
+
 /// GitHub's `mergeStateStatus` enum → the lowercase word the UI reads. An unrecognised or absent
 /// value reads "unknown", which the UI treats as "we cannot promise this is safe" — never as clean.
 fn normalize_merge_state(v: Option<&str>) -> &'static str {
@@ -5452,6 +5491,7 @@ fn decode_open_prs(stdout: &str, limit: u32) -> Option<Vec<PrRow>> {
                 let checks = rollup.map(|a| classify_checks(a)).unwrap_or("none").to_string();
                 let (failing_checks, pending_checks) =
                     rollup.map(|a| collect_check_names(a)).unwrap_or_default();
+                let humanebench = rollup.map(|a| humanebench_state(a).to_string());
                 let mergeable =
                     normalize_mergeable(r.get("mergeable").and_then(Value::as_str)).to_string();
                 let merge_state_status =
@@ -5468,6 +5508,7 @@ fn decode_open_prs(stdout: &str, limit: u32) -> Option<Vec<PrRow>> {
                     merge_state_status,
                     failing_checks,
                     pending_checks,
+                    humanebench,
                     head_ref_oid: str_field("headRefOid"),
                     // Merge rights are a REPO fact and cost their own `gh` call; the pure decoder
                     // cannot know them, so every row leaves here UNKNOWN and `probe_open_prs` fills
@@ -5579,6 +5620,7 @@ where
             .take(covered)
             .map(|p| {
                 let rollup = fetch_checks(&p.head_oid);
+                let humanebench = rollup.as_deref().map(|r| humanebench_state(r).to_string());
                 // A rollup we could not read yields NO check word rather than "none": "none" is
                 // the positive observation that a PR has no checks at all, and the UI reads it as
                 // ready-to-merge. An unreadable rollup must never borrow that meaning.
@@ -5600,6 +5642,7 @@ where
                     merge_state_status: "unknown".into(),
                     failing_checks: failing,
                     pending_checks: pending,
+                    humanebench,
                     head_ref_oid: p.head_oid.clone(),
                     list_saturated: page_full || covered < mine.len(),
                     ..Default::default()
@@ -6150,6 +6193,9 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
             r.viewer_can_merge = can;
         }
     }
+    // Read at the point of use, like `tools.roborev` in `merge_pr`: a toggle takes effect on the
+    // next poll without a restart.
+    apply_humanebench_switch(&mut rows, crate::config::for_project(root).config.tools.humanebench);
     Some(attach_pr_owners(rows, project_id, app_data))
 }
 
@@ -18366,6 +18412,8 @@ mod tests {
                 merge_state_status: "clean".into(),
                 failing_checks: vec![],
                 pending_checks: vec![],
+                // A readable rollup with no HumaneBench entry is the positive "absent", not None.
+                humanebench: Some("absent".into()),
                 head_ref_oid: String::new(),
                 // Merge rights are a repo fact `probe_open_prs` attaches; the decoder leaves them
                 // UNKNOWN, which is not the same as "cannot merge".
@@ -18394,6 +18442,7 @@ mod tests {
                 merge_state_status: "unknown".into(),
                 failing_checks: vec![],
                 pending_checks: vec![],
+                humanebench: None,
                 head_ref_oid: String::new(),
                 viewer_can_merge: None,
                 list_saturated: false,
@@ -18402,6 +18451,83 @@ mod tests {
                 body: String::new(),
             }
         );
+    }
+
+    /// `[tools].humanebench` HAS A CONSUMER (bead sparkle-9o0649.1), pinned in BOTH directions on
+    /// the same decoded row: ON surfaces the HumaneBench state, OFF suppresses it. And in neither
+    /// direction does the switch touch the merge gate's own reading — the HumaneBench failure stays
+    /// in `failing_checks` and keeps `checks` red, because the switch cannot turn the review off.
+    #[test]
+    fn the_humanebench_switch_surfaces_or_suppresses_the_verdict_but_never_the_gate() {
+        let decode = || {
+            decode_open_prs(
+                r#"[{
+                    "number": 3100,
+                    "statusCheckRollup": [
+                        { "name": "Node — static", "status": "COMPLETED", "conclusion": "SUCCESS" },
+                        { "name": "HumaneBench", "status": "COMPLETED", "conclusion": "SUCCESS" },
+                        { "name": "HumaneBench verdict", "status": "COMPLETED", "conclusion": "FAILURE" }
+                    ]
+                }]"#,
+                OPEN_PR_LIST_LIMIT,
+            )
+            .expect("valid array decodes")
+        };
+
+        let mut on = decode();
+        apply_humanebench_switch(&mut on, true);
+        assert_eq!(on[0].humanebench.as_deref(), Some("failing"), "ON must surface the verdict");
+
+        let mut off = decode();
+        apply_humanebench_switch(&mut off, false);
+        assert_eq!(off[0].humanebench, None, "OFF must suppress the HumaneBench surface");
+
+        for rows in [&on, &off] {
+            assert_eq!(rows[0].checks, "failing", "the switch must never clear the rollup");
+            assert_eq!(rows[0].failing_checks, vec!["HumaneBench verdict".to_string()]);
+        }
+    }
+
+    /// The test above pins the helper; this pins that the LIVE probe still calls it with the flag.
+    /// `probe_open_prs` shells out to `gh`, so it is checked at the source: the body (bounded by
+    /// its column-0 closing brace) must route its rows through `apply_humanebench_switch` keyed on
+    /// `tools.humanebench`. Delete that line and the flag is inert again — this goes red.
+    #[test]
+    fn probe_open_prs_reads_the_humanebench_flag_at_the_point_of_use() {
+        let src = include_str!("worktree.rs");
+        let start = src.find("\nfn probe_open_prs(").expect("probe_open_prs exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("probe_open_prs has a column-0 close")];
+        assert!(
+            body.contains("Some(attach_pr_owners(rows, project_id, app_data))"),
+            "deep-body anchor missing — the slice no longer covers probe_open_prs' body"
+        );
+        assert!(
+            body.contains(
+                "apply_humanebench_switch(&mut rows, crate::config::for_project(root).config.tools.humanebench)"
+            ),
+            "probe_open_prs must gate the HumaneBench surface on [tools].humanebench (sparkle-9o0649.1)"
+        );
+    }
+
+    /// `humanebench_state` reads only HumaneBench entries, with `classify_checks`' precedence, and
+    /// says "absent" — never "passing" — when the rollup holds none.
+    #[test]
+    fn humanebench_state_reads_only_the_humanebench_entries() {
+        let rollup = |v: Value| v.as_array().unwrap().clone();
+        let other_red = serde_json::json!([
+            { "name": "Node — static", "status": "COMPLETED", "conclusion": "FAILURE" }
+        ]);
+        assert_eq!(humanebench_state(&rollup(other_red)), "absent");
+        let passing = serde_json::json!([
+            { "name": "Node — static", "status": "COMPLETED", "conclusion": "FAILURE" },
+            { "name": "HumaneBench", "status": "COMPLETED", "conclusion": "SUCCESS" }
+        ]);
+        assert_eq!(humanebench_state(&rollup(passing)), "passing");
+        let pending = serde_json::json!([
+            { "name": "HumaneBench", "status": "IN_PROGRESS" }
+        ]);
+        assert_eq!(humanebench_state(&rollup(pending)), "pending");
     }
 
     /// THE UNSTABLE CASE, decoded end-to-end from the real `gh pr list` shape.

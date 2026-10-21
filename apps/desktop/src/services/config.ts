@@ -154,8 +154,9 @@ export interface ToolsConfig {
    *  It does NOT switch that review off, and cannot: the review is repo-side
    *  (`.github/workflows/humane-gate.yml`, triggered by the pull request), so no machine-wide
    *  desktop setting reaches it — deliberately, since a checkout must not be able to disable its
-   *  own humaneness gate. Today nothing reads this field at all; it is the preference a future
-   *  consumer will read (bead `sparkle-9o0649.1`). See `ToolsConfig::humanebench` in config.rs.
+   *  own humaneness gate. What it DOES govern (bead `sparkle-9o0649.1`): whether the open-PR
+   *  menu shows each PR's HumaneBench state — Rust's `probe_open_prs` clears `PrRow.humanebench`
+   *  when it is off. See `ToolsConfig::humanebench` in config.rs.
    *
    *  Optional so callers guard: a Rust backend predating the key omits it, and the hydrate
    *  resolves an absent value through `?? true` — the same back-compat rule the

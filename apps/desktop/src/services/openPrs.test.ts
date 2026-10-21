@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 import {
   formatPrBadge,
+  humanebenchNote,
   mergePr,
   OPEN_PR_POLL_MS,
   OPEN_PR_QUERY_LIMIT,
@@ -1154,5 +1155,22 @@ describe("prMergeReadiness — an unverified row offers no override either", () 
       expect(r.override, JSON.stringify(pr)).toBeNull();
       expect(r.tone, JSON.stringify(pr)).not.toBe("ready");
     }
+  });
+});
+
+describe("humanebenchNote — the [tools].humanebench surface (bead sparkle-9o0649.1)", () => {
+  it("names each surfaced state and says the switch does not turn the review off", () => {
+    expect(humanebenchNote({ humanebench: "passing" })?.label).toBe("HumaneBench passed");
+    expect(humanebenchNote({ humanebench: "pending" })?.label).toBe("HumaneBench running");
+    const failed = humanebenchNote({ humanebench: "failing" });
+    expect(failed?.label).toBe("HumaneBench failed");
+    expect(failed?.title).toMatch(/does not turn the review off/i);
+  });
+
+  it("is silent when the switch is off (null), on an older build (undefined), or with no check", () => {
+    expect(humanebenchNote({ humanebench: null })).toBeNull();
+    expect(humanebenchNote({})).toBeNull();
+    // "absent" is the positive "no HumaneBench check here" — it must not read as a pass.
+    expect(humanebenchNote({ humanebench: "absent" })).toBeNull();
   });
 });
