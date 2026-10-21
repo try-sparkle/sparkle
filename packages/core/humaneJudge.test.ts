@@ -301,6 +301,10 @@ describe('CANNOT-PAY is not CANNOT-REACH — an unpaid bill must not read as an 
   const CREDIT = 'HTTP 400 Bad Request — {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}';
   const RATE = 'HTTP 429 Too Many Requests — {"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded for this organization"}}';
   const AUTHFAIL = 'HTTP 401 Unauthorized — {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}';
+  // The ONLY auth failure this gate actually sees in CI. The Claude CLI does not emit "HTTP 401"
+  // or the provider's `authentication_error` type — it says this (bead sparkle-9o0649.2).
+  const CLI_AUTHFAIL =
+    'Claude Code error (success 401): Failed to authenticate. API Error: 401 OAuth access token is invalid.';
   const DEAD = 'fetch failed: connect ECONNREFUSED 127.0.0.1:443';
 
   function noVerdict(error: string) {
@@ -327,6 +331,18 @@ describe('CANNOT-PAY is not CANNOT-REACH — an unpaid bill must not read as an 
     expect(line).not.toMatch(/credit balance|billing/i);
   });
 
+  it("classifies the Claude CLI's OWN 401 wording as a key problem, not an unreachable model", () => {
+    // bead sparkle-9o0649.2. The synthetic AUTHFAIL above matches because it carries "HTTP 401"
+    // and the provider's `authentication_error` type — but that is a FICTION. The real CLI says
+    // "Failed to authenticate. API Error: 401 OAuth access token is invalid." (no "HTTP", no
+    // `authentication_error`), so it fell through to `unreachable` and the "re-issue the key"
+    // remedy was never reached. Asserted on the wording the gate actually sees.
+    const line = headline(noVerdict(CLI_AUTHFAIL));
+    expect(line).toMatch(/key|credential/i);
+    expect(line).not.toMatch(/unreachable|could not be reached/i);
+    expect(line).not.toMatch(/credit balance|billing/i);
+  });
+
   it('still says the generic thing when the cause really IS an unreachable model', () => {
     // The paired negative: without it, a classifier that fires on everything passes the
     // three tests above while telling every reader to go pay a bill they do not owe.
@@ -338,7 +354,7 @@ describe('CANNOT-PAY is not CANNOT-REACH — an unpaid bill must not read as an 
   it('is still NOT A PASS, and still does not block, whatever the cause', () => {
     // The fail-open contract is the reason this bug was survivable. Classifying the cause
     // must not quietly convert a neutral no-verdict into a blocking one.
-    for (const err of [CREDIT, RATE, AUTHFAIL, DEAD]) {
+    for (const err of [CREDIT, RATE, AUTHFAIL, CLI_AUTHFAIL, DEAD]) {
       const v = noVerdict(err);
       expect(v.humaneScore).toBeNull();
       expect(headline(v)).toContain('not a pass');

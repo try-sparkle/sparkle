@@ -191,7 +191,12 @@ export function classifyNoVerdictCause(
   if (/\bHTTP 402\b|credit balance|insufficient[ _-]?(?:quota|credit|funds)|billing|payment required|quota exceeded|rate[ _-]?limit_error|\bHTTP 429\b/i.test(text)) {
     return 'credit';
   }
-  if (/\bHTTP 40[13]\b|authentication[ _-]?error|permission[ _-]?error|invalid[ _-]?(?:x-)?api[ _-]?key|unauthorized|not authenticated/i.test(text)) {
+  // The Claude CLI is the auth failure this gate actually sees, and it speaks its OWN dialect, not
+  // the HTTP/`authentication_error` one above: "Failed to authenticate. API Error: 401 OAuth access
+  // token is invalid." (bead sparkle-9o0649.2). Those phrases are matched here so a dead token is
+  // classified as `auth` — and reaches the re-issue-the-key remedy — instead of falling through to
+  // `unreachable`. 401/403 only; 400/404/422 stay with request-rejected below.
+  if (/\bHTTP 40[13]\b|\bAPI Error:\s*40[13]\b|authentication[ _-]?error|permission[ _-]?error|failed to authenticate|invalid[ _-]?(?:x-)?api[ _-]?key|access token is invalid|unauthorized|not authenticated/i.test(text)) {
     return 'auth';
   }
   // THE REQUEST ITSELF WAS REFUSED — the gate is wrong, not the infrastructure. Beads
