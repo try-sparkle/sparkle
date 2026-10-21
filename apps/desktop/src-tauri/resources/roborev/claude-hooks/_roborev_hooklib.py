@@ -606,6 +606,160 @@ def scope_to_branch_commits(cwd: str, branch: str, jobs: list[dict]) -> list[dic
     return kept
 
 
+# ---- UNREVIEWED pushed commits (bead sparkle-ivm6t7) --------------------------
+#
+# `_is_open_fail` is the only thing the push gate DENIES on, and that is right:
+# a crashed review job (status failed, no verdict — expired OAuth, spent quota, a
+# stand-down) and a commit with NO job row at all are not findings. But both used
+# to fall through to the happy-path allow with NO message, so "nobody reviewed
+# this" read exactly like "reviewed and clean". The policy stays triaged-to-land
+# (a NOTICE, never a deny — turning it into a block is a founder call); what
+# changes is that the push now SAYS it is unreviewed.
+#
+# Scope is "the commits being pushed": on the branch, reachable from no remote-
+# tracking ref, merges excluded (a clean `git merge` fires post-MERGE, never
+# post-commit, so it never gets a row — reporting it would make the notice
+# always-on for every branch that merges its base in, and a notice that is always
+# on is one nobody reads). Narrative-only commits (every path under PRD/ or a
+# docs/*.md) are excluded for the same reason: the vendored post-commit hook
+# deliberately never enqueues them. Both exclusions only ever SILENCE a "no row"
+# line — an errored row on such a commit is still reported.
+
+UNREVIEWED_MAX_COMMITS = 50
+UNREVIEWED_ERROR_MAX_CHARS = 120
+# `roborev list` returns at most this many rows by default; a rowless commit on a
+# branch whose listing hit the cap may simply be older than the window.
+ROBOREV_LIST_DEFAULT_LIMIT = 50
+
+
+def _git_lines(cwd: str, *args: str) -> list[str] | None:
+    """`git <args>` stdout as lines, or None if git could not answer. Unlike
+    `_git_stdout`, an EMPTY answer stays distinct from a failed one — "nothing is
+    being pushed" and "could not tell what is being pushed" are different facts."""
+    git = _find_git()
+    if git is None:
+        return None
+    try:
+        r = subprocess.run([git, *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _is_narrative_path(path: str) -> bool:
+    # Mirrors the vendored post-commit hook's `^(PRD/|docs/.*\.md$)` skip.
+    return path.startswith("PRD/") or (path.startswith("docs/") and path.endswith(".md"))
+
+
+def _never_enqueued_by_design(cwd: str, sha: str) -> bool:
+    paths = _git_lines(cwd, "diff-tree", "--no-commit-id", "--name-only", "-r", sha)
+    # Empty/unreadable → NOT exempt: the post-commit hook enqueues those too.
+    return bool(paths) and all(_is_narrative_path(p) for p in paths)
+
+
+def _row_matches(row: dict, sha: str) -> bool:
+    ref = row.get("git_ref")
+    if not isinstance(ref, str):
+        return False
+    ref = ref.strip()
+    return ref == sha or (len(ref) >= 7 and sha.startswith(ref))
+
+
+def _first_error_line(row: dict) -> str:
+    err = row.get("error")
+    line = ""
+    if isinstance(err, str):
+        line = next((ln.strip() for ln in err.splitlines() if ln.strip()), "")
+    if not line:
+        return f"job finished with no verdict (status {row.get('status') or '?'})"
+    if len(line) > UNREVIEWED_ERROR_MAX_CHARS:
+        line = line[: UNREVIEWED_ERROR_MAX_CHARS - 1] + "…"
+    return f"job errored: {line}"
+
+
+def unreviewed_pushed_commits(cwd: str, branch: str, jobs: list) -> dict:
+    """Classify the commits being pushed by review coverage.
+
+    Returns `{"ok": False}` when git could not enumerate them (fail-closed: the
+    caller must SAY coverage was not checked rather than stay silent), else
+    `{"ok": True, "unreviewed": [(sha, subject, reason), ...], "truncated": bool,
+    "window_full": bool}`. A commit counts as covered when any of its rows carries
+    a verdict, is closed (acknowledged), or is still in flight (it will land and,
+    if it fails, block the NEXT push — the triaged-to-land contract)."""
+    lines = _git_lines(
+        cwd, "log", "--no-merges", f"-n{UNREVIEWED_MAX_COMMITS + 1}",
+        "--format=%H%x09%s", branch, "--not", "--remotes", "--",
+    )
+    if lines is None:
+        return {"ok": False}
+    truncated = len(lines) > UNREVIEWED_MAX_COMMITS
+    rows = [j for j in (jobs or []) if isinstance(j, dict)]
+    unreviewed = []
+    for ln in lines[:UNREVIEWED_MAX_COMMITS]:
+        sha, _, subject = ln.partition("\t")
+        mine = [j for j in rows if _row_matches(j, sha)]
+        if any(j.get("verdict") for j in mine):
+            continue
+        if any(j.get("closed", False) for j in mine):
+            continue
+        if _in_flight(mine):
+            continue
+        if mine:
+            failed = [j for j in mine if j.get("status") == "failed"] or mine
+            latest = max(failed, key=lambda j: j.get("id") if isinstance(j.get("id"), int) else -1)
+            unreviewed.append((sha, subject, _first_error_line(latest)))
+        elif not _never_enqueued_by_design(cwd, sha):
+            unreviewed.append((sha, subject, "no review job was ever enqueued"))
+    return {
+        "ok": True,
+        "unreviewed": unreviewed,
+        "truncated": truncated,
+        "window_full": len(rows) >= ROBOREV_LIST_DEFAULT_LIMIT,
+    }
+
+
+def format_unreviewed_notice(branch: str, result: dict) -> str:
+    """Non-blocking additionalContext text for `unreviewed_pushed_commits`; "" when
+    there is nothing to say. Self-contained on purpose: this hook runs in ARBITRARY
+    repos machine-wide, so it names only roborev's own CLI and mentions a repo
+    script strictly conditionally."""
+    if not result.get("ok"):
+        return (
+            f"roborev: could not enumerate the commits being pushed on '{branch}' "
+            "(git log failed), so their review coverage was NOT checked. This push is "
+            "not blocked, but do not read the silence as 'every commit was reviewed'."
+        )
+    items = result.get("unreviewed") or []
+    if not items:
+        return ""
+    lines = [
+        f"roborev: {len(items)} commit(s) UNREVIEWED on '{branch}' — this push is NOT "
+        "blocked (only a completed fail-verdict review blocks a push), but no review "
+        "verdict exists for:",
+    ]
+    for sha, subject, reason in items:
+        subj = subject if len(subject) <= 60 else subject[:59] + "…"
+        lines.append(f"  - {sha[:12]} {subj} — {reason}")
+    if result.get("truncated"):
+        lines.append(f"  (only the newest {UNREVIEWED_MAX_COMMITS} pushed commits were checked)")
+    if result.get("window_full") and any(r == "no review job was ever enqueued" for _, _, r in items):
+        lines.append(
+            f"  (`roborev list` returned its {ROBOREV_LIST_DEFAULT_LIMIT}-row cap, so a "
+            "commit listed as never enqueued may just be older than that window)"
+        )
+    lines += [
+        "",
+        "An absence of findings here is NOT a clean review. Verify per commit: "
+        "`roborev show <sha>` reads its job state, and `roborev review <sha>` "
+        "re-enqueues it once the cause is fixed (`roborev status` — expired auth, "
+        "spent quota, a stopped daemon); if this repo has "
+        "scripts/roborev-authored-findings.sh, run it for a per-commit verdict.",
+    ]
+    return "\n".join(lines)
+
+
 # `roborev list` is bounded so a wedged daemon can't hang a git hook forever. The
 # bound was 5s, which is a statement about the CLI's LATENCY — and that latency
 # grows with the size of the local review store, not with anything the pushing

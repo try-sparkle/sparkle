@@ -417,6 +417,11 @@ export interface WorkerResult {
   /** OPTIONAL structured retrospective (missing is fine). Strict-when-present: a malformed retro
    *  throws, which is caught at the AgentPane call site (same as the rest of parseWorkerResult). */
   retro?: WorkerRetro;
+  /** sparkle-wr9u8: the roborev gate the worker ran before claiming success —
+   *  `scripts/roborev-authored-findings.sh`'s exit code, or `null` in a repo with no such script.
+   *  OPTIONAL and LENIENT: a malformed value is dropped rather than rejecting the whole result, and
+   *  the orchestrator reads an absent one as UNKNOWN (never clean). */
+  reviewGate?: { exit: number | null; reason?: string };
 }
 
 const STATUSES = ["success", "failed", "partial"] as const;
@@ -497,6 +502,7 @@ export function parseWorkerResult(raw: string): WorkerResult {
   if (typeof obj.summary !== "string" || !obj.summary) throw new Error("summary is required");
   if (obj.notes !== undefined && typeof obj.notes !== "string") throw new Error("notes must be a string");
   const retro = obj.retro !== undefined ? parseWorkerRetro(obj.retro) : undefined;
+  const reviewGate = parseReviewGate(obj.reviewGate);
   return {
     schemaVersion: 1,
     taskId: obj.taskId,
@@ -506,7 +512,18 @@ export function parseWorkerResult(raw: string): WorkerResult {
     summary: obj.summary,
     ...(obj.notes !== undefined ? { notes: obj.notes as string } : {}),
     ...(retro !== undefined ? { retro } : {}),
+    ...(reviewGate !== undefined ? { reviewGate } : {}),
   };
+}
+
+/** Lenient read of result.json's `reviewGate`: the field is new, so a malformed one must not cost
+ *  the whole result (the orchestrator already reads an absent gate as UNKNOWN). */
+function parseReviewGate(v: unknown): WorkerResult["reviewGate"] {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const g = v as Record<string, unknown>;
+  const exit = g.exit === null ? null : typeof g.exit === "number" && Number.isInteger(g.exit) ? g.exit : undefined;
+  if (exit === undefined) return undefined;
+  return { exit, ...(typeof g.reason === "string" ? { reason: g.reason } : {}) };
 }
 
 /** System prompt that turns a plain `claude` session into a single-task worker IC. When
@@ -549,9 +566,23 @@ export function workerPersona(opts: {
     '  { "schemaVersion": 1, "taskId": "<the id from the Task <id>: line of your first message>",',
     '    "branch": "<your git branch>", "status": "success" | "failed" | "partial",',
     '    "filesChanged": ["path", ...], "summary": "<one-paragraph what you did>",',
-    '    "notes": "<optional caveats / follow-ups>" }',
+    '    "notes": "<optional caveats / follow-ups>", "reviewGate": { "exit": <n> } }',
     "Create the .sparkle directory if needed. This result.json is for the orchestrator's coordination",
     "(status / summary / files), NOT your retrospective — your retro is the structured output below.",
+    "",
+    "REVIEW GATE — BEFORE YOU WRITE status \"success\"",
+    "- A success claim is a claim that your commits were REVIEWED and nothing is open on them.",
+    "  If the repo has `scripts/roborev-authored-findings.sh`, run",
+    "  `bash scripts/roborev-authored-findings.sh` after your FINAL commit.",
+    "  Only exit 0 clears; 1, 3 and 4 are NOT success (1 = an open",
+    "  fail-verdict finding on a commit you authored — fix it or close it with a stated reason, then",
+    "  re-run; 3 = could not tell; 4 = NOT REVIEWED — a job still queued/running, crashed, or never",
+    "  enqueued — wait for it and re-run). If it still does not exit 0, write status \"partial\" and",
+    "  say why in `notes`.",
+    '- Record the exit code you got as `"reviewGate": { "exit": <n> }` in result.json — the',
+    "  orchestrator reads that field, not your prose. If the repo has no such script, write",
+    '  `"reviewGate": { "exit": null, "reason": "no roborev gate script in this repo" }` — never',
+    "  invent a 0. A result with no reviewGate is read as UNKNOWN, not as clean.",
     "",
     retroEmissionProtocol(),
     "",

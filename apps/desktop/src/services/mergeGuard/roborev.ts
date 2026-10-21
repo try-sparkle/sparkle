@@ -416,7 +416,7 @@ function buildFinding(
  *     a finding because we could not grade it would turn the worst-understood finding into no
  *     finding at all, which is the failure this parser exists to avoid.
  */
-/* The three body shapes that PROVE a review raised nothing, measured in the live review store.
+/* The two body shapes that PROVE a review raised nothing, measured in the live review store.
  *  Each is anchored, because an unanchored match would clear a real finding that merely mentions
  *  one of these strings in passing. */
 
@@ -425,11 +425,11 @@ function buildFinding(
 const THRESHOLD_MET_LINE = /(?:^|\n)[ \t]*SEVERITY_THRESHOLD_MET[ \t]*(?:\n|$)/;
 // A review that ran and found nothing.
 const NO_ISSUES_OPENING = /^\s*(?:#+\s*)?no issues found/i;
-/* An AGENT SESSION-STATUS body: the review job executed a resume/status prompt instead of the review
- *  prompt, so the session's own status report was stored as the review. Anchored at the START and
- *  kept to three literal openings taken verbatim from the store, rather than anything fuzzy — this
- *  arm makes the gate MORE permissive, so a loose pattern here would clear real findings. */
-const SESSION_STATUS_OPENING = /^\s*(?:working:|nothing to commit\b|review-only session\b)/i;
+/* NOT a no-finding shape: an AGENT SESSION-STATUS body (`Working: …`, `NOTHING TO COMMIT`,
+ *  `Review-only session …`). There the job ran a resume/status prompt and the session's report was
+ *  stored as the review, so it proves the review NEVER RAN, not that it found nothing. Clearing it
+ *  would count an unreviewed commit as reviewed-and-clean (roborev job 83752), so it keeps
+ *  blocking like any other unreadable review. The corpus pins it as `noFinding: false`. */
 
 /**
  * Does this review body PROVE that the review raised no finding?
@@ -441,23 +441,13 @@ const SESSION_STATUS_OPENING = /^\s*(?:working:|nothing to commit\b|review-only 
  * keyed on `verdict === "F"` alone blocks a merge over a review that found nothing — and the
  * commonest single instance, an empty merge diff, occurs 788 times all-time.
  *
- * NOT YET WIRED TO ANY GATE, DELIBERATELY — and do not wire it to one alone. Read this first.
- * A first attempt applied it in `mergePrTool` only, and review showed that is worse than not
- * applying it at all, for two independent reasons:
- *
- *   1. THE REAL SINK IS RUST. Every in-app merge reaches `merge_pr` -> `roborev_drain_gate`
- *      (worktree.rs), which re-derives the blocking set itself from `roborev list --json` on
- *      `verdict == "F" && !closed`, never reads a body, and has deliberately no override. So a
- *      TypeScript-only reclassification is INERT in production: the pre-check passes and the sink
- *      still refuses. Worse, the refusal then arrives through the catch chain, whose classifier does
- *      not recognise the drain-refusal wording, so a coded `refused / roborev-unresolved` becomes an
- *      uncoded `unknown-error` — the branch a concierge retries verbatim, in a loop.
- *   2. `prRoborevStatusTool` documents an invariant that it and `merge_pr` "can never disagree about
- *      what clean means". Applying this on one path and not the other breaks exactly that.
- *
- * So it lands together or not at all: the Rust gate, both TypeScript ops, a shared ordering for the
- * read cap, and a classifier arm for the drain refusal. Tracked as its own bead; the unit tests
- * below already pin the predicate's contract so that work starts from a settled definition.
+ * WIRED EVERYWHERE OR NOWHERE (bead sparkle-6ca0yg). It is applied by the `merge_pr` pre-check and
+ * `pr_roborev_status` (both through `noFindingReadSet` + `withoutNoFindingFails` below, so the two
+ * can never disagree about what clean means) AND by its Rust twin `body_carries_no_finding` in
+ * `roborev_probe.rs`, which `roborev_drain_gate` — the sink every in-app merge reaches — applies
+ * to its own blocking set. A TypeScript-only application was tried first and was INERT: the sink
+ * re-derived the blocking set from the verdict column and still refused. The two definitions are
+ * pinned to ONE corpus, `apps/desktop/shared/roborev-no-finding-bodies.json`, parsed by both suites.
  *
  * IT IS A SAFETY GATE, SO IT FAILS CLOSED IN EVERY DIRECTION. `true` is reachable only by PROOF,
  * and it requires BOTH halves: the finding parser must come back empty AND the body must match a
@@ -482,9 +472,67 @@ export function bodyCarriesNoFinding(body: string | null | undefined): boolean {
   if (parseRoborevFindings(body).length > 0) return false;
   return (
     THRESHOLD_MET_LINE.test(body) ||
-    NO_ISSUES_OPENING.test(text) ||
-    SESSION_STATUS_OPENING.test(text)
+    NO_ISSUES_OPENING.test(text)
   );
+}
+
+/** How many FAIL-verdict review bodies one gate reading opens, newest (highest job id) first.
+ *  SHARED by the `merge_pr` pre-check, `pr_roborev_status`, and Rust's `NO_FINDING_READ_CAP`
+ *  (`roborev_probe.rs`, whose test reads this exact declaration): with one cap and one order, past
+ *  the cap every surface leaves the SAME rows unread — and unread blocks. */
+export const ROBOREV_REVIEW_READ_CAP = 5;
+
+/** Blocking rows in the one read order every surface shares: newest first. */
+export function blockingReadOrder(blocking: readonly RoborevJobRow[]): RoborevJobRow[] {
+  return [...blocking].sort((a, b) => b.id - a.id);
+}
+
+/** The blocking rows whose bodies a gate reading opens — the first `ROBOREV_REVIEW_READ_CAP` in
+ *  `blockingReadOrder`. Pure; the caller fetches the bodies. */
+export function noFindingReadSet(state: RoborevBranchState): RoborevJobRow[] {
+  return blockingReadOrder(state.blocking).slice(0, ROBOREV_REVIEW_READ_CAP);
+}
+
+/**
+ * Drop the blocking FAILs whose body PROVES the review raised nothing. Pure.
+ *
+ * Only rows in `noFindingReadSet(state)` can clear, and only on proof: a body missing from
+ * `bodies`, a `null` (unreadable) body, and every row past the cap keep blocking. This changes how a
+ * FAIL is CLASSIFIED, never whether a review exists — the cleared ids are returned so a reader can
+ * still see them.
+ */
+export function withoutNoFindingFails(
+  state: RoborevBranchState,
+  bodies: ReadonlyMap<number, string | null | undefined>,
+): { state: RoborevBranchState; noFinding: number[] } {
+  const cleared = new Set<number>();
+  for (const job of noFindingReadSet(state)) {
+    if (bodyCarriesNoFinding(bodies.get(job.id))) cleared.add(job.id);
+  }
+  if (cleared.size === 0) return { state, noFinding: [] };
+  return {
+    state: { ...state, blocking: state.blocking.filter((job) => !cleared.has(job.id)) },
+    noFinding: blockingReadOrder(state.blocking.filter((job) => cleared.has(job.id))).map((job) => job.id),
+  };
+}
+
+/**
+ * Classify a refusal raised by Rust's `roborev_drain_gate` (worktree.rs) — the sink every in-app
+ * merge reaches — into the same code the TypeScript gate would have used, or `null` when the
+ * message is not one. Without this, a sink refusal that arrives through `merge_pr`'s catch chain
+ * matches none of its generic patterns and degrades to `unknown-error`, the bucket a model retries
+ * verbatim. Keyed on markers Rust embeds deliberately (`Refusing merge_pr` plus the bead id or the
+ * fixed phrase), which a Rust test pins on the real rendered strings.
+ */
+export function roborevDrainRefusalCode(
+  message: string,
+): "roborev-unresolved" | "roborev-unknown" | null {
+  const m = (message || "").toLowerCase();
+  if (!m.includes("refusing merge_pr")) return null;
+  if (m.includes("sparkle-c9is0f") && m.includes("open roborev fail-verdict")) return "roborev-unresolved";
+  if (m.includes("could not read roborev's review state")) return "roborev-unknown";
+  if (m.includes("could not read the pr's head branch") && m.includes("roborev")) return "roborev-unknown";
+  return null;
 }
 
 export function parseRoborevFindings(markdown: string): RoborevFinding[] {

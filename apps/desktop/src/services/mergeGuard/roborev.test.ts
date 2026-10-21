@@ -18,6 +18,11 @@ import {
   fetchRoborevProbe,
   fetchRoborevReview,
   bodyCarriesNoFinding,
+  blockingReadOrder,
+  noFindingReadSet,
+  roborevDrainRefusalCode,
+  ROBOREV_REVIEW_READ_CAP,
+  withoutNoFindingFails,
   summarizeRoborev,
   roborevMergeGate,
   parseRoborevFindings,
@@ -25,6 +30,8 @@ import {
   ROBOREV_SEVERITY_RANK,
 } from "./roborev";
 import type { RoborevJobRow, RoborevProbe } from "./types";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 function resetInvoke(): void {
   calls.length = 0;
@@ -432,20 +439,21 @@ describe("parseRoborevFindings", () => {
       expect(bodyCarriesNoFinding("No issues found.\n\nSummary: all good.")).toBe(true);
     });
 
-    it("an agent SESSION-STATUS body is no-finding — the job ran the wrong prompt", () => {
+    it("an agent SESSION-STATUS body keeps BLOCKING — the review never ran (roborev job 83752)", () => {
       // Verbatim shapes from the store: the review job executed a resume/status prompt and the
-      // session's own status report was stored as the review body.
+      // session's own status report was stored as the review body. That proves NOT REVIEWED,
+      // never "found nothing", so clearing it would let an unreviewed commit merge.
       expect(
         bodyCarriesNoFinding(
           "Working: **yes** — branch sparkle/agent-9261ee4d; task = roborev code review of commit de93136",
         ),
-      ).toBe(true);
-      expect(bodyCarriesNoFinding("NOTHING TO COMMIT")).toBe(true);
+      ).toBe(false);
+      expect(bodyCarriesNoFinding("NOTHING TO COMMIT")).toBe(false);
       expect(
         bodyCarriesNoFinding(
           "Review-only session (roborev invoked me to review 2027d5c); I didn't commit, push or open a PR.",
         ),
-      ).toBe(true);
+      ).toBe(false);
     });
 
     /* THE PAIRED HALF, and the one that matters. Every case above makes the gate MORE permissive,
@@ -535,5 +543,101 @@ describe("severity ranking", () => {
 
   it("is null for no findings", () => {
     expect(highestSeverity([])).toBeNull();
+  });
+});
+
+/* THE CROSS-RUNTIME SEAM (bead sparkle-6ca0yg). `bodyCarriesNoFinding` has a Rust twin,
+ *  `body_carries_no_finding` in roborev_probe.rs, applied by `roborev_drain_gate` — the sink every
+ *  in-app merge reaches. Each suite alone is green while they disagree, so BOTH parse this one
+ *  corpus; change either definition and the other suite goes red too. */
+describe("bodyCarriesNoFinding — the shared cross-runtime corpus", () => {
+  const FIXTURE = JSON.parse(
+    readFileSync(
+      fileURLToPath(new URL("../../../shared/roborev-no-finding-bodies.json", import.meta.url)),
+      "utf8",
+    ),
+  ) as { version: number; cases: Array<{ name: string; body: string; noFinding: boolean }> };
+
+  it("is version 1 and carries both directions", () => {
+    expect(FIXTURE.version).toBe(1);
+    // A constant predicate passes a one-sided corpus.
+    expect(FIXTURE.cases.filter((c) => c.noFinding).length).toBeGreaterThanOrEqual(5);
+    expect(FIXTURE.cases.filter((c) => !c.noFinding).length).toBeGreaterThanOrEqual(5);
+  });
+
+  for (const c of FIXTURE.cases) {
+    it(`${c.noFinding ? "clears" : "keeps blocking"}: ${c.name}`, () => {
+      expect(bodyCarriesNoFinding(c.body)).toBe(c.noFinding);
+    });
+  }
+});
+
+describe("withoutNoFindingFails — the reclassification every surface shares", () => {
+  const CLEAN = "The diff is empty.\n\nSEVERITY_THRESHOLD_MET";
+  const REAL = "- **Severity**: High\n- **Problem**: x";
+  const fails = (...ids: number[]) =>
+    summarizeRoborev(probe(ids.map((id) => job({ id, verdict: "F" }))));
+
+  it("clears a FAIL whose body proves no finding, and keeps one that carries a finding", () => {
+    const { state, noFinding } = withoutNoFindingFails(
+      fails(1, 2),
+      new Map([
+        [1, CLEAN],
+        [2, REAL],
+      ]),
+    );
+    expect(state.blocking.map((j) => j.id)).toEqual([2]);
+    expect(noFinding).toEqual([1]);
+    expect(roborevMergeGate(state).code).toBe("roborev-unresolved");
+    // …and with only the clean one, the gate passes.
+    const only = withoutNoFindingFails(fails(1), new Map([[1, CLEAN]]));
+    expect(roborevMergeGate(only.state).canMerge).toBe(true);
+  });
+
+  it("fails CLOSED: an unreadable or missing body keeps blocking", () => {
+    for (const bodies of [new Map([[1, null]]), new Map<number, string | null>()]) {
+      expect(withoutNoFindingFails(fails(1), bodies).state.blocking.map((j) => j.id)).toEqual([1]);
+    }
+  });
+
+  it("reads newest first and stops at the SHARED cap — rows past it keep blocking", () => {
+    expect(ROBOREV_REVIEW_READ_CAP).toBe(5);
+    const s = fails(1, 2, 3, 4, 5, 6, 7);
+    expect(blockingReadOrder(s.blocking).map((j) => j.id)).toEqual([7, 6, 5, 4, 3, 2, 1]);
+    expect(noFindingReadSet(s).map((j) => j.id)).toEqual([7, 6, 5, 4, 3]);
+    // Every body is clean, yet 1 and 2 were never read — so they still block.
+    const all = new Map([1, 2, 3, 4, 5, 6, 7].map((id) => [id, CLEAN] as const));
+    const { state, noFinding } = withoutNoFindingFails(s, all);
+    expect(state.blocking.map((j) => j.id).sort()).toEqual([1, 2]);
+    expect(noFinding).toEqual([7, 6, 5, 4, 3]);
+  });
+});
+
+describe("roborevDrainRefusalCode — Rust's sink refusal must not degrade to unknown-error", () => {
+  // The REAL rendered strings from worktree.rs (`roborev_drain_refusal`,
+  // `roborev_unreadable_refusal`, `roborev_unreadable_head_refusal`); a Rust test pins the markers.
+  const DRAIN =
+    "Refusing merge_pr #2580: `agent/work` has 1 open roborev fail-verdict review (11). The pre-push gate already blocks on these, so merging here would land defects it held back and leave the fixes to a third PR (bead sparkle-c9is0f). Drain them first: `roborev show <id>` to read the findings, then either fix and `roborev close <id>`, or `EDITOR=true roborev comment --job <id> -m \"<why declined>\" && roborev close <id>`.";
+  const UNREADABLE =
+    "Refusing merge_pr #9: could not read roborev's review state for `agent/work`, so whether this head has open fail-verdict findings is UNKNOWN — and an unknown is not an all-clear (bead sparkle-c9is0f). Check `roborev status`, then merge again. To merge without roborev at all, turn `[tools].roborev` off for this project.";
+  const HEAD =
+    "Refusing merge_pr #9: could not read the PR's head branch from `gh`, so whether it has open roborev fail-verdict findings cannot be asked at all — and an unasked question is not an all-clear (roborev 69915). This is usually transient: check `gh auth status` and your connection, then merge again.";
+
+  it("codes each Rust roborev refusal", () => {
+    expect(roborevDrainRefusalCode(DRAIN)).toBe("roborev-unresolved");
+    expect(roborevDrainRefusalCode(UNREADABLE)).toBe("roborev-unknown");
+    expect(roborevDrainRefusalCode(HEAD)).toBe("roborev-unknown");
+  });
+
+  it("leaves every other merge failure alone", () => {
+    for (const msg of [
+      "Pull request is not mergeable: conflict",
+      "GraphQL: Required status checks have not passed",
+      "Refusing merge_pr #9: base is an in-flight branch (sparkle-hvenv2)",
+      "roborev fail-verdict mentioned in passing",
+      "",
+    ]) {
+      expect(roborevDrainRefusalCode(msg), msg).toBeNull();
+    }
   });
 });

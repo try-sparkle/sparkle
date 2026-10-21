@@ -165,7 +165,7 @@ if [ "$standdown" -eq 0 ] && [ "$have" -eq 0 ] && [ "$havefirst" -eq 1 ]; then
 fi
 
 if [ "$standdown" -eq 1 ]; then
-  echo "sparkle roborev shim: standing down — fewer than two healthy Claude accounts, leaving the last one for interactive work" >&2
+  echo "sparkle roborev shim: standing down — no usable non-default account (no healthy fleet Claude login); the default login is reserved for interactive work and is never used for review" >&2
   exit 78
 fi
 

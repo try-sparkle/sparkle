@@ -7183,7 +7183,7 @@ fn roborev_drain_gate(
     // fail-CLOSED gate silently becomes fail-OPEN, and a network blip would then re-admit exactly
     // the merge this gate exists to refuse.
     let head_ref = roborev_head_ref_or_refuse(number, head_ref)?;
-    let mut cmd = Command::new(bin);
+    let mut cmd = Command::new(&bin);
     cmd.args(["list", "--json", "--repo", root, "--branch", head_ref]).current_dir(root);
     apply_noninteractive(&mut cmd);
     let parsed = match output_with_timeout(cmd, ROBOREV_TIMEOUT) {
@@ -7193,7 +7193,40 @@ fn roborev_drain_gate(
         // unreachable, so the parse is what actually settles it (AGENTS.md, *roborev cadence*).
         _ => None,
     };
+    // A FAIL whose body PROVES it raised nothing does not block (beads sparkle-6ca0yg,
+    // sparkle-edk2r1). Only how a FAIL is CLASSIFIED changes here, never whether a review exists:
+    // an unreadable body, a row past the read cap and a row with no id all keep blocking.
+    let parsed = roborev_without_no_finding_fails(parsed, &mut |id| {
+        crate::roborev_probe::read_review_body(&bin, root, id)
+    });
     roborev_drain_decision(number, head_ref, parsed)
+}
+
+/// Drop the open FAILs whose review body PROVES the review raised no finding, as a PURE function
+/// over an injected body reader — the gate's real reader shells out to roborev, which hosted CI does
+/// not have, so a test driven through the gate would assert nothing there (roborev 72642).
+///
+/// The SAME rule the TypeScript `merge_pr` pre-check and `pr_roborev_status` apply
+/// (`noFindingReadSet` / `withoutNoFindingFails` in `services/mergeGuard/roborev.ts`): read at most
+/// [`crate::roborev_probe::NO_FINDING_READ_CAP`] bodies, highest job id first, and clear a row only
+/// on PROOF. Fail-closed throughout: `None` (could not ask) stays `None`; an unreadable body, a row
+/// beyond the cap, and a row with no `id` (counted but unnamed) all keep blocking.
+fn roborev_without_no_finding_fails(
+    parsed: Option<(usize, Vec<i64>)>,
+    read_body: &mut dyn FnMut(i64) -> Option<String>,
+) -> Option<(usize, Vec<i64>)> {
+    let (count, ids) = parsed?;
+    let mut newest_first = ids.clone();
+    newest_first.sort_unstable_by(|a, b| b.cmp(a));
+    newest_first.dedup();
+    let cleared: HashSet<i64> = newest_first
+        .into_iter()
+        .take(crate::roborev_probe::NO_FINDING_READ_CAP)
+        .filter(|&id| crate::roborev_probe::body_carries_no_finding(read_body(id).as_deref()))
+        .collect();
+    let removed = ids.iter().filter(|id| cleared.contains(id)).count();
+    let kept: Vec<i64> = ids.into_iter().filter(|id| !cleared.contains(id)).collect();
+    Some((count.saturating_sub(removed), kept))
 }
 
 /// The gate's DECISION, split out from the subprocess so all three arms are reachable from a test —
@@ -13770,6 +13803,64 @@ mod tests {
     /// The count comes from the ROWS, not the ids — a drifted row with no `id` must still block the
     /// merge. Counting the ids instead makes such a row vanish from the tally and the gate certify
     /// clear, which is the exact failure the gate exists to prevent.
+    const NO_FINDING_BODY: &str = "The diff is empty — a merge commit.\n\nSEVERITY_THRESHOLD_MET";
+    const REAL_FINDING_BODY: &str = "- **Severity**: High\n- **Location**: `a.rs:1`\n- **Problem**: x\n";
+
+    /// A FAIL whose body proves it raised nothing no longer blocks; one whose body carries a finding
+    /// still does (bead sparkle-6ca0yg). Paired, so a reader that clears everything cannot pass.
+    #[test]
+    fn a_fail_whose_body_carries_no_finding_stops_blocking_and_a_real_one_keeps_blocking() {
+        let mut read = |id: i64| Some(if id == 1 { NO_FINDING_BODY } else { REAL_FINDING_BODY }.to_string());
+        assert_eq!(roborev_without_no_finding_fails(Some((2, vec![1, 2])), &mut read), Some((1, vec![2])));
+        // Driven through the DECISION too: the cleared-only branch now merges, the mixed one refuses.
+        let mut clean = |_: i64| Some(NO_FINDING_BODY.to_string());
+        let cleared = roborev_without_no_finding_fails(Some((1, vec![7])), &mut clean);
+        assert!(roborev_drain_decision(9, "agent/work", cleared).is_ok());
+        let mut real = |_: i64| Some(REAL_FINDING_BODY.to_string());
+        let kept = roborev_without_no_finding_fails(Some((1, vec![7])), &mut real);
+        assert!(roborev_drain_decision(9, "agent/work", kept).is_err());
+    }
+
+    /// FAIL CLOSED: an unreadable body keeps blocking, an unnamed row (no id) keeps blocking, and an
+    /// unreadable LIST stays unreadable — reclassification never manufactures an answer.
+    #[test]
+    fn no_finding_reclassification_fails_closed_on_every_unknown() {
+        let mut unreadable = |_: i64| None;
+        assert_eq!(roborev_without_no_finding_fails(Some((1, vec![3])), &mut unreadable), Some((1, vec![3])));
+        let mut clean = |_: i64| Some(NO_FINDING_BODY.to_string());
+        // Two rows, one without an id: the named one clears, the unnamed one still counts.
+        assert_eq!(roborev_without_no_finding_fails(Some((2, vec![3])), &mut clean), Some((1, vec![])));
+        assert_eq!(roborev_without_no_finding_fails(None, &mut clean), None);
+    }
+
+    /// THE SHARED READ-CAP ORDERING: newest (highest id) first, at most the cap — the TS ops sort and
+    /// slice the same way, so past the cap all surfaces agree on which rows went unread and block.
+    #[test]
+    fn no_finding_reclassification_reads_newest_first_and_stops_at_the_cap() {
+        let mut asked = Vec::new();
+        let mut clean = |id: i64| {
+            asked.push(id);
+            Some(NO_FINDING_BODY.to_string())
+        };
+        let got = roborev_without_no_finding_fails(Some((7, vec![1, 2, 3, 4, 5, 6, 7])), &mut clean);
+        assert_eq!(asked, vec![7, 6, 5, 4, 3], "newest first, capped");
+        assert_eq!(got, Some((2, vec![1, 2])), "rows past the cap stay blocking, unread");
+    }
+
+    /// The reclassification must be CALLED by the gate — a pure helper nothing invokes is the inert
+    /// shape this bead exists because of. Bounded to the function body (roborev 72720).
+    #[test]
+    fn roborev_drain_gate_actually_reclassifies_no_finding_fails() {
+        let src = include_str!("worktree.rs");
+        let start = src.find("fn roborev_drain_gate(").expect("roborev_drain_gate");
+        let end = start + src[start..].find("\n}\n").expect("end of roborev_drain_gate") + 3;
+        let body = &src[start..end];
+        let reclass = body.find("roborev_without_no_finding_fails(parsed").expect("the reclassification call");
+        let decide = body.find("roborev_drain_decision(number, head_ref, parsed)").expect("the decision");
+        assert!(reclass < decide, "the reclassification must feed the decision");
+        assert!(body.contains("read_review_body(&bin, root, id)"), "it must read the real body");
+    }
+
     #[test]
     fn roborev_open_fail_still_counts_a_row_whose_id_is_missing() {
         let raw = r#"[{"verdict": "F", "closed": false}]"#;
@@ -13852,6 +13943,23 @@ mod tests {
         let head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         assert!(worktree_ahead_gate(&root, 9, None, Some(&head)).is_ok());
         assert!(worktree_ahead_gate(&root, 9, Some(""), Some(&head)).is_ok());
+    }
+
+    /// The TypeScript `roborevDrainRefusalCode` (mergeGuard/roborev.ts) codes these refusals by the
+    /// markers below; lose one and a sink refusal degrades to `unknown-error`, which a model retries
+    /// verbatim (bead sparkle-6ca0yg). Pinned on the REAL rendered strings.
+    #[test]
+    fn roborev_refusals_carry_the_markers_the_typescript_classifier_keys_on() {
+        let drain = roborev_drain_refusal(9, "agent/work", 1, &[11]).to_lowercase();
+        for marker in ["refusing merge_pr", "sparkle-c9is0f", "open roborev fail-verdict"] {
+            assert!(drain.contains(marker), "drain refusal lost `{marker}`: {drain}");
+        }
+        let unreadable = roborev_unreadable_refusal(9, "agent/work").to_lowercase();
+        assert!(unreadable.contains("refusing merge_pr"), "{unreadable}");
+        assert!(unreadable.contains("could not read roborev's review state"), "{unreadable}");
+        let head = roborev_unreadable_head_refusal(9).to_lowercase();
+        assert!(head.contains("refusing merge_pr") && head.contains("could not read the pr's head branch"), "{head}");
+        assert!(head.contains("roborev"), "{head}");
     }
 
     #[test]

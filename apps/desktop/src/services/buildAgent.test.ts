@@ -143,6 +143,18 @@ describe("parseWorkerResult", () => {
     expect(r.notes).toBeUndefined();
   });
 
+  it("keeps a well-formed reviewGate and drops a malformed one without rejecting the result", () => {
+    expect(parseWorkerResult(JSON.stringify({ ...JSON.parse(valid), reviewGate: { exit: 4 } })).reviewGate).toEqual({
+      exit: 4,
+    });
+    expect(
+      parseWorkerResult(JSON.stringify({ ...JSON.parse(valid), reviewGate: { exit: null, reason: "none" } })).reviewGate,
+    ).toEqual({ exit: null, reason: "none" });
+    const r = parseWorkerResult(JSON.stringify({ ...JSON.parse(valid), reviewGate: { exit: "0" } }));
+    expect(r.status).toBe("success");
+    expect(r.reviewGate).toBeUndefined();
+  });
+
   it("throws on a bad status value", () => {
     const bad = JSON.stringify({ ...JSON.parse(valid), status: "done" });
     expect(() => parseWorkerResult(bad)).toThrow(/status/);
@@ -272,6 +284,26 @@ describe("workerPersona", () => {
     expect(p).toMatch(/security/);
     expect(p).toContain("ai.sparkle.desktop");
     expect(p).toMatch(/never/i);
+  });
+  it("gates a success result on the roborev authored-findings check (sparkle-wr9u8, sparkle-2s2jn5)", () => {
+    // A worker wrote status "success" while its own notes said its reviews were still queued and
+    // unread. The persona must make the gate a precondition of "success" and record its exit code
+    // in a STRUCTURED field the orchestrator reads (reviewGate), not in prose.
+    expect(p).toContain("bash scripts/roborev-authored-findings.sh");
+    expect(p).toMatch(/only exit 0 clears/i);
+    expect(p).toMatch(/1, 3 (and|or) 4 are NOT success/i);
+    expect(p).toContain('"reviewGate": { "exit": <n> }');
+    // Personas run against ARBITRARY repos, where the script may not exist: conditional wording,
+    // and an explicit not-run record rather than a fabricated 0.
+    expect(p).toMatch(/if (this|the) repo has `?scripts\/roborev-authored-findings\.sh/i);
+    expect(p).toContain('"reviewGate": { "exit": null');
+    // A non-clearing gate means partial, never success.
+    expect(p).toMatch(/write status "partial"/i);
+  });
+  it("never tells the worker a queued/unread review is compatible with success", () => {
+    // Paired negative: the defect was a success claim beside "reviews still queued". No wording
+    // may present an unreviewed commit as finishable as success.
+    expect(p).not.toMatch(/success[^.\n]*(even|although|while)[^.\n]*(queued|unread|not reviewed)/i);
   });
   it("makes the structured founder-format retro + PR-body marker the required final output", () => {
     // The retro REPLACES any free-form completion report. The human copy is the founder format;

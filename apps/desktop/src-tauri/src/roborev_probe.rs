@@ -533,9 +533,119 @@ pub async fn roborev_job_review(root: String, job_id: u64) -> Result<Option<Stri
     .map_err(|e| format!("roborev_job_review task failed: {e}"))?
 }
 
+/// How many FAIL-verdict review BODIES one gate reading opens to ask [`body_carries_no_finding`],
+/// newest (highest job id) first. MUST equal `ROBOREV_REVIEW_READ_CAP` in
+/// `services/mergeGuard/roborev.ts` — the `merge_pr` pre-check and `pr_roborev_status` read the same
+/// rows in the same order, so past the cap all three surfaces still agree on which FAILs were
+/// reclassified and which kept blocking unread. A test below reads the TypeScript constant.
+pub(crate) const NO_FINDING_READ_CAP: usize = 5;
+
+/// One `roborev show` is a local-daemon round trip; this bounds a wedged one. Shorter than the list
+/// probe's because the gate may make up to [`NO_FINDING_READ_CAP`] of these in a row.
+const REVIEW_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+
+// The two body shapes that PROVE a review raised nothing — the Rust twin of the patterns beside
+// `bodyCarriesNoFinding` in `services/mergeGuard/roborev.ts`. Both are pinned by ONE corpus,
+// `apps/desktop/shared/roborev-no-finding-bodies.json`, which both suites parse; change one
+// definition without the other and both suites go red.
+static THRESHOLD_MET_LINE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static NO_ISSUES_OPENING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static FINDING_FIELD_LINE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+/// Does any line of `body` carry a finding field — `Severity`, `Location` or `Problem` — in the
+/// shape the TypeScript `parseRoborevFindings` reads? That parser emits a finding for every block
+/// holding one of exactly those three labels (bold or not, since all three are on its unbolded
+/// whitelist), so "it parsed at least one finding" reduces to this line test. Lines are split the
+/// way the parser splits them (`\r?\n`).
+fn body_has_finding_field(body: &str) -> bool {
+    let field = crate::support::re(
+        &FINDING_FIELD_LINE,
+        r"^\s{0,3}(?:[-*+]\s+)?(\*\*)?\s*([A-Za-z][A-Za-z ]{0,24}?)\s*(?:\*\*)?\s*:\s*(.*)$",
+    );
+    body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).any(|line| {
+        field.captures(line).is_some_and(|c| {
+            let label = c.get(2).map_or("", |m| m.as_str()).trim().to_ascii_lowercase();
+            matches!(label.as_str(), "severity" | "location" | "problem")
+        })
+    })
+}
+
+/// Does this review body PROVE that the review raised no finding? (beads sparkle-6ca0yg,
+/// sparkle-edk2r1)
+///
+/// roborev derives the verdict inside a prebuilt binary, and the derivation is intermittently
+/// wrong: measured, 1,649 bodies carry `SEVERITY_THRESHOLD_MET` and 74 were recorded `F`. A FAIL
+/// that carries nothing to fix must not block a merge.
+///
+/// A SAFETY GATE, so it fails CLOSED in every direction: `true` needs BOTH no finding field AND a
+/// recognised no-finding shape. `None`, empty, and unrecognised prose (a permission refusal, a
+/// truncated review) are "we could not tell", which keeps blocking.
+pub(crate) fn body_carries_no_finding(body: Option<&str>) -> bool {
+    let Some(body) = body else { return false };
+    let text = body.trim();
+    if text.is_empty() || body_has_finding_field(body) {
+        return false;
+    }
+    crate::support::re(&THRESHOLD_MET_LINE, r"(?:^|\n)[ \t]*SEVERITY_THRESHOLD_MET[ \t]*(?:\n|$)")
+        .is_match(body)
+        || crate::support::re(&NO_ISSUES_OPENING, r"(?i)^\s*(?:#+\s*)?no issues found").is_match(text)
+    // An agent SESSION-STATUS body (`Working: …`, `NOTHING TO COMMIT`) is deliberately NOT here:
+    // it proves the review never ran, so it keeps blocking (roborev job 83752).
+}
+
+/// Read one job's review markdown with an already-resolved roborev binary, or `None` when it cannot
+/// be read. `None` is "unread", never "clean" — [`body_carries_no_finding`] blocks on it.
+pub(crate) fn read_review_body(program: &str, root: &str, job_id: i64) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(["show", "--job", &job_id.to_string(), "--json"]).current_dir(root);
+    apply_noninteractive(&mut cmd);
+    let output = crate::worktree::output_with_timeout(cmd, REVIEW_BODY_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    extract_review_output(&String::from_utf8_lossy(&output.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE CROSS-RUNTIME SEAM (bead sparkle-6ca0yg). `body_carries_no_finding` and the TypeScript
+    /// `bodyCarriesNoFinding` are two definitions of one rule, and each suite alone is green while
+    /// they disagree. Both parse this ONE corpus (`mergeGuard/roborev.test.ts` reads it too), so a
+    /// change to either definition reds the other suite instead of neither.
+    #[test]
+    fn body_carries_no_finding_matches_the_shared_cross_runtime_corpus() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("roborev-no-finding-bodies.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+        assert_eq!(fixture["version"].as_i64(), Some(1));
+        let cases = fixture["cases"].as_array().expect("cases");
+        // Anti-vacuity: both directions must be present, or a constant predicate passes.
+        let yes = cases.iter().filter(|c| c["noFinding"] == true).count();
+        let no = cases.iter().filter(|c| c["noFinding"] == false).count();
+        assert!(yes >= 5 && no >= 5, "corpus lost a direction: {yes} true / {no} false");
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let body = case["body"].as_str().expect("body");
+            let want = case["noFinding"].as_bool().expect("noFinding");
+            assert_eq!(body_carries_no_finding(Some(body)), want, "case: {name}");
+        }
+        // Unreadable is not clean — the Rust-only spelling of the TS null/undefined cases.
+        assert!(!body_carries_no_finding(None));
+    }
+
+    /// The read cap is SHARED with the TypeScript ops; past it the surfaces must read the same rows.
+    #[test]
+    fn the_no_finding_read_cap_matches_the_typescript_constant() {
+        let ts = include_str!("../../src/services/mergeGuard/roborev.ts");
+        let decl = format!("export const ROBOREV_REVIEW_READ_CAP = {NO_FINDING_READ_CAP};");
+        assert!(ts.contains(&decl), "roborev.ts must declare `{decl}` — the caps have drifted");
+    }
 
     /// A row shaped like the real CLI's, including fields we do not read.
     fn cli_row(extra: &str) -> String {

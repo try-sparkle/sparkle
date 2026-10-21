@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "_why": [
+    "ONE corpus of roborev review bodies, parsed by BOTH runtimes that decide whether a FAIL verdict",
+    "with nothing in it may stop blocking a merge (beads sparkle-6ca0yg, sparkle-edk2r1).",
+    "The predicate exists twice: `bodyCarriesNoFinding` in apps/desktop/src/services/mergeGuard/roborev.ts",
+    "(the merge_pr pre-check and pr_roborev_status) and `body_carries_no_finding` in",
+    "apps/desktop/src-tauri/src/worktree.rs (the roborev_drain_gate sink every in-app merge reaches).",
+    "If the two definitions drift, one surface reports a branch clean while the other refuses it.",
+    "Both suites assert every case below, so changing one definition reds the other suite too.",
+    "`noFinding: true` makes the gate MORE permissive, so every such case must be PROVABLY empty;",
+    "the `false` cases are the paired half that keeps a real finding blocking."
+  ],
+  "cases": [
+    {
+      "name": "the measured empty-merge body",
+      "body": "The diff is empty — this is a merge commit with no changes to review.\n\nSEVERITY_THRESHOLD_MET",
+      "noFinding": true
+    },
+    { "name": "the bare threshold sentinel", "body": "SEVERITY_THRESHOLD_MET", "noFinding": true },
+    { "name": "the sentinel indented with trailing space", "body": "Summary.\n  SEVERITY_THRESHOLD_MET \t\n", "noFinding": true },
+    { "name": "a clean review", "body": "No issues found.\n\nSummary: all good.", "noFinding": true },
+    { "name": "a clean review under a heading", "body": "## No issues found\n\nNothing to report.", "noFinding": true },
+    {
+      "name": "a session-status body is NOT REVIEWED (Working:)",
+      "body": "Working: **yes** — branch sparkle/agent-9261ee4d; task = roborev code review of commit de93136",
+      "noFinding": false
+    },
+    { "name": "a session-status body is NOT REVIEWED (nothing to commit)", "body": "NOTHING TO COMMIT", "noFinding": false },
+    {
+      "name": "a session-status body is NOT REVIEWED (review-only session)",
+      "body": "Review-only session (roborev invoked me to review 2027d5c); I didn't commit, push or open a PR.",
+      "noFinding": false
+    },
+    {
+      "name": "a bold non-finding label beside the sentinel",
+      "body": "**Summary**: the change is fine.\n\nSEVERITY_THRESHOLD_MET",
+      "noFinding": true
+    },
+    {
+      "name": "a real finding",
+      "body": "## Review Findings\n\n- **Severity**: High\n- **Location**: `src/a.ts:10`\n- **Problem**: leaks a credential\n",
+      "noFinding": false
+    },
+    {
+      "name": "a real finding followed by the sentinel",
+      "body": "## Review Findings\n\n- **Severity**: High\n- **Location**: `src/a.ts:10`\n- **Problem**: leaks a credential\n\nSEVERITY_THRESHOLD_MET",
+      "noFinding": false
+    },
+    {
+      "name": "the sentinel followed by a real finding",
+      "body": "SEVERITY_THRESHOLD_MET\n\n## Review Findings\n\n- **Severity**: High\n- **Location**: `src/a.ts:10`\n- **Problem**: leaks a credential\n",
+      "noFinding": false
+    },
+    {
+      "name": "an unbolded Location field beside the sentinel",
+      "body": "Location: src/a.ts:10\n\nSEVERITY_THRESHOLD_MET",
+      "noFinding": false
+    },
+    {
+      "name": "a Problem-only block after a rule, beside a clean opening",
+      "body": "No issues found.\n\n---\n\nProblem: the lock is never released\n",
+      "noFinding": false
+    },
+    {
+      "name": "a CRLF finding beside the sentinel",
+      "body": "- **Severity**: Medium\r\n- **Problem**: off by one\r\n\r\nSEVERITY_THRESHOLD_MET\r\n",
+      "noFinding": false
+    },
+    { "name": "an empty body", "body": "", "noFinding": false },
+    { "name": "a whitespace-only body", "body": "   \n  \n", "noFinding": false },
+    { "name": "an unrecognised failure", "body": "the reviewer could not reach the model", "noFinding": false },
+    { "name": "a permission-blocked review", "body": "Permission denied reading the diff.", "noFinding": false },
+    {
+      "name": "prose about the sentinel is not the sentinel",
+      "body": "This review does not emit SEVERITY_THRESHOLD_MET because it found a bug",
+      "noFinding": false
+    },
+    {
+      "name": "no issues found that is not the opening",
+      "body": "I looked closely. No issues found in the parser, but the cache is wrong.",
+      "noFinding": false
+    }
+  ]
+}

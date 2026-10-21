@@ -74,10 +74,15 @@ import {
 import {
   fetchRoborevProbe,
   fetchRoborevReview,
+  blockingReadOrder,
   highestSeverity,
+  noFindingReadSet,
   parseRoborevFindings,
+  ROBOREV_REVIEW_READ_CAP,
+  roborevDrainRefusalCode,
   roborevMergeGate,
   summarizeRoborev,
+  withoutNoFindingFails,
 } from "../mergeGuard/roborev";
 import { fetchPrClaims, findClaim, viewClaim } from "../mergeGuard/prClaims";
 import { isBaseBranchRefusal, isKnightwatchRefusal, knightwatchReasonIssue } from "../mergeGuard/knightwatch";
@@ -640,9 +645,26 @@ async function readPrClaim(root: string, number: number): Promise<PrClaimView | 
   );
 }
 
-/** The roborev state of a PR's HEAD branch. */
-async function readRoborevState(root: string, branch: string): Promise<RoborevBranchState> {
-  return summarizeRoborev(await fetchRoborevProbe(root, branch));
+/** One gate reading of a PR's HEAD branch: the state the gate judges, the review bodies it opened
+ *  to judge it, and the FAILs it reclassified as carrying no finding. */
+interface RoborevReading {
+  state: RoborevBranchState;
+  bodies: Map<number, string | null>;
+  noFinding: number[];
+}
+
+/**
+ * The roborev state of a PR's HEAD branch, with FAILs whose body PROVES no finding removed from the
+ * blocking set (bead sparkle-6ca0yg). BOTH `merge_pr` and `pr_roborev_status` read through this one
+ * function, so they cannot disagree about what clean means — and Rust's `roborev_drain_gate`
+ * applies the same rule with the same cap and order, so the sink agrees with them too.
+ */
+async function readRoborevState(root: string, branch: string): Promise<RoborevReading> {
+  const raw = summarizeRoborev(await fetchRoborevProbe(root, branch));
+  const bodies = new Map<number, string | null>();
+  for (const job of noFindingReadSet(raw)) bodies.set(job.id, await fetchRoborevReview(root, job.id));
+  const { state, noFinding } = withoutNoFindingFails(raw, bodies);
+  return { state, bodies, noFinding };
 }
 
 /**
@@ -1089,7 +1111,7 @@ export async function mergePrTool(
     );
 
   // --- Gate 5: roborev --------------------------------------------------------------------------
-  const roborev = await readRoborevState(root, pr.headRefName);
+  const { state: roborev } = await readRoborevState(root, pr.headRefName);
   const ack = normalizeAck(raw.roborevOverride);
   if (ack === "invalid")
     return refused(
@@ -1155,6 +1177,12 @@ export async function mergePrTool(
     // "message a model retries verbatim" the comment above names). The remedy is in Rust's prose:
     // retarget the PR at the integration branch. There is no override to offer, by design.
     if (isBaseBranchRefusal(msg)) return refused(op, "foreign-base-branch", msg);
+    // A REFUSAL from Rust's roborev drain gate (bead sparkle-6ca0yg). Gate 5 above applies the same
+    // rule, so this fires only when the two readings differ — a round landed between them, or the
+    // sink could not read what the pre-check could. Nothing merged; its prose names the drain.
+    // Uncoded it matched none of the generic patterns and fell to the retry-me `unknown-error`.
+    const drainCode = roborevDrainRefusalCode(msg);
+    if (drainCode) return refused(op, drainCode, msg);
     // ALSO A REFUSAL, for the same reason and one more. GitHub evaluates `--match-head-commit`
     // BEFORE it merges anything, so a moved head means the repo did not move either — reporting it
     // as `failed` would tell the model an operation half-happened when none of it did. And it is
@@ -1463,11 +1491,11 @@ export async function prChecksStatusTool(
   }
 }
 
-/** How many reviews we will open and parse for one `pr_roborev_status` call. The findings body of a
- *  thorough review runs to thousands of characters and lands permanently in a concierge's context,
- *  so the op reads the OPEN blockers newest-first and says plainly when it stopped. A cap that lies
- *  by omission would be worse than no cap — see `truncated`. */
-const ROBOREV_REVIEW_READ_CAP = 5;
+/* How many reviews we will open and parse for one `pr_roborev_status` call is
+ * `ROBOREV_REVIEW_READ_CAP` (mergeGuard/roborev.ts) — the SAME cap and newest-first order the
+ * no-finding reclassification uses on every surface. The findings body of a thorough review runs to
+ * thousands of characters and lands permanently in a concierge's context, so the op says plainly
+ * when it stopped. A cap that lies by omission would be worse than no cap — see `truncated`. */
 
 export interface PrRoborevStatus {
   number: number;
@@ -1487,6 +1515,10 @@ export interface PrRoborevStatus {
   blockedReason: string | null;
   /** Open FAIL reviews with their findings parsed out. Capped — see `truncated`. */
   outstanding: RoborevJobFindings[];
+  /** FAIL-verdict reviews whose body PROVES they raised no finding (the threshold sentinel, "No
+   *  issues found", a session-status body), newest first. They do NOT block — here or in `merge_pr`
+   *  — and are listed so a reader who sees an F in `roborev list` can tell why (bead sparkle-6ca0yg). */
+  noFindingFails: number[];
   /** The worst severity across everything in `outstanding`; null when there is nothing to rank. */
   highestSeverity: string | null;
   /** How many open blockers exist BEYOND the ones detailed above. Zero means the list is complete. */
@@ -1542,14 +1574,15 @@ export async function prRoborevStatusTool(
       `PR #${number} is not in the list this probe can see — ${PR_SCOPE}. That is not evidence it is merged or closed; \`gh pr view ${number}\` answers it directly.`,
     );
 
-  const state = await readRoborevState(root, pr.headRefName);
+  const { state, bodies, noFinding } = await readRoborevState(root, pr.headRefName);
   const verdict = roborevMergeGate(state);
   // Newest first: when the cap bites, the reviews a caller most needs are the recent ones.
-  const ordered = [...state.blocking].sort((a, b) => b.id - a.id);
+  const ordered = blockingReadOrder(state.blocking);
   const detailed = ordered.slice(0, ROBOREV_REVIEW_READ_CAP);
   const outstanding: RoborevJobFindings[] = [];
   for (const job of detailed) {
-    const body = await fetchRoborevReview(root, job.id);
+    // Reuse the body the reading already opened; fetch only rows it did not reach.
+    const body = bodies.has(job.id) ? (bodies.get(job.id) ?? null) : await fetchRoborevReview(root, job.id);
     // null body ≠ no findings. `findings: null` says we could not read the review, which is a
     // different fact from a review that turned out clean, and the caller must be able to tell.
     outstanding.push({ job, findings: body === null ? null : parseRoborevFindings(body) });
@@ -1573,6 +1606,7 @@ export async function prRoborevStatusTool(
       ? null
       : roborevRefusalMessage(verdict, pr.headRefName, false),
     outstanding,
+    noFindingFails: noFinding,
     // An unreadable review body must NOT summarise as "open reviews, nothing serious". `null` here
     // is reserved for "every body was read and none carried a finding"; a body we could not fetch
     // ranks as `unknown`, which sorts as high as `high`. Same null-is-not-a-benign-default rule the

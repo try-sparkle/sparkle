@@ -117,6 +117,12 @@ def _format_block(branch: str, jobs: list[dict]) -> str:
         "`roborev close <id>`.",
         "  3. INVALID / YAGNI finding: `roborev comment --job <id> -m \"<why declined>\"` "
         "then `roborev close <id>`.",
+        "     A reason that quotes code: never type its backticks inside `-m \"...\"` — the "
+        "shell command-substitutes them and the comment lands mangled. Where the repo "
+        "ships `scripts/roborev-triage.sh`, use `scripts/roborev-triage.sh <id> "
+        "--reason-file <path> --close` instead: it passes the reason untouched and "
+        "VERIFIES comment+close by re-reading, because the CLI can exit non-zero on a "
+        "write that landed (so a blind retry posts a duplicate).",
         "",
         "Re-run the switch once no open fail-verdict reviews remain on this branch.",
     ]

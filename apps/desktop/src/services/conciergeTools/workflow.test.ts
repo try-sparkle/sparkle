@@ -1197,6 +1197,83 @@ describe("pr_roborev_status — the read op the concierge never had", () => {
     const r = await prRoborevStatusTool("/repo", "p1", 806);
     expect((r as { data: { claim: unknown } }).data.claim).toBeNull();
   });
+
+  /* A FAIL WITH NOTHING IN IT (bead sparkle-6ca0yg). roborev records verdict F on bodies that carry
+   *  no finding — 74 of 1,649 SEVERITY_THRESHOLD_MET bodies, measured. Both ops read through ONE
+   *  reclassification, so they must agree, and Rust's sink applies the same rule. */
+  describe("a FAIL whose body carries no finding", () => {
+    const NO_FINDING = "The diff is empty — this is a merge commit with no changes to review.\n\nSEVERITY_THRESHOLD_MET";
+
+    it("does not block — and BOTH ops agree, and the merge reaches the sink", async () => {
+      m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [job({ id: 41 })] });
+      m.fetchRoborevReview.mockResolvedValue(NO_FINDING);
+      m.mergePr.mockResolvedValue(undefined);
+      const r = await prRoborevStatusTool("/repo", "p1", 806);
+      const data = (r as { data: { wouldBlockMerge: boolean; noFindingFails: number[]; outstanding: unknown[] } })
+        .data;
+      expect(data.wouldBlockMerge).toBe(false);
+      expect(data.noFindingFails).toEqual([41]);
+      expect(data.outstanding).toEqual([]);
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
+      expect(m.mergePr).toHaveBeenCalled();
+      expect(m.fetchRoborevReview).toHaveBeenCalledWith("/repo", 41);
+    });
+
+    it("a real finding still blocks in BOTH ops — the paired half", async () => {
+      m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [job({ id: 41 })] });
+      m.fetchRoborevReview.mockResolvedValue(`${NO_FINDING}\n\n- **Severity**: High\n- **Problem**: x`);
+      const r = await prRoborevStatusTool("/repo", "p1", 806);
+      const data = (r as { data: { wouldBlockMerge: boolean; noFindingFails: number[] } }).data;
+      expect(data.wouldBlockMerge).toBe(true);
+      expect(data.noFindingFails).toEqual([]);
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+        code: "roborev-unresolved",
+      });
+      expect(m.mergePr).not.toHaveBeenCalled();
+    });
+
+    it("an UNREADABLE body keeps blocking in both ops — unread is not clean", async () => {
+      m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [job({ id: 41 })] });
+      m.fetchRoborevReview.mockResolvedValue(null);
+      const r = await prRoborevStatusTool("/repo", "p1", 806);
+      expect((r as { data: { wouldBlockMerge: boolean } }).data.wouldBlockMerge).toBe(true);
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+        code: "roborev-unresolved",
+      });
+    });
+
+    it("past the shared cap, the SAME unread rows block in both ops", async () => {
+      const jobs = [1, 2, 3, 4, 5, 6, 7].map((id) => job({ id }));
+      m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs });
+      m.fetchRoborevReview.mockResolvedValue(NO_FINDING);
+      const r = await prRoborevStatusTool("/repo", "p1", 806);
+      const data = (r as { data: { noFindingFails: number[]; outstanding: Array<{ job: { id: number } }> } }).data;
+      expect(data.noFindingFails).toEqual([7, 6, 5, 4, 3]);
+      expect(data.outstanding.map((o) => o.job.id)).toEqual([2, 1]);
+      const merge = await mergePrTool({ root: "/repo", projectId: "p1", number: 806 });
+      expect(merge).toMatchObject({ code: "roborev-unresolved" });
+      expect((merge as { message: string }).message).toContain("jobs 1, 2)");
+    });
+
+    it("a refusal from Rust's drain gate is CODED, never the retry-me unknown-error", async () => {
+      m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [] });
+      m.mergePr.mockRejectedValue(
+        "Refusing merge_pr #806: `sparkle/left-pair` has 1 open roborev fail-verdict review (11). The pre-push gate already blocks on these, so merging here would land defects it held back and leave the fixes to a third PR (bead sparkle-c9is0f). Drain them first.",
+      );
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+        ok: false,
+        kind: "refused",
+        code: "roborev-unresolved",
+      });
+      m.mergePr.mockRejectedValue(
+        "Refusing merge_pr #806: could not read roborev's review state for `sparkle/left-pair`, so whether this head has open fail-verdict findings is UNKNOWN — and an unknown is not an all-clear (bead sparkle-c9is0f).",
+      );
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+        kind: "refused",
+        code: "roborev-unknown",
+      });
+    });
+  });
 });
 
 describe("merge_pr defers to an agent that claimed the PR", () => {

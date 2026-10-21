@@ -65,6 +65,8 @@ from _roborev_hooklib import (
     _git_stdout,
     open_fail_backlog,
     format_backlog_summary,
+    unreviewed_pushed_commits,
+    format_unreviewed_notice,
     chained_steps_around_push,
     format_skipped_steps,
     BACKLOG_NOTICE_MAX_ROWS,
@@ -115,7 +117,7 @@ def _current_roots(cwd: str, repo_root: str) -> set[str]:
     return roots
 
 
-def _allow_with_backlog(cwd: str = "", repo_root: str = "") -> int:
+def _allow_with_backlog(cwd: str = "", repo_root: str = "", notice: str = "") -> int:
     """The happy-path allow: this branch is clear (current-branch deny already
     ruled out), so surface the MACHINE-WIDE open-FAIL backlog as non-blocking
     `additionalContext` and nudge the agent to sweep the stale ones.
@@ -124,16 +126,23 @@ def _allow_with_backlog(cwd: str = "", repo_root: str = "") -> int:
     proceeds regardless of what other branches hold — the hard deny stays
     strictly current-branch-only (other-branch FAILs must never wedge a push).
     A None/empty backlog (read failure or nothing open) is a silent clean allow —
-    the informational surface is best-effort and never costs a push."""
+    the informational surface is best-effort and never costs a push.
+
+    `notice` (the UNREVIEWED-pushed-commits text, bead sparkle-ivm6t7) rides in
+    the SAME additionalContext, first — it is about the commits being pushed, the
+    backlog is about everything else. Equally non-blocking."""
+    parts = [notice] if notice else []
     backlog = open_fail_backlog()
-    if not backlog:
+    if backlog:
+        parts.append(format_backlog_summary(
+            backlog,
+            current_roots=_current_roots(cwd, repo_root),
+            max_rows=BACKLOG_NOTICE_MAX_ROWS,
+            max_ids=BACKLOG_NOTICE_MAX_IDS,
+        ))
+    if not parts:
         return _allow()
-    _emit_hook({"additionalContext": format_backlog_summary(
-        backlog,
-        current_roots=_current_roots(cwd, repo_root),
-        max_rows=BACKLOG_NOTICE_MAX_ROWS,
-        max_ids=BACKLOG_NOTICE_MAX_IDS,
-    )})
+    _emit_hook({"additionalContext": "\n\n".join(parts)})
     return 0
 
 
@@ -202,6 +211,12 @@ def _format_block(jobs: list[dict], cmd: str = "") -> str:
         "abstraction not warranted at the current operating point): decline it — "
         "`roborev comment --job <id> -m \"<why declined>\"` to record the reason, then "
         "`roborev close <id>`.",
+        "     A reason that quotes code: never type its backticks inside `-m \"...\"` — the "
+        "shell command-substitutes them and the comment lands mangled. Where the repo "
+        "ships `scripts/roborev-triage.sh`, use `scripts/roborev-triage.sh <id> "
+        "--reason-file <path> --close` instead: it passes the reason untouched and "
+        "VERIFIES comment+close by re-reading, because the CLI can exit non-zero on a "
+        "write that landed (so a blind retry posts a duplicate).",
         "",
         "Do NOT clear these with `roborev refine` or `roborev fix`: they "
         "autonomously apply every finding WITHOUT the valid-vs-YAGNI judgment in "
@@ -279,7 +294,11 @@ def main() -> int:
     # This branch is clear (no un-triaged completed findings). Surface the machine-wide backlog (non-blocking) so
     # the agent can sweep stale FAILs on OTHER branches it's moved off of — the
     # visibility half the current-branch deny structurally can't cover.
-    return _allow_with_backlog(cwd, repo_root)
+    # And SAY when the commits being pushed were never actually reviewed — a
+    # crashed job or a missing row is not a finding, so it cannot deny, but it
+    # must not read as a clean review either (bead sparkle-ivm6t7). Non-blocking.
+    notice = format_unreviewed_notice(branch, unreviewed_pushed_commits(cwd, branch, jobs))
+    return _allow_with_backlog(cwd, repo_root, notice)
 
 
 if __name__ == "__main__":
