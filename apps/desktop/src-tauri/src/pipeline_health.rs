@@ -1864,10 +1864,45 @@ fn baseline_note(
 ///     worth clearing (the v0.111.0 draft against a shipped v0.118.0); nothing current is stuck.
 ///   * releases or tags unreadable → UNKNOWN, never Healthy. A probe that could not read its signal
 ///     presenting as fine is precisely the silence this whole module exists to end.
+///   * a releases read with ZERO published AND ZERO drafts while version tags exist → UNKNOWN, never
+///     Blocking (bead `sparkle-tm3ik6.1`). That is a well-formed EMPTY array, and an empty array is
+///     also exactly what a failed, rate-limited or under-scoped read hands back. Measured: the panel
+///     flapped BLOCKING ("has no published release at all, 161 tags unpublished") ↔ RECOVERED
+///     several times a day while v0.152.1 was published and Latest throughout. A project that has
+///     tagged versions but NEVER published, staged or drafted a single release is not a state this
+///     pipeline produces; an empty read is.
+///   * the acceptance baseline unreadable → a WARNING finding is held as UNKNOWN. Every accepted
+///     orphan is recounted as new when the file cannot be read, so the verdict then flaps on the
+///     read rather than on the pipeline. Unknown is still not green — it says so, and names what
+///     would be flagged. BLOCKING is NOT held: a tag stranded above the high-water mark is the
+///     outage this component exists to report, and the baseline is `None` for lasting reasons too
+///     (file deleted or renamed, no `origin/<default>`) — see [`read_baseline_at`].
 ///
 /// PURE: it takes the newest published version, the drafts and the tags as already-read data, so
 /// every branch is tested from fixtures with no `gh` and no network.
 fn classify_release_publication(
+    releases: Option<&ReleasesReading>,
+    tags: Option<&[String]>,
+    baseline: Option<&ReleaseBaseline>,
+    draft_gates: &std::collections::BTreeMap<Version, GateVerdict>,
+) -> (HealthState, String) {
+    let (state, detail) = classify_release_publication_read(releases, tags, baseline, draft_gates);
+    if baseline.is_none() && state == HealthState::Warning {
+        return (
+            HealthState::Unknown,
+            format!(
+                "{ORPHAN_BASELINE_PATH} could not be read this time, so whether the versions below \
+                 are already-accepted debris is unread — held as Unknown rather than alarming on a \
+                 failed read. What would be flagged: {detail}"
+            ),
+        );
+    }
+    (state, detail)
+}
+
+/// The classification proper, before the unreadable-baseline hold in
+/// [`classify_release_publication`].
+fn classify_release_publication_read(
     releases: Option<&ReleasesReading>,
     tags: Option<&[String]>,
     baseline: Option<&ReleaseBaseline>,
@@ -1921,6 +1956,22 @@ fn classify_release_publication(
             format!(
                 "no recognizable vMAJOR.MINOR.PATCH tag among the {RELEASE_REPO} tags read — cannot \
                  tell what has been built."
+            ),
+        );
+    }
+
+    // AN EMPTY READ IS NOT "NOTHING PUBLISHED" (bead `sparkle-tm3ik6.1`). Zero published releases
+    // and zero drafts while tags exist is what a failed / under-scoped / rate-limited read returns,
+    // and the measured flap was exactly this: BLOCKING on one poll, healthy at v0.152.1 on the next.
+    if published.is_empty() && drafts.is_empty() && !tagged.is_empty() {
+        return (
+            HealthState::Unknown,
+            format!(
+                "the {PUBLIC_RELEASE_REPO} releases read came back with no published release and no \
+                 draft while {} version tag(s) exist — that is what a failed or insufficiently-scoped \
+                 read returns, so whether anything is published is unread. Check with `gh release \
+                 list --repo {PUBLIC_RELEASE_REPO}`.",
+                tagged.len()
             ),
         );
     }
@@ -5602,20 +5653,52 @@ mod tests {
         assert!(detail.contains("v0.120.0"), "{detail}");
     }
 
-    /// Nothing published at ALL, with work tagged, is the worst case, not an empty one: every tag is
-    /// above an empty high-water mark. It must not fall into the "no high-water mark → cannot rank"
-    /// hole and read green.
+    /// AN EMPTY RELEASES READ IS UNKNOWN, NEVER BLOCKING (bead `sparkle-tm3ik6.1`). The measured
+    /// flap: one poll said "try-sparkle/sparkle has no published release at all, v0.152.1 … (+157
+    /// more) built but NOT published" and the next said healthy at v0.152.1, which was published and
+    /// Latest throughout. A well-formed `[]` is also what a failed, rate-limited or under-scoped read
+    /// returns, so zero published AND zero drafts while tags exist cannot be read as an outage.
+    /// Driven through the real entry point from the raw `[]` payload, so the parse is covered too.
     #[test]
-    fn nothing_published_at_all_blocks_when_a_tag_exists() {
-        let releases = ReleasesReading { published: Vec::new(), drafts: Vec::new() };
-        let (state, detail) =
-            classify_pub(Some(&releases), Some(&strings(&["v0.1.0"])));
-        assert_eq!(state, HealthState::Blocking, "{detail}");
-        assert!(detail.contains("no published release at all"), "{detail}");
+    fn an_empty_releases_read_with_tags_is_unknown_not_blocking() {
+        let no_gh = |_: &str| None;
+        let tags_json = r#"[{"name":"v0.152.1"},{"name":"v0.152.0"},{"name":"v0.151.2"}]"#;
+        let c = release_publication_from_json(
+            Some("[]"),
+            Some(tags_json),
+            true,
+            &no_repo_root("empty-releases-read"),
+            &no_gh,
+        );
+        assert_eq!(c.state, HealthState::Unknown, "an empty read is unread, not an outage: {}", c.detail);
+        assert!(!c.detail.contains("NOT published"), "it must not claim the build is stranded: {}", c.detail);
+        assert!(c.detail.contains("unread"), "it must say the read is the problem: {}", c.detail);
 
-        // …and a repo with nothing tagged and nothing released has nothing waiting — green.
+        // The same, with the baseline readable — the empty read alone is enough to hold it.
+        let releases = read_releases("[]").expect("[] is a well-formed payload");
+        let (state, detail) = classify_pub(Some(&releases), Some(&strings(&["v0.1.0"])));
+        assert_eq!(state, HealthState::Unknown, "{detail}");
+
+        // …a list holding ONLY a prerelease is the same zero-published, zero-draft shape.
+        let only_pre = read_releases(r#"[{"tag_name":"v0.1.0","draft":false,"prerelease":true}]"#).unwrap();
+        let (state, detail) = classify_pub(Some(&only_pre), Some(&strings(&["v0.1.0"])));
+        assert_eq!(state, HealthState::Unknown, "{detail}");
+
+        // …a repo with nothing tagged and nothing released has nothing waiting — green.
         let (state, detail) = classify_pub(Some(&releases), Some(&[]));
         assert_eq!(state, HealthState::Healthy, "{detail}");
+    }
+
+    /// The paired direction: a read that DID return something (a draft) proves the query works, so
+    /// with nothing published every tag is genuinely above an empty high-water mark — BLOCKING still
+    /// fires. The empty-read hold must not swallow a real "nothing published" outage.
+    #[test]
+    fn nothing_published_but_a_draft_visible_still_blocks() {
+        let releases = ReleasesReading { published: Vec::new(), drafts: strings(&["v0.0.9"]) };
+        let (state, detail) =
+            classify_pub(Some(&releases), Some(&strings(&["v0.1.0", "v0.0.9"])));
+        assert_eq!(state, HealthState::Blocking, "{detail}");
+        assert!(detail.contains("no published release at all"), "{detail}");
     }
 
     /// The detail is ONE panel line, so a long list is capped — but sorted highest-first, so the
@@ -5813,8 +5896,11 @@ mod tests {
             None,
             &std::collections::BTreeMap::new(),
         );
-        assert_eq!(state, HealthState::Warning, "an unreadable baseline accepts nothing: {detail}");
-        assert!(detail.contains("v0.129.0"), "the orphan is still counted: {detail}");
+        // HELD AS UNKNOWN, not Warning (bead `sparkle-tm3ik6.1`): an intermittently unreadable file
+        // recounted every accepted orphan as new and flapped the verdict on the READ. Unknown is
+        // still not green, and the finding it would have raised is still named.
+        assert_eq!(state, HealthState::Unknown, "an unreadable baseline is unread, not a finding: {detail}");
+        assert!(detail.contains("v0.129.0"), "the orphan is still named: {detail}");
         assert!(detail.contains("could not be read"), "and the reason is stated: {detail}");
         assert!(detail.contains(ORPHAN_BASELINE_PATH), "naming the file: {detail}");
     }
@@ -5908,11 +5994,12 @@ mod tests {
         assert!(c.detail.contains("are accepted in"), "{}", c.detail);
 
         // The paired direction, through the SAME entry point: a root with no acceptance file accepts
-        // nothing, so the identical payloads degrade. It is BLOCKING rather than Warning because the
-        // baseline now carries v0.142.0 — a plain tag ABOVE the published high-water mark (v0.132.0)
-        // with no release object at all, which is branch 1's stranded-tag shape. That is the whole
-        // point of the pair: the SAME payloads read Healthy when the acceptance file is present and
-        // Blocking when it is not, so the file is provably what the classifier is honouring.
+        // nothing, so the identical payloads degrade. It is BLOCKING because v0.142.0 is a plain tag
+        // ABOVE the published high-water mark (v0.132.0) — branch 1's stranded-tag shape — and an
+        // unread baseline must NOT mute that (only a Warning is held as Unknown, bead
+        // `sparkle-tm3ik6.1`). That is the whole point of the pair: the SAME payloads read Healthy
+        // when the acceptance file is present and Blocking when it is not, so the file is provably
+        // what the classifier is honouring.
         //
         // The "no file" root is a directory OUTSIDE any repository, and it has to be: since the read
         // resolves `origin/<default>:<path>` rather than a path on disk, a SUBDIRECTORY of this repo
@@ -5925,7 +6012,8 @@ mod tests {
             &no_repo_root("honours-empty"),
             &no_gh,
         );
-        assert_eq!(c.state, HealthState::Blocking, "no file means nothing accepted: {}", c.detail);
+        assert_eq!(c.state, HealthState::Blocking, "an unread baseline never mutes a stranded tag: {}", c.detail);
+        assert!(c.detail.contains("v0.142.0"), "{}", c.detail);
         assert!(c.detail.contains("could not be read"), "{}", c.detail);
     }
 
