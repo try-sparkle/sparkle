@@ -1,9 +1,10 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
 import { DETECTOR_IDS } from './humaneDetectors';
-import { bundledPackFiles, loadBundledPacks } from './humanePackData/loadBundled';
 import {
   EmptyJurisdictionScopeError,
   evaluatePacks,
@@ -15,6 +16,7 @@ import {
   parsePack,
   pendingJudgedQuestions,
   scopeUsable,
+  type LoadOptions,
   type LoadResult,
   type Pack,
   type PacksInScope,
@@ -28,6 +30,46 @@ import {
   type PrincipleAssessment,
   type PrincipleId,
 } from './humaneTypes';
+
+/**
+ * The bundled starter packs, read off disk the way a filesystem caller would.
+ *
+ * This lived in `humanePackData/loadBundled.ts` until 2026-10-21, when it was deleted as dormant: // guard-ok — tombstone: replaced by this local helper
+ * nothing but this suite ever called it — the humane gate (`tools/humane-gate/run-gate.ts`) does
+ * not load packs from disk. The `.json` packs still ship as data, so the suite keeps testing them
+ * as data through this local copy. If a production caller is ever written, move it back out.
+ */
+const BUNDLED_PACK_DIR = fileURLToPath(new URL('./humanePackData/', import.meta.url));
+
+function bundledPackFiles(): string[] {
+  return readdirSync(BUNDLED_PACK_DIR)
+    .filter((name) => name.endsWith('.json'))
+    .sort()
+    .map((name) => join(BUNDLED_PACK_DIR, name));
+}
+
+function loadBundledPacks(opts: LoadOptions = {}): LoadResult {
+  const files = bundledPackFiles();
+  const raws: unknown[] = [];
+  const readErrors: string[] = [];
+  const kept: string[] = [];
+  for (const file of files) {
+    try {
+      raws.push(JSON.parse(readFileSync(file, 'utf8')));
+      kept.push(file);
+    } catch (err) {
+      readErrors.push(`${file}: not readable as JSON — ${(err as Error).message}`);
+    }
+  }
+  const result = loadPacks(raws, {
+    ...opts,
+    label: opts.label ?? ((i) => kept[i] ?? `pack[${i}]`),
+  });
+  const errors = [...readErrors, ...result.errors];
+  return scopeUsable(result)
+    ? { scope: result.scope, packs: result.packs, errors }
+    : { scope: result.scope, errors };
+}
 
 /**
  * A raw pack document, as a policy author would write it. Deep-cloned per test so a

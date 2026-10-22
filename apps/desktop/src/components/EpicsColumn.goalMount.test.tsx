@@ -34,9 +34,9 @@
 //
 // ══ WHERE THE GOAL IS GOING ═══════════════════════════════════════════════════════════════════
 // Onto the opened epic CARD, as an editable field (item 12 of `sparkle-huw924`, bead
-// `sparkle-huw924.4`). `EpicGoalRowForEpic` is intact and unmounted for exactly that reason, and
-// its container suite is kept green so the re-mount is safe. When that lands, the right move is to
-// ADD the card-side mount guard here — the original argument, re-aimed — not to delete this file.
+// `sparkle-huw924.4`). That landed as `BeadCard/EpicCardGoal.tsx`, a new component; the unmounted
+// `EpicGoalRowForEpic` was deleted on 2026-10-21 (bead `sparkle-873c42`). This file still guards
+// the row against getting a goal back.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 

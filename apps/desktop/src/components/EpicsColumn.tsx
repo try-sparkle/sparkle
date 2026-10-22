@@ -1354,20 +1354,10 @@ function EpicRow({
           "we're not gonna show 'set a goal' on here". The row is the epic's NAME; the goal belongs
           to the opened card.
 
-          THE COMPONENT IS NOT DELETED. `EpicGoalRow` keeps its editor, validation, portal and
-          suite, because the card is where it is going next (item 12 of `sparkle-huw924`, bead
-          `sparkle-huw924.4`).
-
-          BUT UNTIL THAT LANDS, THE EPIC GOAL IS LIVE STATE WITH NO SURFACE — and that is a wider
-          gap than "you cannot edit it" (roborev 66336). The goal is not a readout: it is an INPUT
-          TO DISPATCH. `workerSpawn.ladderGoalFor` injects its text into every spawned worker's
-          goal, and `sendToBuild.epicGoalLadder` pastes it verbatim into the handoff prompt ("THIS
-          TASK LADDERS UP TO EPIC …, whose goal, verbatim, is:"). `conciergeTools/plans.ts`
-          auto-generates it at epic creation. So a wrong or stale auto-written goal now steers
-          every dispatch under that epic while being readable nowhere in the app, and the only way
-          back is asking the concierge to regenerate. THIS ROW IS NOT THE PLACE TO FIX THAT — the
-          founder ruled the goal off the row three times — so the fix is to land the card field,
-          not to re-mount here.
+          The goal now lives on the opened card as `BeadCard/EpicCardGoal.tsx` (bead
+          `sparkle-huw924.4`), a new component rather than a re-mount. The old row component,
+          `EpicGoalRow`, sat unmounted and was deleted on 2026-10-21 (bead `sparkle-873c42`).
+          Do not re-mount a goal here: the founder ruled it off the row three times.
 
           IF YOU MOUNT ANYTHING CLICKABLE HERE, read `Workspace.epicsColumn.test.tsx`'s "opens the
           card wherever inside the row the click lands" first. It clicks every descendant of this
