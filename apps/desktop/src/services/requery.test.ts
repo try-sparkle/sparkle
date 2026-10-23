@@ -471,3 +471,62 @@ describe("reading the agent's previous answer back (roborev 57707)", () => {
     }
   });
 });
+
+describe("a FINISHED agent — goal met AND landed — is never asked (sparkle-eou3y0.5)", () => {
+  /**
+   * One open, idle build agent with a CLEAN live branch reading. `met` latches the goal; `shipped`
+   * sets the origin/main watermark `landedEvidenceFor` reads. Every case starts with
+   * `workflowShipped` set explicitly so no state leaks between cases through the store.
+   */
+  function seedFinished(over: { met: boolean; shipped: boolean }) {
+    const a = agent("b1", "build");
+    a.goal = {
+      text: "land it",
+      setAt: 0,
+      ttlMs: 3_600_000,
+      continues: 0,
+      totalContinues: 0,
+      ...(over.met ? { metAt: 1 } : {}),
+    };
+    seed([a], ["b1"], { b1: "idle" });
+    useRuntimeStore.setState({
+      branchStatus: {
+        b1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, worktreeOnBranch: true },
+      },
+      workflowShipped: over.shipped ? { b1: true } : {},
+    } as never);
+  }
+
+  it("sends NOTHING on first contact, and nothing an hour later either", async () => {
+    // The two doors `buildAsk` keeps open on purpose — first contact, and the hourly expiry — are
+    // exactly the doors the measured finished agents were walked through. Both must stay shut.
+    seedFinished({ met: true, shipped: true });
+    const realNow = Date.now;
+    try {
+      let clock = 1_000_000;
+      Date.now = () => clock;
+      await requeryOpenAgents();
+      expect(submitPrompt).not.toHaveBeenCalled();
+      clock += MAX_SILENCE_MS * 2;
+      await requeryOpenAgents();
+      expect(submitPrompt).not.toHaveBeenCalled();
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("STILL asks a met agent whose landing git has not proven", async () => {
+    // The paired case: identical setup, only the landing watermark removed. A met claim alone is
+    // the agent's word — a never-committed branch is clean too — so it keeps being asked.
+    seedFinished({ met: true, shipped: false });
+    await requeryOpenAgents();
+    expect(submitPrompt).toHaveBeenCalledWith("b1", BLOCKER_ASK, { machine: true });
+  });
+
+  it("STILL asks a landed agent whose goal is not met", async () => {
+    // The other half of the conjunction: shipped work with an open goal is a live agent.
+    seedFinished({ met: false, shipped: true });
+    await requeryOpenAgents();
+    expect(submitPrompt).toHaveBeenCalledWith("b1", BLOCKER_ASK, { machine: true });
+  });
+});

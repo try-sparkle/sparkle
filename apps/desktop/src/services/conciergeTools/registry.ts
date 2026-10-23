@@ -115,6 +115,7 @@ import {
   type ControlKeyName,
   sendToAgentTerminal,
 } from "./terminal";
+import { withAgentScreen } from "../screenRelay";
 import {
   ATTACHMENTS_OPS,
   ATTACHMENTS_RISK,
@@ -1503,7 +1504,13 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
     const r = await sendControlKey(a.agentId, a.key as ControlKeyName, authority);
     return r.ok ? ok(ctx, r) : err(ctx, r.reason ?? "action-failed", r.detail ?? "Not pressed.");
   }),
-  read_picker_options: route(agentOnly, (a, ctx) => ok(ctx, readPickerOptions(a.agentId))),
+  // BOTH picker ops read the screen through `withAgentScreen`, so an agent whose pane lives in
+  // ANOTHER window is readable and answerable (bead sparkle-eou3y0.3). It supplies evidence only:
+  // the read, the fingerprint match and every send-side refusal below are the unchanged code, and
+  // with no window able to see the agent they refuse `pane-not-mounted` exactly as before.
+  read_picker_options: route(agentOnly, async (a, ctx) =>
+    ok(ctx, await withAgentScreen(a.agentId, () => readPickerOptions(a.agentId))),
+  ),
   select_picker_option: route(selectPickerArgs, async (a, ctx) => {
     // Pressing a menu option writes to a PTY, so it rides the SAME authority as typed text — a
     // picked option is attributable to a toolCallId exactly like a send.
@@ -1519,7 +1526,9 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
         "Not pressed: nothing authorized this write. Answering a menu needs a tool-call id and a resolved allow/approved policy.",
       );
     }
-    const r = await selectPickerOption(a.agentId, a.index, a.expectFingerprint, authority);
+    const r = await withAgentScreen(a.agentId, () =>
+      selectPickerOption(a.agentId, a.index, a.expectFingerprint, authority),
+    );
     return r.ok ? ok(ctx, r) : err(ctx, r.reason ?? "action-failed", r.detail ?? "Not pressed.");
   }),
   read_agent_terminal: route(readTerminalArgs, async (a, ctx) =>

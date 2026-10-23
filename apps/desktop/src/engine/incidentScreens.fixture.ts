@@ -97,3 +97,95 @@ export const WEDGED_FRAME_SCREEN = [
   "",
   "❯\u00a0                                                ← for agents                   "
 ].join("\n");
+
+/** The full-width rule Claude Code draws above and below its composer, at the 120-column grid the
+ *  other reconstructions here use. */
+const RULE_120 = "─".repeat(120);
+
+/**
+ * AN IDLE AGENT WHOSE ONLY FOOTER IS THE AGENTS INDICATOR — bead sparkle-eou3y0.8.
+ *
+ * RECONSTRUCTED, NOT CAPTURED, from the bead's description of four affected panes (an Improve
+ * Sparkle pane, a crypto-basis pane, a Daily Spend Report pane and a babysit pane): an idle prompt
+ * whose transcript reads normally and whose footer row is ONLY the agents indicator — no permission
+ * mode bar, no `? for shortcuts`. The reply's own `⏺` header has scrolled above the viewport, which
+ * is the ordinary state of a finished agent that wrote more than a screenful.
+ *
+ * On that screen the composer box was the ONLY recognised family, `isClaudeCodeScreen` answered
+ * false, and `send_to_agent_terminal` refused `alternate-screen` — so the concierge could not
+ * message most idle agents. The two footer variants named in the bead are the two exports below.
+ */
+const idleWithFooter = (footer: string): string =>
+  [
+    "  - Merged PR #3088 into main and confirmed it by ancestry.",
+    "  - Closed the review findings with stated reasons.",
+    "",
+    "  Nothing else is pending on my side.",
+    "",
+    "✻ Cogitated for 3m 12s",
+    "",
+    "",
+    "",
+    RULE_120,
+    "❯ ",
+    RULE_120,
+    footer,
+  ].join("\n");
+
+export const IDLE_AGENTS_MANAGE_FOOTER_SCREEN = idleWithFooter("  ← agents · ↓ to manage");
+export const IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN = idleWithFooter("  ← agents · 1 feedback draft");
+
+/**
+ * THE FEEDBACK-DRAFT CARD — bead sparkle-eou3y0.5.
+ *
+ * RECONSTRUCTED, NOT CAPTURED. An agent answering a status-check nudge calls SendFeedback, and
+ * Claude Code leaves a "Bug report drafted" card on screen offering `1 review / 2 send / 0 dismiss`.
+ * The footer is spelled here as a key-hint bar (`N to verb · …`), because that is the only spelling
+ * consistent with what the bead observed: `read_picker_options` answered
+ * `blind: "footer-without-options"`, which requires the shared picker footer matcher to have
+ * matched, and that matcher accepts only `<key> to <verb>` segments. The recogniser does not depend
+ * on that spelling — `feedbackDraftCard.ts` also takes `1 review / 2 send / 0 dismiss` — so a
+ * capture that disagrees narrows nothing.
+ */
+export const FEEDBACK_DRAFT_CARD_SCREEN = [
+  "⏺ Not blocked — the goal is met and PR #3065 is on main. I've drafted feedback about the",
+  "  repeated status checks.",
+  "",
+  "  Bug report drafted: Status-check nudges keep firing after goal is met",
+  "  1 to review · 2 to send · 0 to dismiss",
+  "",
+  RULE_120,
+  "❯ ",
+  RULE_120,
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← agents · 1 feedback draft",
+].join("\n");
+
+/** The same card in the slash-separated spelling the bead quoted, with no `to`. */
+export const FEEDBACK_DRAFT_CARD_SLASH_SCREEN = FEEDBACK_DRAFT_CARD_SCREEN.replace(
+  "  1 to review · 2 to send · 0 to dismiss",
+  "  1 review / 2 send / 0 dismiss",
+);
+
+/**
+ * THE IMPOSTOR — the SAME card text quoted in agent output with more output beneath it. A card that
+ * real output has scrolled past is not live, so nothing may be offered for it: a stale "2 send"
+ * pressed on a guess would publish a bug report nobody asked to send.
+ */
+export const FEEDBACK_DRAFT_CARD_QUOTED_SCREEN = [
+  "⏺ Here is what the card looked like:",
+  "  Bug report drafted: Status-check nudges keep firing after goal is met",
+  "  1 to review · 2 to send · 0 to dismiss",
+  "",
+  "⏺ Next I re-ran the suite:",
+  "  bash scripts/tests/run.sh nudge",
+  "  SELECTED SHELL TESTS PASSED (3 of 57 — full suite NOT run)",
+  "  The nudge suite is green on this branch.",
+  "  Moving on to the Rust side now.",
+  "  cargo test --lib nudge_gate",
+  "  test result: ok. 41 passed",
+  "",
+  RULE_120,
+  "❯ ",
+  RULE_120,
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+].join("\n");

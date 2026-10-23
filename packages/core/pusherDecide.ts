@@ -65,8 +65,11 @@ export interface DecisionSend {
 
 export interface DecisionQuiet {
   action: "quiet";
-  /** Why nothing was sent — a gate refusal, or `no-trigger` when nothing was measurably wrong. */
-  reason: GateRefusal | "no-trigger";
+  /**
+   * Why nothing was sent — a gate refusal, `no-trigger` when nothing was measurably wrong, or
+   * `goal-met-landed` when the partner is FINISHED and must not be spoken to at all.
+   */
+  reason: GateRefusal | "no-trigger" | "goal-met-landed";
   /** The memory to store now. Always applied: the two-observation rule depends on it. */
   memory: PartnerMemory;
 }
@@ -105,13 +108,22 @@ export function decidePusherAction(input: DecideInput): PusherDecision {
     ),
   };
 
-  const quiet = (reason: GateRefusal | "no-trigger"): DecisionQuiet => ({
+  const quiet = (reason: DecisionQuiet["reason"]): DecisionQuiet => ({
     action: "quiet",
     reason,
     memory: base,
   });
 
   if (!policy.enabled) return quiet("disabled");
+
+  // A FINISHED PARTNER IS NEVER CHALLENGED (sparkle-eou3y0.5). Goal met AND affirmatively nothing
+  // unlanded — `undefined` ("branch not polled") does not qualify, the same fail-closed reading every
+  // trigger applies to `hasUnlandedWork`. The challenge carries `BLOCKER_ASK` ("Status check"), and a
+  // finished agent answers it by drafting a SendFeedback card that blocks `retire_agent`; the PTY
+  // write also reads to the Rust nudge ladder as new work superseding the met goal, so one challenge
+  // re-arms `[sparkle-nudge #N]` too. Checked AFTER `base` so the sighting is still remembered: if
+  // the agent picks up new work, its triggers persist exactly as if this branch had not existed.
+  if (observation.goalMet && observation.hasUnlandedWork === false) return quiet("goal-met-landed");
 
   // Nothing measurably wrong, or nothing wrong TWICE. Reported as distinct reasons because they
   // mean different things in the hit-rate log: one says the fleet is healthy, the other says the

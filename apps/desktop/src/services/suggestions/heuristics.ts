@@ -12,6 +12,7 @@ import {
 // source of truth — the same one `screenClassifier` imports it from, so there is one definition of
 // "a row that is Claude Code's own furniture" rather than a second copy that can drift.
 import { AMBIENT_CHROME_LINE } from "../sessionLimitScreen";
+import { findFeedbackDraftCard } from "../../engine/feedbackDraftCard";
 
 /** How many rows the shared vocabulary does NOT recognise may sit below a cursor-anchored option run
  *  before it stops counting as the menu the screen is waiting on.
@@ -485,6 +486,28 @@ function parsePickerOptionsWithBounds(scrollback: string): {
   // manufactures exactly the false escalations that got the `no-footer` arm removed in roborev
   // 61832. `blockEnd` carries the walk's starting point; `footerIdx` stays -1 unless a real footer
   // was seen, and the diagnosis stays honest about what it saw.
+  // ── THE FEEDBACK-DRAFT CARD: ITS OPTIONS ARE IN ITS FOOTER (bead sparkle-eou3y0.5) ────────────
+  // "Bug report drafted … 1 to review · 2 to send · 0 to dismiss" has a footer the scan above
+  // matches and NO numbered option rows, so the walk below found nothing and the read answered
+  // `footer-without-options` on a card that is perfectly answerable. Worse, a numbered list in the
+  // agent's own output above the card could be mistaken for its options by that walk. So a LIVE
+  // card is asked first and, when it is the last thing on screen that looks like a menu, its
+  // footer's own keystrokes are the options. `top` is set to the row above the card's title so the
+  // fingerprint hashes the title — the card's question — and nothing from the transcript above.
+  const card = findFeedbackDraftCard(lines);
+  if (card && card.footerIdx >= footerIdx) {
+    return {
+      opts: card.options.map((o) => ({ n: Number(o.key), label: o.label })),
+      bounds: {
+        first: card.titleIdx,
+        footer: card.footerIdx,
+        footerLast: card.footerIdx,
+        top: card.titleIdx - 1,
+      },
+      footerIdx: card.footerIdx,
+    };
+  }
+
   let blockEnd = footerIdx;
   if (footerIdx < 0) {
     blockEnd = cursorAnchoredRunEnd(lines);

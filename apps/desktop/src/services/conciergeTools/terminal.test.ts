@@ -70,7 +70,7 @@ import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { useRuntimeStore, readPersistedOpenAgentIds } from "../../stores/runtimeStore";
 import { getAgentScrollback } from "../terminalScrollback";
-import { FOOTER_ONLY_SCREEN } from "../../engine/incidentScreens.fixture";
+import { FEEDBACK_DRAFT_CARD_SCREEN, FOOTER_ONLY_SCREEN } from "../../engine/incidentScreens.fixture";
 import { isClaudeCodeScreen, hasClaudeCodeLiveTui } from "../../engine/claudeCodeScreen";
 import {
   APPROVAL_2_1_220,
@@ -1640,6 +1640,17 @@ describe("read_picker_options", () => {
       // claim above is decoration.
       scrollbackMock.mockReturnValue(FOOTER_ONLY_SCREEN);
       expect(readPickerOptions(AGENT).blind).toBe("footer-without-options");
+    });
+
+    // THE FEEDBACK-DRAFT CARD (bead sparkle-eou3y0.5). Its options live in its footer, so it used
+    // to land in the case above — `footer-without-options` on a card the concierge could answer.
+    it("reads the feedback-draft card's options instead of reporting it blind", () => {
+      scrollbackMock.mockReturnValue(FEEDBACK_DRAFT_CARD_SCREEN);
+      const read = readPickerOptions(AGENT);
+      expect(read.present).toBe(true);
+      expect(read.blind).toBeUndefined();
+      expect(read.options.map((o) => o.label)).toEqual(["1 · review", "2 · send", "0 · dismiss"]);
+      expect(read.fingerprint, "an answerable card needs a fingerprint to echo back").not.toBe("");
     });
 
     it("names a footer whose option block did not parse", () => {

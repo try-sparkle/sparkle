@@ -123,6 +123,33 @@ const STATUS_GLYPHS = "\\u26a0\\u23f8\\u23f5\\u23f4\\u25b6\\u25c6\\u25cf\\u2713\
  *  never match, quietly weakening the narrow-composer arm instead of strengthening it. */
 const PERMISSION_MODE_BAR = new RegExp(`[${STATUS_GLYPHS}][${STATUS_GLYPHS}]?\\s+[a-z][a-z ]{1,28}\\son\\b`, "i");
 
+/** ══ THE AGENTS INDICATOR AS A ROW OF ITS OWN (bead sparkle-eou3y0.8) ═══════════════════════════
+ *  Claude Code ends its status bar with an agents indicator — `· ← for agents` on the mode bars
+ *  above. Current builds also draw it as the ONLY footer row of an idle pane, with no mode bar and
+ *  no `? for shortcuts`:
+ *
+ *      ← agents · ↓ to manage
+ *      ← agents · 1 feedback draft
+ *
+ *  Unknown to family C, that left an idle pane whose `⏺` header had scrolled off scoring the
+ *  composer box alone, and every message to it was refused `alternate-screen` — the concierge could
+ *  not reach most idle agents (`IDLE_AGENTS_*_FOOTER_SCREEN` in `incidentScreens.fixture.ts`).
+ *
+ *  WHY IT IS SAFE AS CHROME: the arrow must OPEN the row (after indentation and an optional status
+ *  glyph), so a sentence in a document that mentions the indicator does not count, and the word
+ *  after it must be `agents` followed by a `·` segment or the end of the row. It is a family-C vote
+ *  like `? for shortcuts`, never a substitute for the composer box, so a pager quoting it is still
+ *  refused. The `(?:^|·)` opening also lets the indicator count when it trails a bar segment.
+ *
+ *  `^` IS SAFE INSIDE `CHROME_BAR_OPENS`' WRAPPER despite the warning on `PERMISSION_MODE_BAR`: the
+ *  wrapper's prefix is `*`, so it can match empty and leave the inner `^` at position 0, and the
+ *  `\s*` inside this pattern absorbs the indentation instead. Pinned by the narrow-pane case in
+ *  `claudeCodeScreen.agentsFooter.test.ts`. */
+const AGENTS_INDICATOR_ROW = new RegExp(
+  `(?:^[ \\t\\u00a0${STATUS_GLYPHS}]*|·[ \\t\\u00a0]*)←[ \\t\\u00a0]+(?:for[ \\t\\u00a0]+)?agents(?=[ \\t\\u00a0]*(?:·|$))`,
+  "im",
+);
+
 /** ══ FAMILY C — THE PERSISTENT CHROME BARS ══════════════════════════════════════════════════════
  *  The always-on footer lines. Every entry here is pinned by `NON_PICKER_HINT_LINES_2_1_220` in the
  *  captured fixtures as REAL Claude Code chrome — that list exists to keep the picker matcher from
@@ -150,6 +177,7 @@ const CHROME_BAR: RegExp[] = [
   // closing rule) would then score 2 and be written into. This hint sits BELOW the closing rule,
   // which is what makes it independent evidence rather than box content.
   /\bpaste again to expand\b/i,
+  AGENTS_INDICATOR_ROW,
 ];
 
 /** `CHROME_BAR`, re-anchored to the START of a string, tolerating a leading status glyph.

@@ -3,6 +3,7 @@ import { AuthGate } from "./components/AuthGate";
 import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
 import { installInputFreezeTrace, traceGates } from "./diagnostics/inputFreezeTrace";
+import { startScreenRelayResponder } from "./services/screenRelay";
 import { installInputRelease } from "./services/inputRelease";
 import { installDictationFocusTracker } from "./voice/dictationFocusTracker";
 import { useDictationStore } from "./stores/dictationStore";
@@ -501,6 +502,10 @@ export function App() {
   // a native menu item, so it survives a webview whose own event pipeline is the broken thing —
   // see services/inputRelease.
   useEffect(() => installInputRelease(), []);
+  // EVERY WINDOW ANSWERS FOR THE PANES IT HOSTS. The concierge can only read a picker it can see,
+  // and a pane in a torn-off window is invisible to it without this (bead sparkle-eou3y0.3). Ungated
+  // by isMain on purpose: the window hosting the pane is the one that must answer, whichever it is.
+  useEffect(() => startScreenRelayResponder(), []);
   // DICTATION FOLLOWS FOCUS. Records who holds the caret (and whether this window is active) into
   // the dictation store; the routing gate in useDictation and the paused copy on both mic surfaces
   // read the ONE verdict derived from it (voice/dictationFocus). Installed here, beside the trace

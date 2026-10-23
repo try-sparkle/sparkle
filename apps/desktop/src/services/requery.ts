@@ -44,6 +44,7 @@ import { submitPrompt, PtyGoneError } from "../pty";
 import { defaultStore, type KV } from "./windowRegistry";
 import { log } from "../logger";
 import { getAgentScrollback } from "./terminalScrollback";
+import { goalMetAndLanded } from "./agentGoalReading";
 
 /**
  * What we send each agent. One shared constant so the wording lives in one place — and that place is
@@ -253,6 +254,16 @@ export async function requeryOpenAgents(): Promise<void> {
       // COMPOSE THE ASK, OR DECIDE NOT TO ASK. Read after the status gate, so nothing is computed
       // for an agent we were never going to write to.
       const now = fingerprint(agent.id, st);
+
+      // A FINISHED AGENT IS NEVER ASKED (sparkle-eou3y0.5). Met goal AND git-proven landing — not
+      // `buildAsk`'s softer `terminal`, which a clean never-committed branch also satisfies and which
+      // therefore keeps its first-contact ask and hourly expiry. Asking here gets a SendFeedback card
+      // drafted that blocks `retire_agent`, and the write itself re-arms the Rust nudge ladder.
+      if (goalMetAndLanded(agent.id, agent.goal)) {
+        lastSeen.set(agent.id, now);
+        log.debug("connectivity", `no ask for agent ${agent.id} — goal met and its work has landed`);
+        continue;
+      }
       const prev = lastSeen.get(agent.id);
       const scrollback = getAgentScrollback(agent.id);
       const previous = scrollback === null ? undefined : parseBlockerReport(scrollback, Date.now());

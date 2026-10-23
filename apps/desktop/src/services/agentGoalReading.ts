@@ -316,6 +316,27 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
 }
 
+/**
+ * Is this agent FINISHED — its goal latched met AND git's answer that the work is on origin/main?
+ *
+ * THE ONE QUESTION EVERY AUTOMATED "ARE YOU STUCK?" SENDER MUST ASK FIRST (bead sparkle-eou3y0.5).
+ * Measured: two agents with met goals and merged PRs kept receiving `Status check` prompts. Each
+ * answered by drafting a SendFeedback card, which flips the row to Needs-you and makes
+ * `retire_agent` refuse — so a finished agent could not be cleared without the founder pressing a
+ * key in its pane. Worse, every such machine write lands in the PTY as a FOREIGN write, which the
+ * Rust nudge ladder reads as "new work superseded the met goal" and so resumes `[sparkle-nudge #N]`
+ * pings. Asking a finished agent anything is how the quiet state gets broken.
+ *
+ * BOTH HALVES, and the second is git's rather than the agent's: `metAt` alone is the agent's claim
+ * and stays latched until a new goal is set, so a re-tasked or never-committed agent can carry it.
+ * {@link landedEvidenceFor} is `true` only with committed work proven on origin/main and nothing
+ * unlanded since, so `undefined` ("not looked up") and `false` both answer NO here — the fail-closed
+ * direction is to keep asking.
+ */
+export function goalMetAndLanded(agentId: string, goal: AgentGoal | undefined): boolean {
+  return goal?.metAt !== undefined && landedEvidenceFor(agentId) === true;
+}
+
 /** Has this branch AUTHORED anything at all? — the no-op guard a raw ancestry check cannot carry.
  *
  *  `probeLandedFromGit` asks one question: is this worktree's CURRENT HEAD reachable from

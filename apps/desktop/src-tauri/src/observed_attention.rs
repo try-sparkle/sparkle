@@ -1145,12 +1145,16 @@ mod tests {
         }
         // …and the count, so an ADDED bar cannot slip through the per-literal loop above.
         let entries = ts
-            .split("const CHROME_BAR: RegExp[] = [")
+            // `chrome_bar_opens` ports BAR_OPENS_STRICT — the latching tail gate — NOT CHROME_BAR,
+            // which is a family-C scoring vote with no Rust mirror. Counting CHROME_BAR made a new
+            // scoring-only bar (AGENTS_INDICATOR_ROW) look like a missing port, and "fixing" that
+            // loosened this gate in Rust alone (roborev 83987 / 83990).
+            .split("const BAR_OPENS_STRICT: readonly RegExp[] = [")
             .nth(1)
-            .expect("CHROME_BAR array not found")
-            .split("];")
+            .expect("BAR_OPENS_STRICT array not found")
+            .split("].map(")
             .next()
-            .expect("CHROME_BAR array not closed")
+            .expect("BAR_OPENS_STRICT array not closed")
             .lines()
             .filter(|l| {
                 let t = l.trim();
@@ -1159,8 +1163,17 @@ mod tests {
             .count();
         assert_eq!(
             entries, 5,
-            "CHROME_BAR gained or lost an entry — mirror it in `chrome_bar_opens` in the SAME commit"
+            "BAR_OPENS_STRICT gained or lost an entry — mirror it in `chrome_bar_opens` in the SAME commit"
         );
+    }
+
+    /// TS added the `← agents` footer to CHROME_BAR (a scoring vote) but NOT to BAR_OPENS_STRICT,
+    /// so the latching strict gate must keep refusing a tail that merely opens with it.
+    #[test]
+    fn the_agents_indicator_footer_does_not_open_the_strict_latching_bar() {
+        assert!(!chrome_bar_opens().is_match("← agents · ↓ to manage"));
+        assert!(!chrome_bar_opens().is_match("← agents"));
+        assert!(chrome_bar_opens().is_match("? for shortcuts"));
     }
 
     /// The wrapped narrow-pane bar is the case the strict walk cannot see, so assert BOTH halves:

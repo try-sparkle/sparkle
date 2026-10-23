@@ -15,7 +15,7 @@ import {
 } from "./pusherDecide";
 import { resolvePusherPolicy } from "./pusherPolicy";
 import { MESSAGES_PER_HOUR, REPEAT_COOLDOWN_MS } from "./pusherGate";
-import { evaluateTriggers, type Observation } from "./pusherTriggers";
+import { evaluateTriggers, ROBOREV_PLATEAU_ROUND, type Observation } from "./pusherTriggers";
 
 const T0 = 1_700_000_000_000;
 const MIN = 60_000;
@@ -174,5 +174,39 @@ describe("a healthy partner", () => {
     const d = quiet(decide({ observation: quietObs() }));
     expect(d.reason).toBe("no-trigger");
     expect(d.memory.lastTriggers).toEqual([]);
+  });
+});
+
+describe("a FINISHED partner is never challenged (sparkle-eou3y0.5)", () => {
+  // A trigger that a met goal does NOT already disarm on its own, so the only thing that can keep
+  // these quiet is the finished-partner gate. Two identical sightings, so the two-observation rule
+  // is satisfied and would otherwise send.
+  const lapping = (over: Partial<Observation>): Observation => ({
+    goalMet: true,
+    roborevRounds: ROBOREV_PLATEAU_ROUND,
+    now: T0,
+    ...over,
+  });
+
+  function twice(observation: Observation): PusherDecision {
+    // The first sighting is always quiet (two-observation rule), so its memory is on `.memory`.
+    const first = quiet(decide({ observation }));
+    return decide({ observation, memory: first.memory });
+  }
+
+  it("stays quiet for a met goal with nothing unlanded, even with a persisted trigger", () => {
+    expect(quiet(twice(lapping({ hasUnlandedWork: false }))).reason).toBe("goal-met-landed");
+  });
+
+  it("STILL challenges a met goal whose branch holds unlanded work", () => {
+    expect(sent(twice(lapping({ hasUnlandedWork: true }))).triggerId).toBe("roborev-rounds");
+  });
+
+  it("STILL challenges a met goal whose branch was never read — unknown is not landed", () => {
+    expect(twice(lapping({})).action).toBe("send");
+  });
+
+  it("STILL challenges an UNMET goal with nothing unlanded", () => {
+    expect(twice(lapping({ goalMet: false, hasUnlandedWork: false })).action).toBe("send");
   });
 });

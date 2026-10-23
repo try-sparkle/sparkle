@@ -125,6 +125,30 @@ const SERVED: readonly StateRow[] = [
   ["ACCEPT_EDITS_COMPOSER_2_1_237", "a prompt in accept-edits mode", ACCEPT_EDITS_COMPOSER_2_1_237],
   ["BYPASS_COMPOSER_2_1_237", "a prompt in bypass-permissions mode", BYPASS_COMPOSER_2_1_237],
   ["MANUAL_MODE_COMPOSER_2_1_237", "a prompt in manual mode", MANUAL_MODE_COMPOSER_2_1_237],
+  // ── The agents indicator as the ONLY footer row (bead sparkle-eou3y0.8). ──────────────────────
+  [
+    "IDLE_AGENTS_MANAGE_FOOTER_SCREEN",
+    "an idle prompt footed only by `← agents · ↓ to manage`",
+    incident.IDLE_AGENTS_MANAGE_FOOTER_SCREEN,
+  ],
+  [
+    "IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN",
+    "an idle prompt footed only by `← agents · 1 feedback draft`",
+    incident.IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN,
+  ],
+  // ── The feedback-draft card above the composer (bead sparkle-eou3y0.5). Served here — it IS
+  // Claude Code — and still refused as `blocked-prompt` by `screenBlocksWrite`, a different guard.
+  ["FEEDBACK_DRAFT_CARD_SCREEN", "a 'Bug report drafted' card above the prompt", incident.FEEDBACK_DRAFT_CARD_SCREEN],
+  [
+    "FEEDBACK_DRAFT_CARD_SLASH_SCREEN",
+    "the same card drawn with `/` separators",
+    incident.FEEDBACK_DRAFT_CARD_SLASH_SCREEN,
+  ],
+  [
+    "FEEDBACK_DRAFT_CARD_QUOTED_SCREEN",
+    "an idle prompt whose transcript quotes a card that has scrolled on",
+    incident.FEEDBACK_DRAFT_CARD_QUOTED_SCREEN,
+  ],
 ];
 
 // ══ THE STATES THAT MUST STAY REFUSED ═══════════════════════════════════════════════════════════

@@ -918,6 +918,81 @@ fn discover_repos(app_data: &Path) -> Vec<Repo> {
         .collect()
 }
 
+/// What `git remote` says about one worktree — three answers, because "could not ask" must never
+/// read as "has no remote".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCheck {
+    /// At least one remote is configured.
+    Has,
+    /// git ANSWERED and listed no remote at all — a local-only repo (bead sparkle-eou3y0.6).
+    None,
+    /// git could not answer here (a husk, a missing binary). Says nothing about the project.
+    Unknown,
+}
+
+/// `git remote`'s result in one worktree → a [`RemoteCheck`]. PURE so the classification is
+/// unit-tested without a git binary.
+fn remote_check_from_git(result: Result<String, String>) -> RemoteCheck {
+    match result {
+        Ok(out) if out.trim().is_empty() => RemoteCheck::None,
+        Ok(_) => RemoteCheck::Has,
+        Err(_) => RemoteCheck::Unknown,
+    }
+}
+
+/// Production [`RemoteCheck`]: one LOCAL `git remote` (no network), so it costs milliseconds.
+fn git_remote_check(dir: &Path) -> RemoteCheck {
+    match dir.to_str() {
+        Some(d) => remote_check_from_git(crate::worktree::git(d, &["remote"])),
+        None => RemoteCheck::Unknown,
+    }
+}
+
+/// Split off the projects whose checkout has NO git remote at all (bead sparkle-eou3y0.6).
+///
+/// WHY. A local-only repo — by design, e.g. a personal records folder — cannot have a pull request,
+/// yet `gh` exits non-zero there with "no git remotes found". Counted as a probe failure, every such
+/// project reported `gh-failed` forever, climbed `consecutive_failures` without bound and inflated
+/// the sweep's `unreadable` count, so the readability chip read "degraded" over a repo that is
+/// working exactly as intended. These are not unreadable; there is nothing to read.
+///
+/// FAIL CLOSED in both directions that matter:
+/// - The FIRST worktree that answers definitively decides (worktrees of one repo share remotes);
+///   an `Unknown` falls through to the next, and a project where NO worktree answers is KEPT, so a
+///   husk or a git hiccup is still probed and still reported unreadable if it is.
+/// - A project that still has TRACKED PRs is kept even if it now reads remoteless (a remote was
+///   removed mid-life): dropping it would leave those PRs neither pruned nor blind-looked — silently
+///   missing, which downstream is indistinguishable from "no conflicts".
+///
+/// Returns `(kept, skipped project ids)`, both in input order.
+fn partition_remoteless<T, C>(
+    repos: Vec<Repo>,
+    mut has_tracked: T,
+    mut check: C,
+) -> (Vec<Repo>, Vec<String>)
+where
+    T: FnMut(&str) -> bool,
+    C: FnMut(&Path) -> RemoteCheck,
+{
+    let mut kept = Vec::with_capacity(repos.len());
+    let mut skipped = Vec::new();
+    for repo in repos {
+        let remoteless = !has_tracked(&repo.project_id)
+            && repo
+                .dirs
+                .iter()
+                .map(|d| check(d))
+                .find(|c| *c != RemoteCheck::Unknown)
+                == Some(RemoteCheck::None);
+        if remoteless {
+            skipped.push(repo.project_id);
+        } else {
+            kept.push(repo);
+        }
+    }
+    (kept, skipped)
+}
+
 /// The cheap fingerprint of the worktree layout: the base directory's mtime plus each project
 /// directory's, and NOTHING below that.
 ///
@@ -1535,8 +1610,11 @@ fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     apply_noninteractive(&mut cmd);
-    let output = crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT)
-        .map_err(|_| "gh-unavailable")?;
+    let started = std::time::Instant::now();
+    let output = crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT).map_err(|e| {
+        log_gh_unavailable("pr list", started.elapsed(), &e);
+        "gh-unavailable"
+    })?;
     if !output.status.success() {
         // gh's own exit codes do not distinguish "not logged in" from "no remote", and the stderr
         // text is prose we would have to parse. One honest reason beats a guessed taxonomy.
@@ -1552,6 +1630,49 @@ fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
         return Err("gh-failed");
     }
     probe_from_stdout(&String::from_utf8_lossy(&output.stdout), PROBE_LIMIT).ok_or("gh-unreadable")
+}
+
+/// The log line for the `gh-unavailable` arm — which used to log NOTHING (bead sparkle-eou3y0.6).
+///
+/// That arm covers three different facts: the child hit [`PROBE_TIMEOUT`] and was killed, it could
+/// not be spawned at all, or it exited but a helper held its pipes open. Research into a four-hour
+/// `gh-unavailable` episode found `gh` itself healthy (sub-second calls, auth fine) and could not
+/// tell which of the three fired, because the reason code is the same and nothing else was written.
+/// The elapsed time separates them at a glance (≈20s = the deadline; ≈0 = spawn), and the helper's
+/// own error text names the case and any partial-output caveat.
+///
+/// LIMITATION, stated rather than hidden: on a TIMEOUT `output_with_timeout` discards the child's
+/// buffered stderr, so no stderr tail is available here without changing that shared helper in
+/// `worktree.rs`. The error text it returns is what we have.
+fn gh_unavailable_detail(what: &str, elapsed: Duration, err: &str) -> String {
+    let mut err_line: String = err.lines().next().unwrap_or("").trim().to_string();
+    if err_line.len() > GH_STDERR_HINT_CAP {
+        let mut cut = GH_STDERR_HINT_CAP;
+        while !err_line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        err_line.truncate(cut);
+        err_line.push('…');
+    }
+    format!(
+        "`gh {what}` unavailable after {}ms (deadline {}ms): {}",
+        elapsed.as_millis(),
+        PROBE_TIMEOUT.as_millis(),
+        if err_line.is_empty() {
+            "no error text"
+        } else {
+            &err_line
+        }
+    )
+}
+
+fn log_gh_unavailable(what: &str, elapsed: Duration, err: &str) {
+    tracing::warn!(
+        target: "conflict_watch",
+        elapsed_ms = elapsed.as_millis() as u64,
+        detail = %gh_unavailable_detail(what, elapsed, err),
+        "`gh` did not produce a usable answer (gh-unavailable)"
+    );
 }
 
 // ══ THE REST FALLBACK ═══════════════════════════════════════════════════════════════════════════
@@ -1603,8 +1724,11 @@ fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     apply_noninteractive(&mut cmd);
-    let output =
-        crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT).map_err(|_| "gh-unavailable")?;
+    let started = std::time::Instant::now();
+    let output = crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT).map_err(|e| {
+        log_gh_unavailable(path, started.elapsed(), &e);
+        "gh-unavailable"
+    })?;
     if !output.status.success() {
         // Same seam as [`probe_open_prs`]: the reason stays one honest code, the WHY goes to the
         // log. `path` is the literal `{owner}/{repo}` template gh resolves itself, so naming it
@@ -2481,7 +2605,24 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
         return;
     };
 
-    let repos = watch.discovery.repos(&app_data, discover_repos);
+    let discovered = watch.discovery.repos(&app_data, discover_repos);
+    // Local-only repos have nothing for `gh` to read — see [`partition_remoteless`]. Not probed,
+    // not counted unreadable, and any stale backoff entry is dropped so no streak lingers.
+    let (repos, remoteless) = partition_remoteless(
+        discovered,
+        |id| watch.tracked.values().any(|t| t.project_id == id),
+        git_remote_check,
+    );
+    for id in &remoteless {
+        watch.probe_backoff.remove(id);
+    }
+    if !remoteless.is_empty() {
+        tracing::debug!(
+            target: "conflict_watch",
+            skipped = %remoteless.join(","),
+            "skipping projects whose checkout has no git remote; they cannot have pull requests"
+        );
+    }
     let mut looks: Vec<Look> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
     // Projects whose PR listing we actually READ this sweep. Only these may prune — see
@@ -5226,3 +5367,163 @@ mod tests {
     }
 }
 
+/// Bead sparkle-eou3y0.6: local-only repos are skipped, not counted unreadable; and the
+/// `gh-unavailable` arm says how long it waited and why.
+#[cfg(test)]
+mod remoteless_tests {
+    use super::*;
+
+    fn repo(id: &str, dirs: &[&str]) -> Repo {
+        Repo {
+            project_id: id.to_string(),
+            dirs: dirs.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    /// `/local/*` has no remote, `/gh/*` has one, `/husk/*` cannot answer.
+    fn fake_check(d: &Path) -> RemoteCheck {
+        let s = d.to_string_lossy();
+        if s.starts_with("/local") {
+            RemoteCheck::None
+        } else if s.starts_with("/gh") {
+            RemoteCheck::Has
+        } else {
+            RemoteCheck::Unknown
+        }
+    }
+
+    #[test]
+    fn git_answering_with_no_remotes_is_none_and_a_git_error_is_unknown() {
+        assert_eq!(remote_check_from_git(Ok(String::new())), RemoteCheck::None);
+        assert_eq!(remote_check_from_git(Ok("  \n".into())), RemoteCheck::None);
+        assert_eq!(remote_check_from_git(Ok("origin".into())), RemoteCheck::Has);
+        // Could-not-ask must NEVER read as no-remote: that would silently stop watching a real repo.
+        assert_eq!(
+            remote_check_from_git(Err("not a git repository".into())),
+            RemoteCheck::Unknown
+        );
+    }
+
+    /// THE SIDE EFFECT: a remoteless project never reaches `gh`, never enters the backoff, and
+    /// never appears as an unreadable outcome — while the project beside it is probed as before.
+    #[test]
+    fn a_project_with_no_remote_is_skipped_not_counted_as_a_failure() {
+        let repos = vec![repo("taxes", &["/local/a"]), repo("app", &["/gh/a"])];
+        let (kept, skipped) = partition_remoteless(repos, |_| false, fake_check);
+        assert_eq!(skipped, vec!["taxes".to_string()]);
+
+        let mut backoff = ProbeBackoff::new();
+        let mut asked: Vec<PathBuf> = Vec::new();
+        let swept = sweep_probes(
+            &kept,
+            &mut backoff,
+            0,
+            60_000,
+            |d| {
+                asked.push(d.to_path_buf());
+                // What gh really says in a remoteless checkout.
+                if d.starts_with("/local") {
+                    Err("gh-failed")
+                } else {
+                    Ok(Probed {
+                        prs: Vec::new(),
+                        saturated: false,
+                        saturated_by: SATURATED_BY_LIST_WINDOW,
+                    })
+                }
+            },
+            || 0,
+        );
+        assert_eq!(
+            asked,
+            vec![PathBuf::from("/gh/a")],
+            "gh was spawned for the local-only repo"
+        );
+        let unreadable = swept.outcomes.iter().filter(|(_, r, _)| r.is_err()).count();
+        assert_eq!(unreadable, 0, "a local-only repo was counted unreadable");
+        assert!(
+            !backoff.contains_key("taxes"),
+            "a local-only repo accrued a failure streak"
+        );
+        assert_eq!(swept.outcomes.len(), 1);
+    }
+
+    #[test]
+    fn a_project_with_a_remote_is_kept() {
+        let (kept, skipped) =
+            partition_remoteless(vec![repo("app", &["/gh/a"])], |_| false, fake_check);
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    /// FAIL CLOSED: no worktree could answer, so we know nothing — keep probing it.
+    #[test]
+    fn a_project_no_worktree_can_answer_for_is_kept() {
+        let (kept, skipped) = partition_remoteless(
+            vec![repo("husky", &["/husk/a", "/husk/b"])],
+            |_| false,
+            fake_check,
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    /// A husk first, then a real answer: the first DEFINITIVE answer decides.
+    #[test]
+    fn an_unknown_worktree_falls_through_to_the_next_answer() {
+        let (_, skipped) = partition_remoteless(
+            vec![
+                repo("taxes", &["/husk/a", "/local/b"]),
+                repo("app", &["/husk/a", "/gh/b"]),
+            ],
+            |_| false,
+            fake_check,
+        );
+        assert_eq!(skipped, vec!["taxes".to_string()]);
+    }
+
+    /// A project still holding tracked PRs is never dropped, or those PRs go silently unwatched.
+    #[test]
+    fn a_remoteless_project_with_tracked_prs_is_still_probed() {
+        let (kept, skipped) = partition_remoteless(
+            vec![repo("taxes", &["/local/a"])],
+            |id| id == "taxes",
+            fake_check,
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn the_unavailable_detail_names_elapsed_deadline_and_the_error() {
+        let d = gh_unavailable_detail(
+            "pr list",
+            Duration::from_millis(20_013),
+            "timed out after 20s",
+        );
+        assert!(d.contains("20013ms"), "{d}");
+        assert!(
+            d.contains(&format!("{}ms", PROBE_TIMEOUT.as_millis())),
+            "{d}"
+        );
+        assert!(d.contains("timed out after 20s"), "{d}");
+        assert!(d.contains("gh pr list"), "{d}");
+        // A spawn failure reads differently from a deadline kill — the whole point of the line.
+        let spawn =
+            gh_unavailable_detail("pr list", Duration::from_millis(3), "failed to spawn: x");
+        assert!(
+            spawn.contains("3ms") && spawn.contains("failed to spawn"),
+            "{spawn}"
+        );
+    }
+
+    #[test]
+    fn the_unavailable_detail_is_one_bounded_line() {
+        let long = format!("{}\nsecond line", "é".repeat(400));
+        let d = gh_unavailable_detail("api x", Duration::from_millis(1), &long);
+        assert!(!d.contains("second line"));
+        assert!(d.len() < GH_STDERR_HINT_CAP + 120, "{}", d.len());
+        let empty = gh_unavailable_detail("api x", Duration::from_millis(1), "");
+        assert!(empty.contains("no error text"));
+    }
+}
