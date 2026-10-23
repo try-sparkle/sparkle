@@ -274,6 +274,26 @@ describe("pollConflictFlags", () => {
     expect(useConflictStore.getState().flags).toBeUndefined();
   });
 
+  it("does not read an empty list as an all-clear when the budget cut repos off", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === CONFLICT_PROBE_STATUS_COMMAND
+        ? Promise.resolve({ everProbed: true, repos: 12, unreadable: 0, notReached: 9, lastFullReadMs: 0 })
+        : Promise.resolve([]),
+    );
+    await expect(pollConflictFlags()).resolves.toBe(false);
+    expect(useConflictStore.getState().flags).toBeUndefined();
+  });
+
+  it("accepts an empty list once every repo was reached and read", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === CONFLICT_PROBE_STATUS_COMMAND
+        ? Promise.resolve({ everProbed: true, repos: 12, unreadable: 0, notReached: 0, lastFullReadMs: 1 })
+        : Promise.resolve([]),
+    );
+    await expect(pollConflictFlags()).resolves.toBe(true);
+    expect(useConflictStore.getState().flags).toEqual([]);
+  });
+
   // A NON-EMPTY answer is self-evidently a real reading: the producer cannot invent a conflicting
   // PR it could not read. So an incomplete sweep must not discard what it DID find — that would
   // trade a false all-clear for a false silence, which is the same bug wearing the other hat.

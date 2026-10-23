@@ -211,6 +211,16 @@ async function sweptSomething(): Promise<boolean> {
     });
     return false;
   }
+  // A repo the sweep's budget cut off is no longer counted in `unreadable` (bead sparkle-eou3y0.6)
+  // — but it was not read either, so an empty list is still not an all-clear. Absent on an older
+  // backend, which folded these into `unreadable` and is already covered by the check above.
+  const notReached = s["notReached"];
+  if (notReached !== undefined && (typeof notReached !== "number" || notReached > 0)) {
+    log.debug("conflict", "sweep ran out of budget before every repo; an empty list is not an all-clear", {
+      notReached,
+    });
+    return false;
+  }
   return true;
 }
 

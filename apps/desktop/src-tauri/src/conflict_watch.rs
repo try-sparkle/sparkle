@@ -244,8 +244,17 @@ pub struct ProbeStatus {
     pub ever_probed: bool,
     /// Repos found under `<app_data>/worktrees` on the last sweep.
     pub repos: usize,
-    /// Repos the last sweep could not read. Non-zero means `conflict_flags` is INCOMPLETE.
+    /// Repos the last sweep ASKED and could not read. Non-zero means `conflict_flags` is INCOMPLETE.
+    ///
+    /// A repo the [`SWEEP_BUDGET`] cut off is NOT counted here — see `not_reached`. It used to be,
+    /// so one slow probe early in the round-robin reported every later project as unreadable (12 of
+    /// 12 measured) over repos nobody had asked anything (bead sparkle-eou3y0.6).
     pub unreadable: usize,
+    /// Repos the last sweep never REACHED because its whole-sweep budget ran out first. The list is
+    /// still INCOMPLETE when this is non-zero — we did not look — but nothing failed: the rotation
+    /// starts the next sweep with them. A distinct count because "the repo answered badly" and "we
+    /// ran out of time" send a reader to different places.
+    pub not_reached: usize,
     /// Why the last unreadable repo could not be read.
     pub last_error: Option<String>,
     /// When a sweep last read EVERY discovered repo. `0` means never.
@@ -259,15 +268,47 @@ fn probe_status() -> &'static Mutex<ProbeStatus> {
 
 /// Record one sweep's readability. Split out of `tick` so it is assertable without an `AppHandle` —
 /// the cold-start case this exists for is precisely the one `tick` cannot be driven into in a test.
-fn record_probe(repos: usize, unreadable: usize, last_error: Option<&str>, now: u64) {
+fn record_probe(tally: &SweepTally, repos: usize, now: u64) {
     let mut s = probe_status().lock().unwrap_or_else(|e| e.into_inner());
     s.ever_probed = true;
     s.repos = repos;
-    s.unreadable = unreadable;
-    s.last_error = last_error.map(str::to_string);
-    if unreadable == 0 {
+    s.unreadable = tally.unreadable;
+    s.not_reached = tally.not_reached;
+    s.last_error = tally.last_error.map(str::to_string);
+    // A FULL read needs both: a repo the budget never reached was not read either.
+    if tally.unreadable == 0 && tally.not_reached == 0 {
         s.last_full_read_ms = now;
     }
+}
+
+/// How one sweep's outcomes split for [`ProbeStatus`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepTally {
+    /// Repos we ASKED (or whose cached failure the backoff served) that did not answer.
+    unreadable: usize,
+    /// Repos [`SWEEP_BUDGET`] cut off before they were asked — [`Disposition::BudgetSkipped`].
+    not_reached: usize,
+    /// The reason of the last genuinely unreadable repo, in outcome order. Never
+    /// [`SWEEP_BUDGET_REASON`]: that is a fact about our scheduler, not about any repo.
+    last_error: Option<&'static str>,
+}
+
+/// Split a sweep's outcomes into "could not read" and "never reached".
+///
+/// A backoff-SUPPRESSED repo stays unreadable: its `Err` is the cached reason from a probe that
+/// really failed, so it is a standing outage still being reported, not a repo we skipped.
+fn tally_sweep<T>(outcomes: &[(usize, Result<T, &'static str>, Disposition)]) -> SweepTally {
+    let mut t = SweepTally::default();
+    for (_, result, disposition) in outcomes {
+        let Err(reason) = result else { continue };
+        if *disposition == Disposition::BudgetSkipped {
+            t.not_reached += 1;
+        } else {
+            t.unreadable += 1;
+            t.last_error = Some(reason);
+        }
+    }
+    t
 }
 
 /// Live flags, keyed by PR NUMBER so one stuck PR is one row rather than a stream.
@@ -2631,8 +2672,6 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     // …of which THESE came back with a full window, so their listing is not the whole truth and
     // nothing may be pruned on the strength of it.
     let mut saturated: HashSet<String> = HashSet::new();
-    let mut unreadable = 0usize;
-    let mut last_error: Option<&'static str> = None;
     // `(project, pr)` for every PR this sweep skipped because another project claimed the number.
     let mut collisions: Vec<(String, u64)> = Vec::new();
 
@@ -2648,6 +2687,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
         now_ms,
     );
     watch.sweep_cursor = swept.next_cursor;
+    let tally = tally_sweep(&swept.outcomes);
     if !swept.skipped.is_empty() {
         // MAKE THE COST VISIBLE. Before this the sweep simply took minutes and said nothing; the
         // only evidence a human ever had was a process sample. Naming the projects we did not reach
@@ -2755,8 +2795,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                 }
             }
             Err(reason) => {
-                unreadable += 1;
-                last_error = Some(reason);
+                // Counted by `tally_sweep` above, which keeps a budget cut-off out of `unreadable`.
                 // The WARNING is for a repo we actually asked. A repo the backoff suppressed is
                 // logged at debug instead: we already warned when the probe that set the window
                 // really failed, and re-warning every sweep for hours is the noise this change
@@ -2832,7 +2871,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     // Record readability even when NOTHING is tracked — the cold-start case, where the per-PR
     // fail-closed path above has nothing to act on and `conflict_flags` would otherwise return an
     // empty list that reads as "no conflicts". See `ProbeStatus`.
-    record_probe(repos.len(), unreadable, last_error, now);
+    record_probe(&tally, repos.len(), now);
 
     prune_tracked(&mut watch.tracked, &probed_ok, &seen, &saturated);
     if let Some(flags) = app.try_state::<ConflictFlags>() {
@@ -5116,7 +5155,8 @@ mod tests {
         assert!(!conflict_probe_status().ever_probed);
 
         // A sweep that found one repo and could not read it.
-        record_probe(1, 1, Some("gh-unavailable"), 111);
+        let failed = SweepTally { unreadable: 1, not_reached: 0, last_error: Some("gh-unavailable") };
+        record_probe(&failed, 1, 111);
         let st = conflict_probe_status();
         assert!(st.ever_probed);
         assert_eq!(st.unreadable, 1, "the empty flag list is INCOMPLETE, and says so");
@@ -5124,11 +5164,75 @@ mod tests {
         assert_eq!(st.last_full_read_ms, 0, "nothing was ever fully read");
 
         // ...and a clean sweep clears it, so one outage does not mute the signal forever.
-        record_probe(1, 0, None, 222);
+        record_probe(&SweepTally::default(), 1, 222);
         let st = conflict_probe_status();
         assert_eq!(st.unreadable, 0);
         assert_eq!(st.last_error, None);
         assert_eq!(st.last_full_read_ms, 222, "an empty list NOW genuinely means no conflicts");
+
+        // A sweep the BUDGET cut short is not unreadable — but it is not a full read either, so the
+        // stamp must not advance and the consumer still sees the list as incomplete.
+        let short = SweepTally { unreadable: 0, not_reached: 3, last_error: None };
+        record_probe(&short, 4, 333);
+        let st = conflict_probe_status();
+        assert_eq!(st.unreadable, 0, "never-asked repos are not counted unreadable");
+        assert_eq!(st.not_reached, 3, "but they ARE counted, under their own name");
+        assert_eq!(st.last_full_read_ms, 222, "a budget-cut sweep is not a full read");
+    }
+
+    /// ONE SLOW PROBE MUST NOT REPORT EVERY LATER PROJECT UNREADABLE (bead sparkle-eou3y0.6).
+    ///
+    /// Measured: a stalled `gh` early in the round-robin spent the 60s budget, and all 12 projects
+    /// then read as "could not be read" — the 11 the budget cut off had never been asked anything.
+    /// Drive the REAL `sweep_probes` so the dispositions are the ones production produces.
+    #[test]
+    fn budget_skipped_projects_are_not_reached_rather_than_unreadable() {
+        use std::cell::Cell;
+        let repos: Vec<Repo> = (0..12).map(|i| repo_of(&format!("p{i:02}"), 1)).collect();
+        let clock = Cell::new(0u64);
+        let mut backoff = ProbeBackoff::new();
+        let swept = sweep_probes(
+            &repos,
+            &mut backoff,
+            0,
+            SWEEP_BUDGET.as_millis() as u64,
+            |_| {
+                // Every probe stalls to the full timeout and fails, so the budget runs out fast.
+                clock.set(clock.get() + PROBE_TIMEOUT.as_millis() as u64);
+                Err("gh-unavailable")
+            },
+            || clock.get(),
+        );
+        assert!(!swept.skipped.is_empty(), "precondition: the budget really cut the sweep short");
+
+        let tally = tally_sweep(&swept.outcomes);
+        assert_eq!(tally.not_reached, swept.skipped.len(), "every cut-off project is NOT REACHED");
+        assert_eq!(
+            tally.unreadable,
+            repos.len() - swept.skipped.len(),
+            "only the projects we actually ASKED may be counted unreadable"
+        );
+        assert!(tally.unreadable < repos.len(), "12 of 12 unreadable is the measured false alarm");
+        assert_eq!(
+            tally.last_error,
+            Some("gh-unavailable"),
+            "the reported reason is the real failure, never the scheduler's sweep-budget"
+        );
+    }
+
+    /// The other direction: a backoff-SUPPRESSED repo is a standing outage and STAYS unreadable.
+    /// Widening the not-reached arm to cover it would hide a real failure behind "we skipped it".
+    #[test]
+    fn a_backoff_suppressed_failure_still_counts_unreadable() {
+        let outcomes: Vec<(usize, Result<(), &'static str>, Disposition)> = vec![
+            (0, Err("gh-failed"), Disposition::Suppressed { retry_in_secs: 30 }),
+            (1, Err(SWEEP_BUDGET_REASON), Disposition::BudgetSkipped),
+            (2, Ok(()), Disposition::Asked),
+        ];
+        assert_eq!(
+            tally_sweep(&outcomes),
+            SweepTally { unreadable: 1, not_reached: 1, last_error: Some("gh-failed") }
+        );
     }
 
     #[test]
