@@ -1139,6 +1139,43 @@ fn read_queued_runs(json: &str) -> Option<usize> {
     Some(n as usize)
 }
 
+/// How long the OLDEST queued run has been waiting, in seconds, from the SAME
+/// `actions/runs?status=queued` reply [`read_queued_runs`] counts. GitHub lists runs newest-first,
+/// so the oldest on the page is the minimum `run_started_at` (falling back to `created_at`; a
+/// re-run keeps its original `created_at`, which would overstate the wait). When more runs are
+/// queued than the page holds this is a LOWER bound, which only ever errs towards "still booting"
+/// — never towards a false outage.
+///
+/// `None` when the reply holds no parseable timestamp: an age we cannot read must never read as
+/// "just queued", so the caller keeps the outage verdict on `None` (bead `sparkle-eou3y0.7`).
+fn read_oldest_queued_age_secs(json: &str, now_epoch: i64) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let oldest = value
+        .get("workflow_runs")?
+        .as_array()?
+        .iter()
+        .filter_map(|run| {
+            let ts = run
+                .get("run_started_at")
+                .and_then(|v| v.as_str())
+                .or_else(|| run.get("created_at").and_then(|v| v.as_str()))?;
+            github_ts_to_epoch(ts)
+        })
+        .min()?;
+    // A clock skewed behind GitHub's would yield a negative age; that is "just queued", not garbage.
+    Some(now_epoch.saturating_sub(oldest).max(0) as u64)
+}
+
+/// The BOOT GRACE for an empty pool with work queued (bead `sparkle-eou3y0.7`). `linux-ci` scales to
+/// ZERO by design, and booting a Spot VM from zero takes the measured ~175s create->runner-online
+/// (`scripts/lib/ci-autoscale.sh`); the autoscaler itself waits `CIA_SATURATED_QUEUE_GRACE_S` /
+/// `CIA_STOCKOUT_GRACE_S` = 300s before it treats "queued with no idle runner" as anything but a
+/// healthy scale-up. 360s is past both: a run that has waited this long with NOTHING online is the
+/// capacity that was supposed to arrive demonstrably not arriving. Inside it, the same reading is
+/// the pool booting from zero — and publishing BLOCKING there flipped BLOCKING<->RECOVERED dozens
+/// of times a day, once per quiet-then-busy cycle.
+const CI_BOOT_GRACE_SECS: u64 = 360;
+
 /// Below this many queued runs, a backlog is NOT worth a warning even when it exceeds free capacity.
 ///
 /// The autoscaler dispatches on a ~300s grace (`CIA_STOCKOUT_GRACE_S` in `scripts/lib/ci-autoscale.sh`,
@@ -1170,9 +1207,22 @@ const CI_QUEUE_BACKLOG_MIN: usize = 5;
 ///      this is the ceiling-clamped operating point that flapped ~15x/night when it was a Warning
 ///      (bead `sparkle-ot4dxb`).
 ///   7. otherwise (idle runners, drained queue) → Healthy, stating the queue depth it was judged against.
+///
+/// Arm 3 is AGE-GATED (bead `sparkle-eou3y0.7`): with work queued but the oldest queued run younger
+/// than [`CI_BOOT_GRACE_SECS`], an empty pool is the autoscaler booting from zero → Warning. Only an
+/// age we READ and that is past the grace blocks; an unreadable age keeps the outage verdict.
+#[cfg(test)]
 fn classify_ci_pool(
     reading: Option<RunnerPoolReading>,
     queued: Option<usize>,
+) -> (HealthState, String) {
+    classify_ci_pool_aged(reading, queued, None)
+}
+
+fn classify_ci_pool_aged(
+    reading: Option<RunnerPoolReading>,
+    queued: Option<usize>,
+    oldest_queued_age_secs: Option<u64>,
 ) -> (HealthState, String) {
     let Some(r) = reading else {
         return (
@@ -1234,13 +1284,42 @@ fn classify_ci_pool(
             ),
         );
     }
-    // Reached with work QUEUED, or with a queue we could not read.
+    // BOOTING FROM ZERO (bead `sparkle-eou3y0.7`). Work is queued and nothing is online, but the
+    // oldest queued run has waited less than the boot grace — the autoscaler's own scale-up window.
+    // This is the very next state after the idle floor above: a push lands, a run queues, and for
+    // ~3 minutes the pool is empty while a VM boots. Blocking here is what flipped BLOCKING <->
+    // RECOVERED dozens of times a day. It still WARNS rather than greening, so a pool that never
+    // arrives is visible from the first pass and escalates the moment the grace runs out.
     if r.online_total() == 0 {
+        if let (Some(q), Some(age)) = (queued, oldest_queued_age_secs) {
+            if q > 0 && age < CI_BOOT_GRACE_SECS {
+                return (
+                    HealthState::Warning,
+                    format!(
+                        "booting from zero — no CI runners ({CI_RUNNER_LABEL}) are online yet and \
+                         {q} run(s) are queued, the oldest for {age}s. The autoscaled Spot pool \
+                         scales to zero when idle and a runner takes about three minutes to boot, \
+                         so this is a scale-up in progress, not an outage; it is reported as \
+                         blocking only if nothing is online after {CI_BOOT_GRACE_SECS}s."
+                    ),
+                );
+            }
+        }
+    }
+    // Reached with work QUEUED past the boot grace, or with a queue (or its age) we could not read.
+    if r.online_total() == 0 {
+        let waited = match oldest_queued_age_secs {
+            Some(age) => format!(
+                " The oldest queued run has waited {age}s, past the {CI_BOOT_GRACE_SECS}s boot \
+                 grace, so this is not a scale-up still in progress."
+            ),
+            None => String::new(),
+        };
         return (
             HealthState::Blocking,
             format!(
                 "no self-hosted CI runners ({CI_RUNNER_LABEL}) are online — CI cannot run tests, so \
-                 nothing can be verified for merge or release."
+                 nothing can be verified for merge or release.{waited}"
             ),
         );
     }
@@ -3107,21 +3186,27 @@ fn runner_components(
     // The SECOND bounded read: how deep is the repo-wide queue? A failed read is `None`, never `0` —
     // "I could not see the backlog" and "there is no backlog" are the two facts whose collapse
     // produced the false RECOVERED (bead `sparkle-1xg2f6`).
-    let queued = gh_program_for_queue.and_then(|program| {
+    let queued_json = gh_program_for_queue.and_then(|program| {
         let mut cmd = Command::new(program);
         cmd.arg("api")
-            .arg(format!("repos/{RELEASE_REPO}/actions/runs?status=queued&per_page=1"))
+            // `per_page=100`, not 1: the page now also carries the run timestamps the boot grace
+            // ages the queue by (bead `sparkle-eou3y0.7`). `total_count` is unaffected.
+            .arg(format!("repos/{RELEASE_REPO}/actions/runs?status=queued&per_page=100"))
             .current_dir(root);
         apply_noninteractive(&mut cmd);
         match crate::worktree::output_with_timeout(cmd, RUNNER_QUERY_TIMEOUT) {
-            Ok(o) if o.status.success() => read_queued_runs(&String::from_utf8_lossy(&o.stdout)),
+            Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
             _ => None,
         }
     });
+    let queued_age = queued_json
+        .as_deref()
+        .and_then(|j| read_oldest_queued_age_secs(j, now_epoch_secs()));
+    let queued = queued_json.as_deref().and_then(read_queued_runs);
 
     let ci = json.as_deref().and_then(|j| read_runner_pool(j, CI_RUNNER_LABEL));
     let release = json.as_deref().and_then(|j| read_runner_pool(j, RELEASE_RUNNER_LABEL));
-    let (ci_state, ci_detail) = classify_ci_pool(ci, queued);
+    let (ci_state, ci_detail) = classify_ci_pool_aged(ci, queued, queued_age);
     let (rel_state, rel_detail) = classify_release_runner(release);
 
     let pool_readings = |r: Option<RunnerPoolReading>| {
@@ -3135,6 +3220,7 @@ fn runner_components(
     };
     let mut ci_readings = pool_readings(ci);
     ci_readings.push(ComponentHealth::reading("queued", queued));
+    ci_readings.push(ComponentHealth::reading("queued_age_secs", queued_age));
 
     let components = vec![
         ComponentHealth {
@@ -4947,6 +5033,63 @@ mod tests {
         let (state, detail) =
             classify_ci_pool(read_runner_pool(r#"{"total_count":0,"runners":[]}"#, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Unknown, "an EMPTY enumeration stays unknown: {detail}");
+    }
+
+    /// BOOTING FROM ZERO is not an outage (bead `sparkle-eou3y0.7`). A run queued ONE MINUTE ago
+    /// against an empty, autoscaled pool is the ~3-minute Spot boot in progress, and blocking on it
+    /// flipped BLOCKING<->RECOVERED dozens of times a day. PAIRED with the past-grace case on the
+    /// SAME pool and queue depth, so the age is provably the only thing that changes the verdict.
+    #[test]
+    fn a_just_queued_run_with_zero_runners_is_booting_not_blocking() {
+        let none = runners_json(&[("sparkle-release", "online", false)]);
+        let pool = read_runner_pool(&none, CI_RUNNER_LABEL);
+
+        let (state, detail) = classify_ci_pool_aged(pool, Some(7), Some(60));
+        assert_ne!(state, HealthState::Blocking, "a run queued 60s ago is a boot, not an outage: {detail}");
+        assert_eq!(state, HealthState::Warning, "it still WARNS so a pool that never boots is visible: {detail}");
+        assert!(detail.contains("booting from zero"), "{detail}");
+
+        // The grace edge: one second short still boots; at the grace it blocks.
+        let (state, _) = classify_ci_pool_aged(pool, Some(1), Some(CI_BOOT_GRACE_SECS - 1));
+        assert_eq!(state, HealthState::Warning);
+
+        let (state, detail) = classify_ci_pool_aged(pool, Some(7), Some(CI_BOOT_GRACE_SECS));
+        assert_eq!(state, HealthState::Blocking, "past the boot grace nothing arrived: {detail}");
+        let (state, detail) = classify_ci_pool_aged(pool, Some(7), Some(30 * 60));
+        assert_eq!(state, HealthState::Blocking, "a 30-minute wait is a real outage: {detail}");
+        assert!(detail.contains("past the 360s boot grace"), "{detail}");
+
+        // An age we could not read keeps the outage verdict — "unreadable" never reads as "just queued".
+        let (state, _) = classify_ci_pool_aged(pool, Some(7), None);
+        assert_eq!(state, HealthState::Blocking);
+        // The grace never touches the degraded-read arms, the idle floor, or a pool with runners.
+        let (state, _) = classify_ci_pool_aged(None, Some(7), Some(60));
+        assert_eq!(state, HealthState::Unknown);
+        let (state, _) = classify_ci_pool_aged(pool, Some(0), Some(60));
+        assert_eq!(state, HealthState::Healthy);
+    }
+
+    /// The age is read from the queued-runs page: the OLDEST run, by `run_started_at` (a re-run keeps
+    /// its original `created_at`), falling back to `created_at`; `None` when nothing parses.
+    #[test]
+    fn oldest_queued_age_reads_the_oldest_run_on_the_page() {
+        let now = github_ts_to_epoch("2026-10-23T12:10:00Z").unwrap();
+        let page = r#"{"total_count":3,"workflow_runs":[
+            {"created_at":"2026-10-23T12:09:00Z","run_started_at":"2026-10-23T12:09:00Z"},
+            {"created_at":"2026-10-20T00:00:00Z","run_started_at":"2026-10-23T12:05:00Z"},
+            {"created_at":"2026-10-23T12:08:00Z"}]}"#;
+        assert_eq!(read_oldest_queued_age_secs(page, now), Some(300));
+        assert_eq!(read_queued_runs(page), Some(3), "the count still reads from the same page");
+        assert_eq!(read_oldest_queued_age_secs(r#"{"total_count":0,"workflow_runs":[]}"#, now), None);
+        assert_eq!(read_oldest_queued_age_secs(r#"{"message":"Not Found"}"#, now), None);
+        assert_eq!(
+            read_oldest_queued_age_secs(r#"{"workflow_runs":[{"created_at":"garbage"}]}"#, now),
+            None,
+            "an unparseable timestamp is no age, never 'just queued'"
+        );
+        // A local clock behind GitHub's is "just queued", not a wrapped huge age.
+        let future = r#"{"workflow_runs":[{"created_at":"2026-10-23T12:20:00Z"}]}"#;
+        assert_eq!(read_oldest_queued_age_secs(future, now), Some(0));
     }
 
     /// bead `sparkle-ot4dxb`: HEALTHY SATURATION MUST NOT ALARM, but the SAME pool WITH a real
