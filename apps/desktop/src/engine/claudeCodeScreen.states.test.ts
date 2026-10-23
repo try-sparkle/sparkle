@@ -136,6 +136,17 @@ const SERVED: readonly StateRow[] = [
     "an idle prompt footed only by `← agents · 1 feedback draft`",
     incident.IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN,
   ],
+  ["IDLE_AGENTS_BARE_FOOTER_SCREEN", "an idle prompt footed only by `← agents`", incident.IDLE_AGENTS_BARE_FOOTER_SCREEN],
+  [
+    "IDLE_AGENTS_COUNTED_BYPASS_FOOTER_SCREEN",
+    "an idle bypass-mode prompt whose bar ends `· ← 4 agents`",
+    incident.IDLE_AGENTS_COUNTED_BYPASS_FOOTER_SCREEN,
+  ],
+  [
+    "IDLE_AGENTS_COUNTED_FOOTER_SCREEN",
+    "an idle prompt footed only by the counted `← 4 agents · ↓ to manage`",
+    incident.IDLE_AGENTS_COUNTED_FOOTER_SCREEN,
+  ],
   // ── The feedback-draft card above the composer (bead sparkle-eou3y0.5). Served here — it IS
   // Claude Code — and still refused as `blocked-prompt` by `screenBlocksWrite`, a different guard.
   ["FEEDBACK_DRAFT_CARD_SCREEN", "a 'Bug report drafted' card above the prompt", incident.FEEDBACK_DRAFT_CARD_SCREEN],

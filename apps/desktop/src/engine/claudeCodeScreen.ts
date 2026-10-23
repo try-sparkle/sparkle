@@ -141,12 +141,16 @@ const PERMISSION_MODE_BAR = new RegExp(`[${STATUS_GLYPHS}][${STATUS_GLYPHS}]?\\s
  *  like `? for shortcuts`, never a substitute for the composer box, so a pager quoting it is still
  *  refused. The `(?:^|·)` opening also lets the indicator count when it trails a bar segment.
  *
+ *  THE COUNTED FORM `← 4 agents` is the same indicator once subagents are live
+ *  (`⏵⏵ bypass permissions on (shift+tab to cycle) · ← 4 agents`). The count is bounded to three
+ *  digits and sits exactly where `for` does, so it widens nothing but that one slot.
+ *
  *  `^` IS SAFE INSIDE `CHROME_BAR_OPENS`' WRAPPER despite the warning on `PERMISSION_MODE_BAR`: the
  *  wrapper's prefix is `*`, so it can match empty and leave the inner `^` at position 0, and the
  *  `\s*` inside this pattern absorbs the indentation instead. Pinned by the narrow-pane case in
  *  `claudeCodeScreen.agentsFooter.test.ts`. */
 const AGENTS_INDICATOR_ROW = new RegExp(
-  `(?:^[ \\t\\u00a0${STATUS_GLYPHS}]*|·[ \\t\\u00a0]*)←[ \\t\\u00a0]+(?:for[ \\t\\u00a0]+)?agents(?=[ \\t\\u00a0]*(?:·|$))`,
+  `(?:^[ \\t\\u00a0${STATUS_GLYPHS}]*|·[ \\t\\u00a0]*)←[ \\t\\u00a0]+(?:for[ \\t\\u00a0]+|\\d{1,3}[ \\t\\u00a0]+)?agents(?=[ \\t\\u00a0]*(?:·|$))`,
   "im",
 );
 

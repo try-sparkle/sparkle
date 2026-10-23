@@ -13,10 +13,14 @@ import { describe, expect, it } from "vitest";
 import { LESS_ON_A_MARKDOWN_FILE, VIM_ON_A_MARKDOWN_FILE } from "./capturedScreens.fixture";
 import { claudeCodeMarkerFamilies, isClaudeCodeScreen } from "./claudeCodeScreen";
 import {
+  IDLE_AGENTS_BARE_FOOTER_SCREEN,
+  IDLE_AGENTS_COUNTED_BYPASS_FOOTER_SCREEN,
+  IDLE_AGENTS_COUNTED_FOOTER_SCREEN,
   IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN,
   IDLE_AGENTS_MANAGE_FOOTER_SCREEN,
 } from "./incidentScreens.fixture";
 import { altScreenRefusalVerdict } from "./screenReadability";
+import { terminalWriteRefusal } from "../voice/dictationTerminalRoute";
 
 const RULE = "─".repeat(120);
 
@@ -71,5 +75,38 @@ describe("…and it does not weaken the refusal of a real full-screen app", () =
   it("an arrow to something other than agents is not the indicator", () => {
     const other = [RULE, "❯ ", RULE, "  ← back · ↓ to manage"].join("\n");
     expect(isClaudeCodeScreen(other)).toBe(false);
+  });
+});
+
+// THE GATE ITSELF. Everything above asks the recogniser; this asks `terminalWriteRefusal`, the
+// function whose `alternate-screen` answer is the refusal the concierge actually hit — with the
+// alternate buffer ON, since current Claude Code holds it for its whole life.
+describe("send_to_agent_terminal's gate on the current footer variants (sparkle-eou3y0.8)", () => {
+  it.each([
+    ["← agents", IDLE_AGENTS_BARE_FOOTER_SCREEN],
+    ["← agents · ↓ to manage", IDLE_AGENTS_MANAGE_FOOTER_SCREEN],
+    ["← agents · 1 feedback draft", IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN],
+    ["⏵⏵ bypass permissions on (shift+tab to cycle) · ← 4 agents", IDLE_AGENTS_COUNTED_BYPASS_FOOTER_SCREEN],
+    ["← 4 agents · ↓ to manage", IDLE_AGENTS_COUNTED_FOOTER_SCREEN],
+  ])("an idle alternate-buffer pane footed by %s is writable", (_name, text) => {
+    expect(terminalWriteRefusal({ text, alternateBuffer: true }), "an idle Claude Code prompt").toBeNull();
+  });
+
+  it("the counted indicator is a family-C vote of its own, not only via the mode bar", () => {
+    expect(claudeCodeMarkerFamilies(IDLE_AGENTS_COUNTED_FOOTER_SCREEN)).toBe(2);
+  });
+
+  it.each([
+    ["less", LESS_ON_A_MARKDOWN_FILE],
+    ["vim", VIM_ON_A_MARKDOWN_FILE],
+    ["less quoting the counted footer", `${LESS_ON_A_MARKDOWN_FILE}\n  ← 4 agents · ↓ to manage`],
+    ["vim quoting the bare footer", `${VIM_ON_A_MARKDOWN_FILE}\n  ← agents`],
+  ])("a %s screen is still refused alternate-screen", (_name, text) => {
+    expect(terminalWriteRefusal({ text, alternateBuffer: true })).toBe("alternate-screen");
+  });
+
+  it("a count that is not a small number is not the indicator", () => {
+    const rule = "─".repeat(120);
+    expect(isClaudeCodeScreen([rule, "❯ ", rule, "  ← 12345 agents"].join("\n"))).toBe(false);
   });
 });

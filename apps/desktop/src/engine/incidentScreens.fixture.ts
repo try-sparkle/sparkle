@@ -134,6 +134,11 @@ const idleWithFooter = (footer: string): string =>
 
 export const IDLE_AGENTS_MANAGE_FOOTER_SCREEN = idleWithFooter("  ← agents · ↓ to manage");
 export const IDLE_AGENTS_FEEDBACK_DRAFT_FOOTER_SCREEN = idleWithFooter("  ← agents · 1 feedback draft");
+export const IDLE_AGENTS_BARE_FOOTER_SCREEN = idleWithFooter("  ← agents");
+export const IDLE_AGENTS_COUNTED_BYPASS_FOOTER_SCREEN = idleWithFooter(
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 4 agents",
+);
+export const IDLE_AGENTS_COUNTED_FOOTER_SCREEN = idleWithFooter("  ← 4 agents · ↓ to manage");
 
 /**
  * THE FEEDBACK-DRAFT CARD — bead sparkle-eou3y0.5.
