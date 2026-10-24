@@ -7183,7 +7183,7 @@ fn roborev_drain_gate(
     // fail-CLOSED gate silently becomes fail-OPEN, and a network blip would then re-admit exactly
     // the merge this gate exists to refuse.
     let head_ref = roborev_head_ref_or_refuse(number, head_ref)?;
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::setup::roborev_cli(&bin);
     cmd.args(["list", "--json", "--repo", root, "--branch", head_ref]).current_dir(root);
     apply_noninteractive(&mut cmd);
     let parsed = match output_with_timeout(cmd, ROBOREV_TIMEOUT) {

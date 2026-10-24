@@ -482,7 +482,21 @@ if last is not None:
 # stderr suppressed, matching roborev's own generated stub — the happy path stays silent (git
 # ignores a post-commit hook's exit code anyway). The OUTCOME is read back from the log above
 # instead of being inferred from the exit status, which is always 0.
+#
+# PATH IS PINNED to the LaunchAgent's own PATH (setup.rs `daemon_path_env`; a Rust test pins the
+# two equal). `roborev post-commit` AUTO-STARTS a daemon whenever none is reachable, and that daemon
+# inherits THIS process's environment — a commit made from a launchd job or a GUI app carries a bare
+# /usr/bin:/bin PATH, and a daemon started with it reaches no review agent and refuses every enqueue
+# while still owning the port (2026-10-22 recurrence, epic sparkle-eou3y0). Pinned, a daemon this
+# starts is indistinguishable from the one launchd starts. Set on its own line rather than as a
+# prefix, so the delegation below stays at the start of its line where the installed-check looks,
+# and RESTORED right after, so nothing else in this hook sees a PATH its caller did not give it.
+_roborev_caller_path=$PATH
+PATH="$HOME/.sparkle/roborev-claude:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH
 "$ROBOREV" post-commit 2>/dev/null
+PATH=$_roborev_caller_path
+export PATH
 
 # Never fail a commit. This is the LAST line on purpose and there is deliberately NO `exit 0` after
 # it: _roborev_warn_if_rejected returns 0 on every one of its paths, so the hook's status is 0

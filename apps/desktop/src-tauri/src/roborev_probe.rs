@@ -479,7 +479,7 @@ pub async fn roborev_branch_probe(
         // here, which made the probe answer for the wrong (empty) repo and report the branch clean.
         let root = canonical_root(&root);
         let limit = clamp_limit(limit);
-        let mut cmd = Command::new(program);
+        let mut cmd = crate::setup::roborev_cli(program);
         cmd.args(list_argv(&root, &branch, limit))
             .current_dir(&root);
         apply_noninteractive(&mut cmd);
@@ -518,7 +518,7 @@ pub async fn roborev_job_review(root: String, job_id: u64) -> Result<Option<Stri
         let Some(program) = resolve_enabled_binary(&root) else {
             return Ok(None);
         };
-        let mut cmd = Command::new(program);
+        let mut cmd = crate::setup::roborev_cli(program);
         cmd.args(["show", "--job", &job_id.to_string(), "--json"]).current_dir(&root);
         apply_noninteractive(&mut cmd);
         let Ok(output) = crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT) else {
@@ -596,7 +596,7 @@ pub(crate) fn body_carries_no_finding(body: Option<&str>) -> bool {
 /// Read one job's review markdown with an already-resolved roborev binary, or `None` when it cannot
 /// be read. `None` is "unread", never "clean" — [`body_carries_no_finding`] blocks on it.
 pub(crate) fn read_review_body(program: &str, root: &str, job_id: i64) -> Option<String> {
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::setup::roborev_cli(program);
     cmd.args(["show", "--job", &job_id.to_string(), "--json"]).current_dir(root);
     apply_noninteractive(&mut cmd);
     let output = crate::worktree::output_with_timeout(cmd, REVIEW_BODY_TIMEOUT).ok()?;

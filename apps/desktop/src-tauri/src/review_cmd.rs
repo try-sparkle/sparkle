@@ -189,7 +189,7 @@ fn run_roborev(repo: &str, args: &[&str]) -> Result<String, String> {
             "roborev-missing: the roborev binary isn't installed on this machine".to_string()
         );
     };
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::setup::roborev_cli(&bin);
     cmd.args(args);
     // CWD is the repo, so roborev resolves "the current repo" the same way it does for a human
     // typing in that directory. `--repo` is passed by the callers as well; the two agree, and the

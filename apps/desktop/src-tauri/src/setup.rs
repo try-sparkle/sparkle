@@ -636,6 +636,34 @@ pub fn daemon_path_env(home: &Path) -> String {
     )
 }
 
+/// The ONLY way the app may build a `Command` for the roborev CLI: `Command::new(program)` with
+/// `PATH` pinned to [`daemon_path_env`].
+///
+/// WHY (beads `sparkle-trlumq`, and the 2026-10-22 recurrence under epic `sparkle-eou3y0`): every
+/// roborev CLIENT verb (`list`, `show`, `comment`, `post-commit`, …) AUTO-STARTS a daemon when none
+/// is reachable — the binary's own `ensureDaemon`, with no flag or env var to turn it off — and
+/// that daemon inherits the CALLER's environment. Sparkle is a Finder/Dock-launched GUI app whose
+/// PATH is launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`, so a client call landing in the window
+/// where the LaunchAgent copy is down (an app restart re-bootstrapping it, a crash, a kickstart)
+/// spawned a stray `roborev daemon run` (ppid 1) that could reach no review agent. It then owns
+/// port 7373, the LaunchAgent's copy dies on `daemon already running` forever, and every enqueue is
+/// refused with `no review agent available` while `roborev post-commit` still exits 0. Measured
+/// 2026-10-22: the app started 07:29:11 with that bare PATH and the stray held the port before the
+/// LaunchAgent bootstrapped at 07:29:33; reproduced by running `roborev list` against an empty port
+/// under `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin` — it forked a ppid-1 daemon with exactly that
+/// PATH.
+///
+/// We cannot stop the CLI from auto-starting, so we make whatever it starts IDENTICAL to what
+/// launchd starts: the same PATH the plist carries. A stray then reviews correctly instead of
+/// refusing everything. `roborev_cli_is_the_only_constructor` pins that no other spawn site exists.
+pub fn roborev_cli(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        cmd.env("PATH", daemon_path_env(Path::new(&home)));
+    }
+    cmd
+}
+
 /// Where the roborev daemon's own stdout/stderr are captured, under the same
 /// `~/Library/Logs/ai.sparkle.desktop/` directory the maintenance and drainer LaunchAgents use.
 ///
@@ -923,7 +951,7 @@ fn install_roborev_blocking(app: &AppHandle) -> Result<String, String> {
     // (4) Point roborev at the user's claude login as its default review agent. Best-effort but
     //     surfaced on failure — a fresh install needs this to review at all.
     emit(app, "roborev", "Configuring roborev to use claude-code…");
-    let mut cfg = Command::new(&roborev_path);
+    let mut cfg = roborev_cli(&roborev_path);
     cfg.args(["config", "set", "--global", "default_agent", "claude-code"]);
     run_streaming(app, "roborev", cfg)
         .map_err(|e| format!("`roborev config set default_agent` failed: {e}"))?;
@@ -1072,7 +1100,7 @@ fn roborev_auth_selftest_blocking(app: &AppHandle) -> Result<RoborevAuthVerdict,
         .ok_or_else(|| "no HOME directory".to_string())?;
 
     emit(app, "roborev", "Checking that roborev can authenticate claude…");
-    let mut cmd = Command::new(&roborev_path);
+    let mut cmd = roborev_cli(&roborev_path);
     cmd.args(["check-agents", "--agent", "claude-code", "--timeout", "60"]);
     // Reproduce the daemon's env exactly: launchd gives a LaunchAgent a near-empty environment plus
     // the plist's EnvironmentVariables. env_clear() then re-adding only HOME/PATH/USER is what makes
@@ -1745,6 +1773,123 @@ mod tests {
         let home = Path::new("/Users/ada");
         let plist = roborev_daemon_plist("/Users/ada/.local/bin/roborev", home);
         assert!(plist.contains(&daemon_path_env(home)), "plist PATH drifted from daemon_path_env");
+    }
+
+    /// The side effect, not the precondition: a CLI child built by `roborev_cli` carries the
+    /// LaunchAgent's PATH, so a daemon it auto-starts can reach the review agent. Without the pin
+    /// the child inherits the GUI app's bare `/usr/bin:/bin:/usr/sbin:/sbin` and this reads `None`.
+    #[test]
+    fn roborev_cli_pins_the_launch_agent_path() {
+        let home = std::env::var_os("HOME").expect("tests run with HOME set");
+        let cmd = roborev_cli("/Users/ada/.local/bin/roborev");
+        let path = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(
+            path,
+            Some(daemon_path_env(Path::new(&home))),
+            "roborev_cli must hand the CLI the daemon PATH — a daemon the CLI auto-starts inherits it"
+        );
+    }
+
+    /// The hook is the OTHER caller that fires everywhere: `roborev post-commit` auto-starts a
+    /// daemon too, from whatever process committed (a launchd job included). It must pin the same
+    /// PATH, spelled with `$HOME` because the hook resolves it at run time.
+    #[test]
+    fn post_commit_hook_pins_the_launch_agent_path() {
+        let hook = include_str!("../resources/roborev/post-commit");
+        let want = format!(
+            "PATH=\"{}\"\nexport PATH\n\"$ROBOREV\" post-commit",
+            daemon_path_env(Path::new("$HOME"))
+        );
+        assert!(
+            hook.contains(&want),
+            "the vendored post-commit hook must invoke roborev with the daemon PATH; expected `{want}`"
+        );
+    }
+
+    /// RULE: the app never spawns a roborev CLI verb through a bare `Command::new` — only through
+    /// [`roborev_cli`]. Every verb can auto-start a daemon, and one started from the GUI app's
+    /// environment is the stray that refused every enqueue for ~13h (see `roborev_cli`).
+    ///
+    /// A `Command::new(..)` is flagged when its program is not git/gh and the next lines hand it a
+    /// roborev verb. Each file's source is read from disk so this covers every module, not a list.
+    #[test]
+    fn roborev_cli_is_the_only_constructor() {
+        const VERBS: &[&str] = &[
+            ".arg(\"status\")",
+            "[\"list\"",
+            "[\"show\"",
+            "[\"comment\"",
+            "[\"close\"",
+            "[\"config\"",
+            "[\"check-agents\"",
+            "[\"post-commit\"",
+            "[\"review\"",
+            "[\"enqueue\"",
+            "list_argv(",
+            "cmd.args(args)",
+        ];
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut scanned = 0usize;
+        let mut sanctioned = 0usize;
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read source");
+            scanned += 1;
+            sanctioned += src.matches("setup::roborev_cli(").count()
+                + src.matches(" roborev_cli(&").count();
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let Some(at) = line.find("Command::new(") else { continue };
+                let program = &line[at..];
+                if program.contains("git") || program.contains("gh_") || program.contains("\"gh\"") {
+                    continue;
+                }
+                let window = lines[i..(i + 4).min(lines.len())].join("\n");
+                if !VERBS.iter().any(|v| window.contains(v)) {
+                    continue;
+                }
+                // `show`/`list`/`close`/`config` are bd and claude verbs too, so a verb alone is not
+                // a roborev spawn. It is one when the program is a roborev binary: resolved within
+                // the preceding lines, or the parameter of a fn whose name says roborev/review.
+                let before = &lines[i.saturating_sub(40)..i];
+                let resolved_nearby = before.iter().any(|l| {
+                    ["cached_roborev_path", "resolve_enabled_binary", "roborev_path"]
+                        .iter()
+                        .any(|r| l.contains(r))
+                });
+                let in_roborev_fn = before
+                    .iter()
+                    .rev()
+                    .find(|l| l.contains("fn ") && l.contains('('))
+                    .is_some_and(|l| l.contains("roborev") || l.contains("review"));
+                if resolved_nearby || in_roborev_fn {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        i + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(scanned > 50, "scanned only {scanned} files — the walk is not reading src/");
+        // Anti-vacuity: the eight known spawn sites are all routed through the helper. A scan that
+        // stopped seeing them would also stop seeing a regression.
+        assert!(sanctioned >= 8, "found only {sanctioned} roborev_cli call sites; expected >= 8");
+        assert!(
+            offenders.is_empty(),
+            "spawn the roborev CLI with crate::setup::roborev_cli, never Command::new — a bare spawn \
+             inherits the GUI app's PATH, and a daemon it auto-starts can reach no review agent:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]

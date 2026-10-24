@@ -2742,7 +2742,7 @@ fn apply_noninteractive(cmd: &mut Command) {
 /// Run `roborev status` in `root`, mapping the outcome to a [`StatusProbe`]. A timeout becomes
 /// [`StatusProbe::TimedOut`] specifically — that is the wedge signal, not a generic failure.
 fn probe_roborev_status(program: &str, root: &str) -> StatusProbe {
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::setup::roborev_cli(program);
     cmd.arg("status").current_dir(root);
     apply_noninteractive(&mut cmd);
     match crate::worktree::output_with_timeout(cmd, ROBOREV_STATUS_TIMEOUT) {
