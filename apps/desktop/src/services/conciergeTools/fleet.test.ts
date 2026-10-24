@@ -377,6 +377,12 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
     expect(note, "the all-`act` exception must be stated, not implied").toMatch(
       /UNLESS every queued slot holds an `act`[^.]*refused outright/,
     );
+    // ...but that refusal is the ORDINARY lane's. The concierge's own sends ride the operator lane,
+    // which takes a reserved `act` slot rather than being refused (bead sparkle-eou3y0.1) — copy
+    // that told the concierge its `fyi` was refused would send it to escalate for no reason.
+    expect(note, "the operator-lane exception must be stated").toMatch(
+      /concierge's own sends ride the operator lane/,
+    );
     // ...and it still tells the caller that an `act` really can be refused — the wall that remains.
     expect(note, "an `act` at the ceiling IS refused, and that must survive").toMatch(
       /before an `act` is refused/,

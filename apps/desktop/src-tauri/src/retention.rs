@@ -1249,6 +1249,7 @@ mod tests {
             from: "concierge".into(),
             text: format!("message {id}"),
             severity: inbox::Severity::Fyi,
+            lane: inbox::Lane::Ordinary,
         })
         .unwrap()
     }

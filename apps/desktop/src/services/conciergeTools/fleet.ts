@@ -332,8 +332,10 @@ export function recipientQueueFromRow(
         `${actHeadroom} before an \`act\` is refused outright.`
       : `${pending} of this agent's messages are queued and undelivered, at or over the ` +
         `${fyiCeiling}-message \`fyi\` ceiling: the next \`fyi\` evicts this agent's stalest ` +
-        "`fyi` to make room — UNLESS every queued slot holds an `act`, which an `fyi` may never " +
-        `evict and which is refused outright. ${actHeadroom} \`act\` send(s) remain before an ` +
+        "`fyi` to make room — UNLESS every queued slot holds an `act`, which an ordinary `fyi` " +
+        "(every peer send) may never evict and which is refused outright; the concierge's own " +
+        "sends ride the operator lane and take a reserved `act` slot instead (bead " +
+        `sparkle-eou3y0.1). ${actHeadroom} \`act\` send(s) remain before an ` +
         "`act` is refused. Either way it is not reading what it already has — consider whether " +
         "another message helps.";
   return {
