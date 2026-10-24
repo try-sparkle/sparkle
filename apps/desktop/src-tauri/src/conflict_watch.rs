@@ -255,6 +255,11 @@ pub struct ProbeStatus {
     /// starts the next sweep with them. A distinct count because "the repo answered badly" and "we
     /// ran out of time" send a reader to different places.
     pub not_reached: usize,
+    /// Projects still holding TRACKED PRs whose checkout now has NO git remote (bead
+    /// sparkle-5i7e8x.4). Their PRs cannot be re-read, so the list is INCOMPLETE — but nothing
+    /// about GitHub failed and no retry will change it: it is local repo configuration. Counted
+    /// apart from `unreadable` for the same reason `not_reached` is.
+    pub no_remote: usize,
     /// Why the last unreadable repo could not be read.
     pub last_error: Option<String>,
     /// When a sweep last read EVERY discovered repo. `0` means never.
@@ -274,9 +279,11 @@ fn record_probe(tally: &SweepTally, repos: usize, now: u64) {
     s.repos = repos;
     s.unreadable = tally.unreadable;
     s.not_reached = tally.not_reached;
+    s.no_remote = tally.no_remote;
     s.last_error = tally.last_error.map(str::to_string);
-    // A FULL read needs both: a repo the budget never reached was not read either.
-    if tally.unreadable == 0 && tally.not_reached == 0 {
+    // A FULL read needs all three: a repo the budget never reached was not read either, and nor
+    // was a remoteless project's tracked PRs.
+    if tally.unreadable == 0 && tally.not_reached == 0 && tally.no_remote == 0 {
         s.last_full_read_ms = now;
     }
 }
@@ -288,8 +295,11 @@ struct SweepTally {
     unreadable: usize,
     /// Repos [`SWEEP_BUDGET`] cut off before they were asked — [`Disposition::BudgetSkipped`].
     not_reached: usize,
+    /// Projects with tracked PRs and no git remote — [`Disposition::NoRemote`].
+    no_remote: usize,
     /// The reason of the last genuinely unreadable repo, in outcome order. Never
-    /// [`SWEEP_BUDGET_REASON`]: that is a fact about our scheduler, not about any repo.
+    /// [`SWEEP_BUDGET_REASON`] or [`NO_GIT_REMOTE_REASON`]: those are facts about our scheduler
+    /// and about local config, not about whether GitHub answered.
     last_error: Option<&'static str>,
 }
 
@@ -301,11 +311,13 @@ fn tally_sweep<T>(outcomes: &[(usize, Result<T, &'static str>, Disposition)]) ->
     let mut t = SweepTally::default();
     for (_, result, disposition) in outcomes {
         let Err(reason) = result else { continue };
-        if *disposition == Disposition::BudgetSkipped {
-            t.not_reached += 1;
-        } else {
-            t.unreadable += 1;
-            t.last_error = Some(reason);
+        match disposition {
+            Disposition::BudgetSkipped => t.not_reached += 1,
+            Disposition::NoRemote => t.no_remote += 1,
+            _ => {
+                t.unreadable += 1;
+                t.last_error = Some(reason);
+            }
         }
     }
     t
@@ -1001,37 +1013,101 @@ fn git_remote_check(dir: &Path) -> RemoteCheck {
 /// - The FIRST worktree that answers definitively decides (worktrees of one repo share remotes);
 ///   an `Unknown` falls through to the next, and a project where NO worktree answers is KEPT, so a
 ///   husk or a git hiccup is still probed and still reported unreadable if it is.
-/// - A project that still has TRACKED PRs is kept even if it now reads remoteless (a remote was
-///   removed mid-life): dropping it would leave those PRs neither pruned nor blind-looked — silently
-///   missing, which downstream is indistinguishable from "no conflicts".
+/// - A project that still has TRACKED PRs is never DROPPED even if it now reads remoteless (a
+///   remote was removed mid-life): dropping it would leave those PRs neither pruned nor
+///   blind-looked — silently missing, which downstream is indistinguishable from "no conflicts".
+///   It is returned in the THIRD list instead (bead sparkle-5i7e8x.4): not probed — `gh` cannot
+///   succeed there, and asking it every sweep is what produced 32 consecutive
+///   `gh-graphql-and-rest-failed` and a two-hour backoff over a fault no retry can clear — but
+///   handed to [`append_no_remote_outcomes`], so its tracked PRs keep climbing blind under
+///   [`NO_GIT_REMOTE_REASON`], the PERMANENT local-config reason, rather than a GitHub one.
 ///
-/// Returns `(kept, skipped project ids)`, both in input order.
+/// Returns `(to probe, skipped project ids, remoteless-with-tracked-PRs)`, each in input order.
 fn partition_remoteless<T, C>(
     repos: Vec<Repo>,
     mut has_tracked: T,
     mut check: C,
-) -> (Vec<Repo>, Vec<String>)
+) -> (Vec<Repo>, Vec<String>, Vec<Repo>)
 where
     T: FnMut(&str) -> bool,
     C: FnMut(&Path) -> RemoteCheck,
 {
     let mut kept = Vec::with_capacity(repos.len());
     let mut skipped = Vec::new();
+    let mut no_remote = Vec::new();
     for repo in repos {
-        let remoteless = !has_tracked(&repo.project_id)
-            && repo
-                .dirs
-                .iter()
-                .map(|d| check(d))
-                .find(|c| *c != RemoteCheck::Unknown)
-                == Some(RemoteCheck::None);
-        if remoteless {
-            skipped.push(repo.project_id);
-        } else {
+        let remoteless = repo
+            .dirs
+            .iter()
+            .map(|d| check(d))
+            .find(|c| *c != RemoteCheck::Unknown)
+            == Some(RemoteCheck::None);
+        if !remoteless {
             kept.push(repo);
+        } else if has_tracked(&repo.project_id) {
+            no_remote.push(repo);
+        } else {
+            skipped.push(repo.project_id);
         }
     }
-    (kept, skipped)
+    (kept, skipped, no_remote)
+}
+
+/// The `blocked_by` reason a tracked PR carries when its project's checkout has NO git remote.
+///
+/// A PERMANENT local-config fault, deliberately distinct from every `gh-*` reason and from
+/// [`SWEEP_BUDGET_REASON`]: GitHub was not asked, could not have been, and nothing will change until
+/// a person adds a remote. Never entered into [`ProbeBackoff`] — there is no retry to schedule.
+const NO_GIT_REMOTE_REASON: &str = "no-git-remote";
+
+/// Append the remoteless-with-tracked-PRs projects to the sweep's repo list, each with the
+/// [`NO_GIT_REMOTE_REASON`] outcome, and return the combined list the outcomes index into.
+///
+/// Appended AFTER the probed repos so every index [`sweep_probes`] produced stays valid. Every such
+/// project gets an outcome — the same fail-closed rule [`Swept::outcomes`] states: a repo silently
+/// missing from the outcome list is a repo whose tracked PRs stop climbing.
+fn append_no_remote_outcomes<T>(
+    mut probed: Vec<Repo>,
+    no_remote: Vec<Repo>,
+    outcomes: &mut Vec<(usize, Result<T, &'static str>, Disposition)>,
+) -> Vec<Repo> {
+    for repo in no_remote {
+        outcomes.push((probed.len(), Err(NO_GIT_REMOTE_REASON), Disposition::NoRemote));
+        probed.push(repo);
+    }
+    probed
+}
+
+/// The remoteless projects to WARN about this sweep: those not already announced. Forgets any id
+/// no longer remoteless, so a project that regains a remote and later loses it is announced again.
+///
+/// ONCE, because a missing remote is a standing fact: the bead behind this (sparkle-5i7e8x.4) is a
+/// permanent condition reported as if it were news on every sweep for hours. Saying it once, by
+/// name, is what lets a reader act on it; saying it every two minutes is what teaches them not to.
+fn newly_remoteless(announced: &mut HashSet<String>, now_remoteless: &[String]) -> Vec<String> {
+    announced.retain(|id| now_remoteless.contains(id));
+    now_remoteless
+        .iter()
+        .filter(|id| announced.insert((*id).clone()))
+        .cloned()
+        .collect()
+}
+
+/// Where in `repos` this sweep starts, resolved from the PROJECT ID the last sweep stopped at.
+///
+/// WHY AN ID, NOT AN INDEX (bead sparkle-5i7e8x.3). The rotation used to remember a position in the
+/// probed list — but that list changes between sweeps (a project gains or loses worktrees, flips
+/// remoteless, is added or torn down), and every change before the cursor shifted it onto a
+/// DIFFERENT project, so the one the budget actually cut off could be skipped again. An id cannot
+/// drift. When that project is gone, resume at the first id after it: `discover_repos` returns
+/// projects sorted by id, so that is exactly where the sweep would have gone next. `None`, or an
+/// id past the end, starts at the top.
+fn resume_index(repos: &[Repo], resume: Option<&str>) -> usize {
+    let Some(resume) = resume else { return 0 };
+    repos
+        .iter()
+        .position(|r| r.project_id.as_str() >= resume)
+        .unwrap_or(0)
 }
 
 /// The cheap fingerprint of the worktree layout: the base directory's mtime plus each project
@@ -1317,6 +1393,9 @@ enum Disposition {
     /// [`SWEEP_BUDGET`] ran out before we reached this repo. We never asked, so we learned nothing
     /// about it — and in particular this must never be recorded as a probe FAILURE.
     BudgetSkipped,
+    /// The project's checkout has NO git remote — see [`NO_GIT_REMOTE_REASON`]. Not asked, never
+    /// backed off, and not a GitHub failure.
+    NoRemote,
 }
 
 /// What one sweep of every project's `gh` probe produced — see [`sweep_probes`].
@@ -2440,9 +2519,12 @@ struct Watch {
     last_collision_fp: Option<u64>,
     /// The worktree layout, re-walked only when it changes — see [`DiscoveryCache`].
     discovery: DiscoveryCache,
-    /// Where the next sweep starts probing, so a machine too big to sweep inside [`SWEEP_BUDGET`]
-    /// rotates through its projects instead of permanently starving the tail.
-    sweep_cursor: usize,
+    /// The PROJECT the next sweep starts probing at, so a machine too big to sweep inside
+    /// [`SWEEP_BUDGET`] rotates through its projects instead of permanently starving the tail. An
+    /// id rather than an index — see [`resume_index`].
+    sweep_resume: Option<String>,
+    /// Remoteless projects already warned about — see [`newly_remoteless`].
+    announced_remoteless: HashSet<String>,
     /// Per-project probe backoff — see [`ProbeBackoff`]. Holds only repos we are currently failing
     /// to read; an entry is cleared by the first success.
     probe_backoff: ProbeBackoff,
@@ -2649,13 +2731,31 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     let discovered = watch.discovery.repos(&app_data, discover_repos);
     // Local-only repos have nothing for `gh` to read — see [`partition_remoteless`]. Not probed,
     // not counted unreadable, and any stale backoff entry is dropped so no streak lingers.
-    let (repos, remoteless) = partition_remoteless(
+    let (to_probe, remoteless, no_remote) = partition_remoteless(
         discovered,
         |id| watch.tracked.values().any(|t| t.project_id == id),
         git_remote_check,
     );
-    for id in &remoteless {
+    let all_remoteless: Vec<String> = remoteless
+        .iter()
+        .cloned()
+        .chain(no_remote.iter().map(|r| r.project_id.clone()))
+        .collect();
+    for id in &all_remoteless {
         watch.probe_backoff.remove(id);
+    }
+    // ONCE per project, at warn, naming it — a standing local-config fact, not a GitHub failure.
+    for id in newly_remoteless(&mut watch.announced_remoteless, &all_remoteless) {
+        let tracked = no_remote.iter().any(|r| r.project_id == id);
+        tracing::warn!(
+            target: "conflict_watch",
+            project = %id,
+            tracked_prs_held_blind = tracked,
+            reason = NO_GIT_REMOTE_REASON,
+            "this project's checkout has NO git remote, so it cannot have pull requests and GitHub \
+             is not asked about it. This is local repo configuration, NOT a GitHub failure, and no \
+             retry will change it: add a remote to have its PRs watched. Announced once."
+        );
     }
     if !remoteless.is_empty() {
         tracing::debug!(
@@ -2678,15 +2778,18 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     // ONE budget for the whole sweep, a fan-out cap inside it, and a per-project backoff across
     // sweeps — see [`SWEEP_BUDGET`], [`MAX_PROBE_FALLBACKS`] and [`ProbeBackoff`]. This is the only
     // path from this thread to a `gh` subprocess.
-    let swept = sweep_probes(
-        &repos,
+    let mut swept = sweep_probes(
+        &to_probe,
         &mut watch.probe_backoff,
-        watch.sweep_cursor,
+        resume_index(&to_probe, watch.sweep_resume.as_deref()),
         SWEEP_BUDGET.as_millis() as u64,
         probe_open_prs_resilient,
         now_ms,
     );
-    watch.sweep_cursor = swept.next_cursor;
+    watch.sweep_resume = to_probe.get(swept.next_cursor).map(|r| r.project_id.clone());
+    // Remoteless projects still holding tracked PRs: not probed, but given an outcome so those PRs
+    // keep climbing blind under the permanent local-config reason. See `partition_remoteless`.
+    let repos = append_no_remote_outcomes(to_probe, no_remote, &mut swept.outcomes);
     let tally = tally_sweep(&swept.outcomes);
     if !swept.skipped.is_empty() {
         // MAKE THE COST VISIBLE. Before this the sweep simply took minutes and said nothing; the
@@ -2811,6 +2914,22 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                         consecutive_failures = blind_streak(&watch.probe_backoff, &repo.project_id),
                         "not re-probing this repo yet; it is inside its failure backoff and its \
                          tracked PRs keep climbing on the cached reason"
+                    ),
+                    // NOT a read failure, so not the read-failure warning (bead sparkle-5i7e8x.3):
+                    // the budget-skipped repo was never asked, and that is already warned ONCE per
+                    // sweep above, naming every project it missed.
+                    Disposition::BudgetSkipped => tracing::debug!(
+                        target: "conflict_watch",
+                        project = %repo.project_id,
+                        "not reached this sweep (the whole-sweep budget ran out first); its tracked \
+                         PRs keep climbing and the next sweep starts with it"
+                    ),
+                    // Announced once, by name, where the partition is computed — see
+                    // `newly_remoteless`. A per-sweep warning is the noise the bead measured.
+                    Disposition::NoRemote => tracing::debug!(
+                        target: "conflict_watch",
+                        project = %repo.project_id,
+                        "no git remote; tracked PRs keep climbing under the local-config reason"
                     ),
                     // `consecutive_failures` is what separates a blip from a standing outage — see
                     // [`blind_streak`]. Without it this sentence is identical on the first failure
@@ -5155,7 +5274,7 @@ mod tests {
         assert!(!conflict_probe_status().ever_probed);
 
         // A sweep that found one repo and could not read it.
-        let failed = SweepTally { unreadable: 1, not_reached: 0, last_error: Some("gh-unavailable") };
+        let failed = SweepTally { unreadable: 1, not_reached: 0, no_remote: 0, last_error: Some("gh-unavailable") };
         record_probe(&failed, 1, 111);
         let st = conflict_probe_status();
         assert!(st.ever_probed);
@@ -5172,12 +5291,21 @@ mod tests {
 
         // A sweep the BUDGET cut short is not unreadable — but it is not a full read either, so the
         // stamp must not advance and the consumer still sees the list as incomplete.
-        let short = SweepTally { unreadable: 0, not_reached: 3, last_error: None };
+        let short = SweepTally { unreadable: 0, not_reached: 3, no_remote: 0, last_error: None };
         record_probe(&short, 4, 333);
         let st = conflict_probe_status();
         assert_eq!(st.unreadable, 0, "never-asked repos are not counted unreadable");
         assert_eq!(st.not_reached, 3, "but they ARE counted, under their own name");
         assert_eq!(st.last_full_read_ms, 222, "a budget-cut sweep is not a full read");
+
+        // A held remoteless project: its tracked PRs were not re-read, so not a full read either —
+        // but it is counted under its own name, never as a GitHub read failure (sparkle-5i7e8x.4).
+        let held = SweepTally { unreadable: 0, not_reached: 0, no_remote: 1, last_error: None };
+        record_probe(&held, 4, 444);
+        let st = conflict_probe_status();
+        assert_eq!(st.unreadable, 0);
+        assert_eq!(st.no_remote, 1);
+        assert_eq!(st.last_full_read_ms, 222, "a sweep holding a remoteless project is not a full read");
     }
 
     /// ONE SLOW PROBE MUST NOT REPORT EVERY LATER PROJECT UNREADABLE (bead sparkle-eou3y0.6).
@@ -5231,7 +5359,7 @@ mod tests {
         ];
         assert_eq!(
             tally_sweep(&outcomes),
-            SweepTally { unreadable: 1, not_reached: 1, last_error: Some("gh-failed") }
+            SweepTally { unreadable: 1, not_reached: 1, no_remote: 0, last_error: Some("gh-failed") }
         );
     }
 
@@ -5513,7 +5641,7 @@ mod remoteless_tests {
     #[test]
     fn a_project_with_no_remote_is_skipped_not_counted_as_a_failure() {
         let repos = vec![repo("taxes", &["/local/a"]), repo("app", &["/gh/a"])];
-        let (kept, skipped) = partition_remoteless(repos, |_| false, fake_check);
+        let (kept, skipped, _) = partition_remoteless(repos, |_| false, fake_check);
         assert_eq!(skipped, vec!["taxes".to_string()]);
 
         let mut backoff = ProbeBackoff::new();
@@ -5554,7 +5682,7 @@ mod remoteless_tests {
 
     #[test]
     fn a_project_with_a_remote_is_kept() {
-        let (kept, skipped) =
+        let (kept, skipped, _) =
             partition_remoteless(vec![repo("app", &["/gh/a"])], |_| false, fake_check);
         assert_eq!(kept.len(), 1);
         assert!(skipped.is_empty());
@@ -5563,7 +5691,7 @@ mod remoteless_tests {
     /// FAIL CLOSED: no worktree could answer, so we know nothing — keep probing it.
     #[test]
     fn a_project_no_worktree_can_answer_for_is_kept() {
-        let (kept, skipped) = partition_remoteless(
+        let (kept, skipped, _) = partition_remoteless(
             vec![repo("husky", &["/husk/a", "/husk/b"])],
             |_| false,
             fake_check,
@@ -5575,7 +5703,7 @@ mod remoteless_tests {
     /// A husk first, then a real answer: the first DEFINITIVE answer decides.
     #[test]
     fn an_unknown_worktree_falls_through_to_the_next_answer() {
-        let (_, skipped) = partition_remoteless(
+        let (_, skipped, _) = partition_remoteless(
             vec![
                 repo("taxes", &["/husk/a", "/local/b"]),
                 repo("app", &["/husk/a", "/gh/b"]),
@@ -5586,16 +5714,88 @@ mod remoteless_tests {
         assert_eq!(skipped, vec!["taxes".to_string()]);
     }
 
-    /// A project still holding tracked PRs is never dropped, or those PRs go silently unwatched.
+    /// A project still holding tracked PRs is never DROPPED, or those PRs go silently unwatched —
+    /// but it is not PROBED either (bead sparkle-5i7e8x.4): `gh` cannot succeed without a remote,
+    /// and asking it every sweep is what produced 32 consecutive `gh-graphql-and-rest-failed`.
     #[test]
-    fn a_remoteless_project_with_tracked_prs_is_still_probed() {
-        let (kept, skipped) = partition_remoteless(
-            vec![repo("taxes", &["/local/a"])],
+    fn a_remoteless_project_with_tracked_prs_is_held_not_probed() {
+        let (kept, skipped, no_remote) = partition_remoteless(
+            vec![repo("taxes", &["/local/a"]), repo("app", &["/gh/a"])],
             |id| id == "taxes",
             fake_check,
         );
-        assert_eq!(kept.len(), 1);
-        assert!(skipped.is_empty());
+        assert_eq!(kept.iter().map(|r| r.project_id.as_str()).collect::<Vec<_>>(), ["app"]);
+        assert!(skipped.is_empty(), "dropping it would leave its tracked PRs silently unwatched");
+        assert_eq!(no_remote.iter().map(|r| r.project_id.as_str()).collect::<Vec<_>>(), ["taxes"]);
+    }
+
+    /// THE SIDE EFFECT for bead sparkle-5i7e8x.4: the held project's tracked PRs get an outcome —
+    /// carrying the PERMANENT local-config reason, never a `gh-*` one — `gh` is never spawned for
+    /// it, it never enters the retry ladder, and it is not counted as a GitHub read failure.
+    #[test]
+    fn a_held_remoteless_project_reports_no_git_remote_not_a_github_failure() {
+        let (to_probe, _, no_remote) = partition_remoteless(
+            vec![repo("taxes", &["/local/a"]), repo("app", &["/gh/a"])],
+            |id| id == "taxes",
+            fake_check,
+        );
+        let mut backoff = ProbeBackoff::new();
+        let mut asked: Vec<PathBuf> = Vec::new();
+        let mut swept = sweep_probes(
+            &to_probe,
+            &mut backoff,
+            0,
+            60_000,
+            |d| {
+                asked.push(d.to_path_buf());
+                Err(if d.starts_with("/local") { BOTH_APIS_FAILED } else { "gh-failed" })
+            },
+            || 0,
+        );
+        let repos = append_no_remote_outcomes(to_probe, no_remote, &mut swept.outcomes);
+        assert_eq!(asked, vec![PathBuf::from("/gh/a")], "gh was spawned for a remoteless repo");
+        assert!(!backoff.contains_key("taxes"), "a permanent fault entered the retry ladder");
+
+        let (idx, result, disposition) = swept
+            .outcomes
+            .iter()
+            .find(|(i, _, _)| repos[*i].project_id == "taxes")
+            .expect("the held project must still have an outcome, or its tracked PRs stop climbing");
+        assert_eq!(repos[*idx].project_id, "taxes");
+        assert_eq!(result.as_ref().err(), Some(&NO_GIT_REMOTE_REASON));
+        assert_eq!(*disposition, Disposition::NoRemote);
+
+        let tally = tally_sweep(&swept.outcomes);
+        assert_eq!(tally.no_remote, 1);
+        assert_eq!(tally.unreadable, 1, "only `app`, whose gh really failed, is unreadable");
+        assert_eq!(tally.last_error, Some("gh-failed"), "never the local-config reason");
+    }
+
+    #[test]
+    fn a_remoteless_project_is_announced_once_and_again_only_after_it_recovers() {
+        let mut announced = HashSet::new();
+        let taxes = vec!["taxes".to_string()];
+        assert_eq!(newly_remoteless(&mut announced, &taxes), taxes, "first sighting is news");
+        assert!(newly_remoteless(&mut announced, &taxes).is_empty(), "a standing fact is not");
+        assert!(newly_remoteless(&mut announced, &[]).is_empty(), "it gained a remote");
+        assert_eq!(newly_remoteless(&mut announced, &taxes), taxes, "lost it again: news again");
+    }
+
+    /// The rotation resumes at the PROJECT the budget cut off, not at a position that the next
+    /// sweep's list may have shifted onto a different project (bead sparkle-5i7e8x.3).
+    #[test]
+    fn the_sweep_resumes_at_the_project_it_stopped_at_even_when_the_list_shifts() {
+        let ids = |v: &[&str]| v.iter().map(|id| repo(id, &["/gh/x"])).collect::<Vec<_>>();
+        let before = ids(&["a", "b", "c", "tkmx"]);
+        assert_eq!(resume_index(&before, Some("tkmx")), 3);
+        // `a` vanished (torn down, or turned remoteless) before the next sweep: an index cursor of 3
+        // would now be past the end and wrap to `b`, skipping `tkmx` AGAIN.
+        let after = ids(&["b", "c", "tkmx"]);
+        assert_eq!(resume_index(&after, Some("tkmx")), 2);
+        // The resume project itself is gone: continue with the next id in sorted order.
+        assert_eq!(resume_index(&ids(&["b", "c", "zed"]), Some("tkmx")), 2);
+        assert_eq!(resume_index(&ids(&["b", "c"]), Some("tkmx")), 0, "past the end wraps to the top");
+        assert_eq!(resume_index(&after, None), 0);
     }
 
     #[test]

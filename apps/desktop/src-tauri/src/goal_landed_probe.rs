@@ -82,17 +82,123 @@ pub struct LandedProbe {
     /// `None` we could not tell — which the caller must NOT render as a negative.
     pub landed: Option<bool>,
     pub reason: String,
+    /// The branch the worktree has CHECKED OUT (`rev-parse --abbrev-ref HEAD`), or `None` when HEAD
+    /// is detached or unreadable. Reported so a refusal can NAME what was measured (bead
+    /// sparkle-q4r8z2) — never used to resolve anything: rule 1 reads HEAD, not a name.
+    pub branch: Option<String>,
+    /// The sha HEAD resolved to — the LEFT side of the ancestry comparison.
+    pub head_sha: Option<String>,
+    /// The fully-qualified ref compared against, e.g. `refs/remotes/origin/main`.
+    pub base_ref: Option<String>,
+    /// The sha that ref resolved to AFTER the refresh — the RIGHT side of the comparison.
+    pub base_sha: Option<String>,
+    /// Did a commit AUTHORED IN THIS WORKTREE reach origin/<default>? Read from the worktree's own
+    /// HEAD reflog — see [`authored_commit_landed`] for why ancestry alone cannot answer it.
+    /// `Some(true)` one did; `Some(false)` the reflog was read and none did (or none exists);
+    /// `None` it was not asked (the probe bailed earlier) or could not be read.
+    pub authored_landed: Option<bool>,
+    /// Committer time (unix SECONDS) of the newest authored commit found on origin/<default>, when
+    /// `authored_landed` is `Some(true)`. Lets a caller refuse to credit a goal with work that
+    /// landed BEFORE the goal was set — a re-tasked agent whose HEAD still sits on its previous,
+    /// merged work satisfies both ancestry and `authored_landed` without having done the new task.
+    pub authored_landed_at: Option<i64>,
 }
 
 impl LandedProbe {
     fn unknown(reason: impl Into<String>) -> Self {
-        Self { landed: None, reason: reason.into() }
+        Self {
+            landed: None,
+            reason: reason.into(),
+            branch: None,
+            head_sha: None,
+            base_ref: None,
+            base_sha: None,
+            authored_landed: None,
+            authored_landed_at: None,
+        }
     }
-    fn yes(reason: impl Into<String>) -> Self {
-        Self { landed: Some(true), reason: reason.into() }
+    fn with_landed(mut self, landed: Option<bool>) -> Self {
+        self.landed = landed;
+        self
     }
-    fn no(reason: impl Into<String>) -> Self {
-        Self { landed: Some(false), reason: reason.into() }
+}
+
+/// Reflog subjects that record a commit CREATED in this worktree, as opposed to HEAD merely moving
+/// onto one someone else made (`checkout:`, `reset:`, `pull: Fast-forward`, `merge …: Fast-forward`,
+/// `rebase (start)` / `(finish)`). A rebase's `(pick)` / `(reword)` / `(squash)` / `(fixup)` /
+/// `(edit)` / `(continue)` entries write NEW commits carrying the agent's own changes, so they count.
+fn reflog_subject_is_authored(subject: &str) -> bool {
+    let s = subject.trim_start();
+    if s.starts_with("commit") || s.starts_with("cherry-pick") || s.starts_with("revert") {
+        return true;
+    }
+    if s.starts_with("rebase") {
+        return ["(pick)", "(reword)", "(squash)", "(fixup)", "(edit)", "(continue)"]
+            .iter()
+            .any(|m| s.contains(m));
+    }
+    false
+}
+
+/// How many distinct authored shas to test for ancestry. Newest first, short-circuiting on the first
+/// hit, so the common landed case costs ONE `merge-base`; the cap bounds the unlanded case.
+const AUTHORED_SCAN_MAX: usize = 25;
+
+/// DID A COMMIT THIS WORKTREE AUTHORED REACH `remote_ref`? — the no-op guard ancestry cannot carry.
+///
+/// Ancestry of HEAD is satisfied TRIVIALLY by a branch that authored nothing (its HEAD *is* the
+/// ancestor), so the TS caller refuses a probe `true` unless it can also prove work exists. Its only
+/// other proof, `committedWorkSeen`, reads the WINDOW-LOCAL workflow state, which is resolved by the
+/// NAME `sparkle/agent-<id>` in the project root (beads sparkle-t58ekc / sparkle-9vptk0) and which a
+/// merged-then-deleted branch drives back to a bare cut's values — `ahead` 0, `pushed` false, no PR
+/// (bead sparkle-28ifhw). So exactly the agents whose work provably landed were refused
+/// `git-probe-unproven`.
+///
+/// The worktree's OWN `HEAD` reflog answers it from git alone: a linked worktree keeps a private HEAD
+/// log, every `git commit` made there appends a `commit…` entry naming the new sha, and if any such
+/// sha is an ancestor of origin/<default> then work AUTHORED HERE is on origin/<default>. That is
+/// strictly stronger than "work exists": a commit made and then `reset` away is not an ancestor and
+/// proves nothing. A SQUASH landing leaves no authored sha reachable, so it answers `Some(false)` —
+/// the same population the caller already routes to the concierge.
+fn authored_commit_landed(wt: &Path, remote_ref: &str) -> Option<(bool, Option<i64>)> {
+    let out = git_output(wt, &["log", "-g", "--format=%H%x09%ct%x09%gs", "HEAD"], PROBE_TIMEOUT).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut seen: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(sha), Some(ct), Some(subject)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        let sha = sha.trim();
+        if sha.is_empty() || !reflog_subject_is_authored(subject) || seen.contains(&sha) {
+            continue;
+        }
+        seen.push(sha);
+        if seen.len() > AUTHORED_SCAN_MAX {
+            break;
+        }
+        match git_output(wt, &["merge-base", "--is-ancestor", sha, remote_ref], PROBE_TIMEOUT) {
+            Ok(o) if o.status.success() => return Some((true, ct.trim().parse::<i64>().ok())),
+            Ok(o) if o.status.code() == Some(1) => continue,
+            // A sha the object store no longer holds (gc'd after a reset) is not an answer either
+            // way; skip it rather than failing the whole read.
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+    Some((false, None))
+}
+
+fn stdout_line(cwd: &Path, args: &[&str]) -> Option<String> {
+    match git_output(cwd, args, PROBE_TIMEOUT) {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!s.is_empty()).then_some(s)
+        }
+        _ => None,
     }
 }
 
@@ -148,6 +254,8 @@ pub fn landed_probe_in(worktree: &str, root: &str) -> LandedProbe {
     if head.is_empty() {
         return LandedProbe::unknown("git returned an empty HEAD sha");
     }
+    // Reported, never resolved through: `HEAD` (detached) carries no branch name worth printing.
+    let branch = stdout_line(wt, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD");
 
     let default = resolve_default_branch(root);
     if let Err(e) = validate_ref(&default) {
@@ -165,33 +273,63 @@ pub fn landed_probe_in(worktree: &str, root: &str) -> LandedProbe {
     // not refresh" is precisely the stale reading that told finished agents to go land merged work.
     let fetched = ok_status(wt, &["fetch", "--quiet", "origin", &default], FETCH_TIMEOUT);
 
-    if !ok_status(wt, &["rev-parse", "--verify", "--quiet", &remote_ref], PROBE_TIMEOUT) {
-        return LandedProbe::unknown(format!(
+    let Some(base_sha) = stdout_line(wt, &["rev-parse", "--verify", "--quiet", &remote_ref]) else {
+        let mut p = LandedProbe::unknown(format!(
             "{remote_ref} does not exist in this worktree, so there is nothing to compare against"
         ));
-    }
+        p.branch = branch;
+        p.head_sha = Some(head);
+        return p;
+    };
+
+    // Everything a refusal needs to NAME what was compared (bead sparkle-q4r8z2) is known from here
+    // on, whatever the verdict — so every return below carries it.
+    let mut probe = LandedProbe {
+        landed: None,
+        reason: String::new(),
+        branch,
+        head_sha: Some(head.clone()),
+        base_ref: Some(remote_ref.clone()),
+        base_sha: Some(base_sha.clone()),
+        authored_landed: None,
+        authored_landed_at: None,
+    };
 
     // RULE 4 — ancestry. Exit 0 = yes, exit 1 = no, anything else = we failed to ask.
     match git_output(wt, &["merge-base", "--is-ancestor", &head, &remote_ref], PROBE_TIMEOUT) {
         Ok(o) if o.status.success() => {
-            LandedProbe::yes(format!("{head} is an ancestor of {remote_ref}"))
+            // Only a POSITIVE needs the authored-work proof: a negative can only refuse.
+            if let Some((hit, at)) = authored_commit_landed(wt, &remote_ref) {
+                probe.authored_landed = Some(hit);
+                probe.authored_landed_at = at;
+            }
+            probe.reason = format!("{head} is an ancestor of {remote_ref} ({base_sha})");
+            probe.with_landed(Some(true))
         }
         Ok(o) if o.status.code() == Some(1) => {
             if fetched {
-                LandedProbe::no(format!("{head} is not an ancestor of {remote_ref}"))
+                probe.reason = format!("{head} is not an ancestor of {remote_ref} ({base_sha})");
+                probe.with_landed(Some(false))
             } else {
                 // RULE 5 — degrade a negative to "unknown" when the ref behind it is stale.
-                LandedProbe::unknown(format!(
-                    "{head} is not an ancestor of {remote_ref}, but the fetch that would have \
-                     refreshed that ref failed — so this is a stale reading, not a no"
-                ))
+                probe.reason = format!(
+                    "{head} is not an ancestor of {remote_ref} ({base_sha}), but the fetch that \
+                     would have refreshed that ref failed — so this is a stale reading, not a no"
+                );
+                probe
             }
         }
-        Ok(o) => LandedProbe::unknown(format!(
-            "git merge-base --is-ancestor exited {:?}, which is a failure to ask rather than a no",
-            o.status.code()
-        )),
-        Err(e) => LandedProbe::unknown(format!("git merge-base --is-ancestor failed: {e}")),
+        Ok(o) => {
+            probe.reason = format!(
+                "git merge-base --is-ancestor exited {:?}, which is a failure to ask rather than a no",
+                o.status.code()
+            );
+            probe
+        }
+        Err(e) => {
+            probe.reason = format!("git merge-base --is-ancestor failed: {e}");
+            probe
+        }
     }
 }
 
@@ -331,6 +469,116 @@ mod tests {
         let p = landed_probe_in(f.clone.to_str().unwrap(), f.clone.to_str().unwrap());
         assert_eq!(p.landed, Some(true), "reason: {}", p.reason);
         assert_compared_against_origin_main(&p);
+    }
+
+    fn rev(cwd: &Path, r: &str) -> String {
+        String::from_utf8_lossy(&fx(cwd, &["rev-parse", r]).stdout).trim().to_string()
+    }
+
+    /// A LINKED worktree cut from origin/main on branch `name` — the shape every agent runs in. Its
+    /// HEAD reflog is PRIVATE to it, which is what `authored_commit_landed` reads; the fixture's
+    /// main clone holds the `commit (initial)` entry and must not be the tree under test.
+    fn linked_worktree(f: &Fixture, name: &str) -> PathBuf {
+        let wt = f.dir.join(format!("wt-{name}"));
+        fx(&f.clone, &["fetch", "-q", "origin"]);
+        fx(&f.clone, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap(), "origin/main"]);
+        wt
+    }
+
+    fn commit_in(wt: &Path, file: &str) {
+        write(wt, file, "work\n");
+        fx(wt, &["add", "."]);
+        fx(wt, &["commit", "-q", "-m", file]);
+    }
+
+    /// sparkle-28ifhw / sparkle-t58ekc: the branch MERGED, its remote head never existed (or was
+    /// deleted), and the window-local reading — resolved by NAME — sees a bare cut. The probe must
+    /// prove from git alone that work AUTHORED HERE is on origin/main, and name what it compared.
+    #[test]
+    fn merged_feature_branch_proves_authored_work_landed_and_names_both_shas() {
+        let f = fixture("authored");
+        let wt = linked_worktree(&f, "feature/differently-named");
+        commit_in(&wt, "b.txt");
+        let head = rev(&wt, "HEAD");
+        // Land it with a MERGE COMMIT upstream (the PR shape), never pushing the topic branch.
+        fx(&f.clone, &["fetch", "-q", "origin"]);
+        fx(&f.clone, &["merge", "-q", "--no-ff", "-m", "merge pr", "feature/differently-named"]);
+        fx(&f.clone, &["push", "-q", "origin", "main"]);
+        let upstream_main = rev(&f.clone, "HEAD");
+
+        let p = landed_probe_in(wt.to_str().unwrap(), f.clone.to_str().unwrap());
+        assert_eq!(p.landed, Some(true), "reason: {}", p.reason);
+        assert_eq!(p.authored_landed, Some(true), "reason: {}", p.reason);
+        let ct: i64 = String::from_utf8_lossy(&fx(&wt, &["log", "-1", "--format=%ct", "HEAD"]).stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(p.authored_landed_at, Some(ct), "the newest authored commit's committer time");
+        assert_eq!(p.branch.as_deref(), Some("feature/differently-named"));
+        assert_eq!(p.head_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(p.base_ref.as_deref(), Some("refs/remotes/origin/main"));
+        // The RIGHT side is the REFRESHED ref — the merge commit, not the stale pre-merge main.
+        assert_eq!(p.base_sha.as_deref(), Some(upstream_main.as_str()));
+    }
+
+    /// THE OPPOSITE DIRECTION: a cut from origin/main that authored NOTHING satisfies ancestry
+    /// trivially. `landed` stays a pure ancestry answer, but `authored_landed` must be `false`, or
+    /// the caller would close a goal for an agent that wrote no code.
+    #[test]
+    fn a_bare_cut_is_an_ancestor_but_authored_nothing() {
+        let f = fixture("bare");
+        let wt = linked_worktree(&f, "noop");
+        let p = landed_probe_in(wt.to_str().unwrap(), f.clone.to_str().unwrap());
+        assert_eq!(p.landed, Some(true), "reason: {}", p.reason);
+        assert_eq!(p.authored_landed, Some(false), "reason: {}", p.reason);
+        assert_eq!(p.authored_landed_at, None);
+    }
+
+    /// Committed, then threw it away with a reset: HEAD is back on origin/main, the reflog still
+    /// names the commit — but that commit is NOT on origin/main, so nothing authored here landed.
+    #[test]
+    fn a_commit_reset_away_does_not_count_as_authored_landed() {
+        let f = fixture("reset");
+        let wt = linked_worktree(&f, "resetter");
+        commit_in(&wt, "b.txt");
+        fx(&wt, &["reset", "-q", "--hard", "origin/main"]);
+        let p = landed_probe_in(wt.to_str().unwrap(), f.clone.to_str().unwrap());
+        assert_eq!(p.landed, Some(true), "reason: {}", p.reason);
+        assert_eq!(p.authored_landed, Some(false), "reason: {}", p.reason);
+    }
+
+    /// A NEGATIVE must name what it compared too — that is the refusal sparkle-q4r8z2 is about.
+    #[test]
+    fn a_negative_still_names_the_branch_and_both_shas() {
+        let f = fixture("named-no");
+        let wt = linked_worktree(&f, "unlanded");
+        commit_in(&wt, "b.txt");
+        let p = landed_probe_in(wt.to_str().unwrap(), f.clone.to_str().unwrap());
+        assert_eq!(p.landed, Some(false), "reason: {}", p.reason);
+        assert_eq!(p.branch.as_deref(), Some("unlanded"));
+        assert_eq!(p.head_sha.as_deref(), Some(rev(&wt, "HEAD").as_str()));
+        assert_eq!(p.base_sha.as_deref(), Some(rev(&f.clone, "origin/main").as_str()));
+    }
+
+    #[test]
+    fn reflog_subjects_classify_authored_versus_moved() {
+        for yes in ["commit: x", "commit (amend): x", "commit (merge): x", "cherry-pick: x", "rebase (pick): x"] {
+            assert!(reflog_subject_is_authored(yes), "{yes}");
+        }
+        for no in ["checkout: moving from a to b", "reset: moving to origin/main", "pull: Fast-forward",
+                   "rebase (start): checkout origin/main", "rebase (finish): returning to refs/heads/x",
+                   "merge origin/main: Fast-forward"] {
+            assert!(!reflog_subject_is_authored(no), "{no}");
+        }
+    }
+
+    /// The JSON shape the TS reader parses. camelCase, and `None` crosses as `null` (sparkle-16y6h).
+    #[test]
+    fn serializes_camel_case_with_null_for_none() {
+        let v = serde_json::to_value(LandedProbe::unknown("x")).unwrap();
+        for k in ["landed", "branch", "headSha", "baseRef", "baseSha", "authoredLanded", "authoredLandedAt"] {
+            assert!(v.get(k).is_some_and(|x| x.is_null()), "{k} must be present and null: {v}");
+        }
     }
 
     #[test]

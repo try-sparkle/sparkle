@@ -40,7 +40,7 @@ import {
   type ExpiryDecision,
   type NoExpiryReason,
 } from "../engine/goalExpiry";
-import { awaitingCloseEvidenceFor, expiryProofFor } from "./agentGoalReading";
+import { awaitingCloseEvidenceFor, expiryProofFor, latchLandedGoalFromGit } from "./agentGoalReading";
 import type { WorkflowState } from "./branchStatus";
 import { hasUnmetGoal, type MergeAuthorityEvidence } from "../engine/agentGoal";
 // THE MERGE FLOOR, READ FROM THE ONE PLACE THAT OWNS IT. `MERGE_PROTECTED_SLUGS` is compiled into
@@ -1389,7 +1389,10 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
           const remedyKey = `${agent.id}:${decision.reason}:${goalFingerprint(agent.goal?.text)}`;
           if (!loggedRemedy.has(remedyKey)) {
             loggedRemedy.add(remedyKey);
-            log.info("goals", "goal is mis-specified", {
+            // Two classes carry a remedy now: a mis-specified goal, and a goal the AGENT parked as
+            // needing a person (engine/agentGoal `GoalPark`). The line must say which, or a park
+            // reads to whoever greps the log as a goal that needs rewriting.
+            log.info("goals", decision.reason === "goal-misspecified" ? "goal is mis-specified" : "goal is parked for a person", {
               agentId: agent.id,
               reason: decision.reason,
               remedy: decision.remedy,
@@ -1450,6 +1453,22 @@ async function continueAgent(
   outcome: SweepOutcome,
 ): Promise<void> {
   try {
+    // ── A LANDED GOAL GIT ALREADY CONSIDERS MET IS LATCHED, NOT RESUMED (sparkle-aqd0xp et al.) ──
+    // The only other writer of `metAt` for a `{kind:"landed"}` goal is the agent's own
+    // `set_agent_goal_met`, so a finished agent that was refused, killed or simply never made the
+    // call was resumed on a goal git already answered, up to the per-goal ceiling and a false
+    // escalation. Asked HERE — one probe, only when a continue is about to be spent — because the
+    // sweep's own readers are window-local by contract and must not shell git per agent per tick.
+    // `latchLandedGoalFromGit` owns the proof (HEAD on origin/<default> AND a commit authored in this
+    // worktree, no older than the goal, is there); any doubt answers false and the continue proceeds
+    // exactly as before.
+    if (agent.goal?.verify?.kind === "landed" && (await latchLandedGoalFromGit(agent.id))) {
+      outcome.action = "none";
+      outcome.detail = "goal-latched-from-git";
+      outcome.sent = false;
+      log.info("goals", "latched a landed goal met from git instead of resuming", { agentId: agent.id });
+      return;
+    }
     const result = await dispatchConciergeAnswer(agent.id, prompt, {
       authority: { kind: "goal-continue", agentId: agent.id },
       userPrompt: false,

@@ -284,6 +284,19 @@ describe("pollConflictFlags", () => {
     expect(useConflictStore.getState().flags).toBeUndefined();
   });
 
+  // A project holding tracked PRs whose checkout has NO git remote (bead sparkle-5i7e8x.4): those
+  // PRs were not re-read, so an empty list is still not an all-clear — but it is not a GitHub
+  // failure either, so it arrives under its own count rather than in `unreadable`.
+  it("does not read an empty list as an all-clear while a remoteless project holds tracked PRs", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === CONFLICT_PROBE_STATUS_COMMAND
+        ? Promise.resolve({ everProbed: true, repos: 12, unreadable: 0, notReached: 0, noRemote: 1, lastFullReadMs: 0 })
+        : Promise.resolve([]),
+    );
+    await expect(pollConflictFlags()).resolves.toBe(false);
+    expect(useConflictStore.getState().flags).toBeUndefined();
+  });
+
   it("accepts an empty list once every repo was reached and read", async () => {
     invoke.mockImplementation((cmd: string) =>
       cmd === CONFLICT_PROBE_STATUS_COMMAND

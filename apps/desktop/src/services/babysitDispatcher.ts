@@ -93,6 +93,64 @@ export const BABYSIT_LEASE_RELEASE_COMMAND = "babysit_lease_release";
  */
 export const BABYSIT_LEASE_HEARTBEAT_COMMAND = "babysit_lease_heartbeat";
 
+/**
+ * DOES THE TARGET REPO PROVIDE `/babysit-pr` AT ALL? (bead `sparkle-5i7e8x.5`)
+ *
+ * The brief is a slash command, and the skill lives in the SPARKLE repo. Swept into a repo that
+ * does not carry it, claude prints `Unknown command: /babysit-pr` and idles — measured: eight such
+ * drivers in one foreign repo, every one silent for 100+ minutes, each holding an agent slot and
+ * each reading to every later sweep as "this PR already has a driver".
+ *
+ * ONLY AN AFFIRMATIVE `available: false` HOLDS. The reply is the Rust `SkillAvailability`, whose
+ * `available` is `Option<bool>` and so crosses the wire as `true | false | null`; `null`, a failed
+ * call and any shape this file does not recognise all mean "could not tell", and those DISPATCH as
+ * before. That is deliberate: this module's history is a sweep muted silently by an unknown, and an
+ * inert driver costs one slot while a muted sweep costs every PR. The skip path (rather than
+ * rewriting the brief inline) is what the bead's first-listed option asks for — refuse to spawn
+ * rather than spawn something inert — and it keeps the skill the ONE definition of a pass.
+ */
+export const BABYSIT_SKILL_AVAILABLE_COMMAND = "babysit_skill_available";
+export const BABYSIT_HOLD_SKILL_MISSING = "skill-missing";
+/** Projects already warned about, so the warn fires on the transition rather than every 180 s. */
+const skillMissingWarned = new Set<string>();
+
+interface SkillAvailabilityWire {
+  available?: boolean | null;
+  foundAt?: string | null;
+  checked?: string[] | null;
+  error?: string | null;
+}
+
+/** `false` only on an affirmative absence; `true` for found AND for every unknown — see above. */
+async function babysitSkillUsable(project: Project): Promise<boolean> {
+  let reply: SkillAvailabilityWire | null | undefined;
+  try {
+    reply = await invoke<SkillAvailabilityWire | null>(BABYSIT_SKILL_AVAILABLE_COMMAND, {
+      projectRoot: project.rootPath,
+    });
+  } catch (e) {
+    log.debug("babysit", "could not ask whether /babysit-pr exists; dispatching as before", {
+      project: project.id,
+      error: String(e),
+    });
+    return true;
+  }
+  if (reply?.available !== false) {
+    if (reply?.available === true) skillMissingWarned.delete(project.id);
+    return true;
+  }
+  if (!skillMissingWarned.has(project.id)) {
+    skillMissingWarned.add(project.id);
+    log.warn("babysit", "not dispatching: this repo does not provide the /babysit-pr skill, so a driver would be inert", {
+      project: project.id,
+      name: project.name,
+      checked: reply.checked ?? [],
+      remedy: "install .claude/skills/babysit-pr/SKILL.md in this repo or under ~/.claude/skills, or babysit by hand",
+    });
+  }
+  return false;
+}
+
 /** MUST match `REASON_HELD_LIVE` in `babysit_lease.rs` — the ONE refusal that is not a bug. */
 export const BABYSIT_LEASE_REASON_HELD_LIVE = "held-live";
 
@@ -781,6 +839,8 @@ export async function babysitSweepProject(
   const reviewPolicy = await readReviewPolicy(project.rootPath);
 
   const leases = await readLeases();
+  /** Asked lazily, once per sweep — see `babysitSkillUsable`. */
+  let skillUsable: boolean | undefined;
 
   for (const pr of prs) {
     // THE FENCE. Checked before every PR's writes rather than once at the top, because the awaits
@@ -990,6 +1050,20 @@ export async function babysitSweepProject(
       }
 
       lastObservation.set(k, { evidenceIds: babysitEvidenceIds(decision.evidence) });
+      // ── ASKED HERE, AFTER THE DECISION AND BEFORE THE ACQUIRE ──────────────────────────────────
+      // Once per sweep, and only when something actually wants a driver — most sweeps dispatch
+      // nothing, and they should not pay a filesystem round-trip to learn it. Before the acquire so
+      // a hold takes no lease at all. NOT a refusal: the streak is reset like any other decision,
+      // because "this repo cannot run the brief" is an answer, and WEDGED means "wanted a driver and
+      // the fleet would not give one" — a different fact with a different remedy.
+      skillUsable ??= await babysitSkillUsable(project);
+      if (!skillUsable) {
+        hold(BABYSIT_HOLD_SKILL_MISSING);
+        clocks.refusalStreak = 0;
+        continue;
+      }
+      // No fence after that await: `dispatchOne` checks `isCurrent()` after its acquire and before
+      // the spawn, which is the last cancellable instant and already covers this one.
       const agentId = await dispatchOne(project, repo, pr.number, now, isCurrent);
       // NO FENCE HERE, DELIBERATELY (roborev 58537). There WAS one, and it was strictly permissive in
       // the two directions this module says matter most, because neither write below is a stale-clock
@@ -1352,6 +1426,7 @@ export async function sweepAllProjects(
 /** Test seam: forget every remembered observation and dispatch. */
 export function _resetBabysitDispatcherForTests(): void {
   lastGate.clear();
+  skillMissingWarned.clear();
   sweepStartedAt = null;
   sweepGeneration = 0;
   lastObservation.clear();

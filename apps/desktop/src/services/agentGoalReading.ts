@@ -339,7 +339,7 @@ export function goalMetAndLanded(agentId: string, goal: AgentGoal | undefined): 
 
 /** Has this branch AUTHORED anything at all? — the no-op guard a raw ancestry check cannot carry.
  *
- *  `probeLandedFromGit` asks one question: is this worktree's CURRENT HEAD reachable from
+ *  `probeLandedDetailFromGit` asks one question: is this worktree's CURRENT HEAD reachable from
  *  origin/<default>. For a branch cut from origin/main whose agent has committed nothing — or that
  *  holds only uncommitted edits — the honest answer to that question is YES, trivially, because its
  *  HEAD *is* origin/main's HEAD. Ancestry is therefore not sufficient to close a `landed` goal: it
@@ -380,7 +380,49 @@ export function authoredWorkSeen(agentId: string): boolean {
 interface LandedProbeReply {
   landed?: boolean | null;
   reason?: string | null;
+  branch?: string | null;
+  headSha?: string | null;
+  baseRef?: string | null;
+  baseSha?: string | null;
+  authoredLanded?: boolean | null;
+  authoredLandedAt?: number | null;
 }
+
+/**
+ * The probe's answer with everything it compared — `undefined` on any field means "could not tell".
+ *
+ * `branch` / `headSha` / `baseRef` / `baseSha` exist so a refusal can NAME what was measured (bead
+ * sparkle-q4r8z2): "not on origin/main" with no branch and no shas is undiagnosable from outside, and
+ * agents burned repeated attempts guessing which branch the app had looked at.
+ *
+ * `authoredLanded` is git's own proof that work AUTHORED IN THIS WORKTREE is on origin/<default>
+ * (`goal_landed_probe.rs::authored_commit_landed`, read from the worktree's private HEAD reflog). It
+ * is the no-op guard for a probe `true` that does not depend on the window-local workflow state —
+ * which is resolved by branch NAME and reads a merged-then-deleted branch as a bare cut.
+ */
+export interface LandedProbeDetail {
+  landed: boolean | undefined;
+  authoredLanded: boolean | undefined;
+  /** Committer time, unix SECONDS, of the newest authored commit found on origin/<default>. */
+  authoredLandedAt: number | undefined;
+  branch: string | undefined;
+  headSha: string | undefined;
+  baseRef: string | undefined;
+  baseSha: string | undefined;
+}
+
+const NO_PROBE_DETAIL: LandedProbeDetail = {
+  landed: undefined,
+  authoredLanded: undefined,
+  authoredLandedAt: undefined,
+  branch: undefined,
+  headSha: undefined,
+  baseRef: undefined,
+  baseSha: undefined,
+};
+
+const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v : undefined);
+const bool = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
 
 /** Hard ceiling on the whole probe, JS side. Rust already bounds each subprocess (5s local, 10s for
  *  the one fetch), so this is the backstop for the IPC itself hanging — the seam it guards is an
@@ -421,7 +463,9 @@ const LANDED_PROBE_TIMEOUT_MS = 30_000;
  * said on behalf of a git that never ran (sparkle-2668a7). So an error path answering `false` would
  * not merely be wrong, it would launder itself into git's verdict.
  */
-export async function probeLandedFromGit(agentId: string): Promise<boolean | undefined> {
+// It returns everything the probe compared — see {@link LandedProbeDetail} — and `.landed` is the
+// verdict. Every failure path answers all-`undefined`, never `false`.
+export async function probeLandedDetailFromGit(agentId: string): Promise<LandedProbeDetail> {
   // Resolve BOTH halves from the roster row: the agent's own worktree (where HEAD is read) and the
   // project's main checkout (where the default branch NAME is resolved). The Rust side declines
   // outright without a root — see `landed_probe_in` for why guessing it can silently turn "have I
@@ -436,7 +480,7 @@ export async function probeLandedFromGit(agentId: string): Promise<boolean | und
       break;
     }
   }
-  if (!worktree || !root) return undefined;
+  if (!worktree || !root) return NO_PROBE_DETAIL;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const reply = await Promise.race([
@@ -445,15 +489,80 @@ export async function probeLandedFromGit(agentId: string): Promise<boolean | und
         timer = setTimeout(() => resolve(undefined), LANDED_PROBE_TIMEOUT_MS);
       }),
     ]);
-    const landed = reply?.landed;
-    return typeof landed === "boolean" ? landed : undefined;
+    if (reply === undefined || reply === null || typeof reply !== "object") return NO_PROBE_DETAIL;
+    return {
+      landed: bool(reply.landed),
+      authoredLanded: bool(reply.authoredLanded),
+      authoredLandedAt:
+        typeof reply.authoredLandedAt === "number" && Number.isFinite(reply.authoredLandedAt)
+          ? reply.authoredLandedAt
+          : undefined,
+      branch: str(reply.branch),
+      headSha: str(reply.headSha),
+      baseRef: str(reply.baseRef),
+      baseSha: str(reply.baseSha),
+    };
   } catch {
     // An unregistered command, a dead worktree, a panicking probe — all "we could not tell". The
     // caller's copy for that is "your branch's git state has not been read yet", which is true.
-    return undefined;
+    return NO_PROBE_DETAIL;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+/**
+ * LATCH A `{kind:"landed"}` GOAL MET FROM GIT, WITHOUT THE AGENT (sparkle-aqd0xp, sparkle-v22kuv,
+ * sparkle-si8y1p, sparkle-gj72lg, sparkle-7go8pn, sparkle-fiyfrn). Answers whether it latched.
+ *
+ * Until this existed, the ONLY writer of `metAt` for a landed goal was the agent's own
+ * `set_agent_goal_met`. So an agent that had finished — and was refused, or killed, or simply never
+ * made the call — was auto-continued on a goal git already considered met, until the per-goal ceiling
+ * escalated a false alarm to a human. A `{kind:"landed"}` goal is DEFINED as closable on git's answer
+ * rather than the agent's, so nothing about the agent needs to be in the loop.
+ *
+ * THE SAME PROOF THE SELF-MARK SEAM ACCEPTS, AND STRICTER: the live probe (rule-bound in
+ * `goal_landed_probe.rs`: worktree HEAD, refreshed `refs/remotes/origin/<default>`, ancestry) must say
+ * HEAD is on origin/<default> AND that a commit AUTHORED IN THIS WORKTREE is there — and, because
+ * nothing here asked the agent whether it is done, that commit must be NO OLDER THAN THE GOAL. A
+ * re-tasked agent whose HEAD still sits on its previous merged PR satisfies the first two and not the
+ * third. Any blank answer refuses; so do uncommitted edits the window can see.
+ *
+ * COST: one probe, so it must only be called where one resume is about to be spent — never from a
+ * per-tick, per-agent reader (see {@link probeLandedDetailFromGit}).
+ */
+export async function latchLandedGoalFromGit(agentId: string): Promise<boolean> {
+  const before = findGoalOwner(agentId);
+  if (before === undefined) return false;
+  const { goal } = before;
+  if (goal.verify?.kind !== "landed" || goal.metAt !== undefined) return false;
+  if (stallEvidenceFor(agentId).hasUncommittedChanges === true) return false;
+  const d = await probeLandedDetailFromGit(agentId);
+  if (d.landed !== true || d.authoredLanded !== true || d.authoredLandedAt === undefined) return false;
+  // Git's clock is whole SECONDS; floor the goal's ms the same way so a commit made in the same second
+  // the goal was set is not refused by sub-second truncation.
+  if (d.authoredLandedAt < Math.floor(goal.setAt / 1000)) return false;
+  // THE GOAL MAY HAVE MOVED DURING THE PROBE (a fetch can take seconds). Latch only the goal that was
+  // judged: same `setAt`, still unmet, still `landed`.
+  const after = findGoalOwner(agentId);
+  if (
+    after === undefined ||
+    after.goal.setAt !== goal.setAt ||
+    after.goal.metAt !== undefined ||
+    after.goal.verify?.kind !== "landed"
+  ) {
+    return false;
+  }
+  useProjectStore.getState().setAgentGoalMet(after.projectId, agentId, true);
+  return true;
+}
+
+function findGoalOwner(agentId: string): { projectId: string; goal: AgentGoal } | undefined {
+  for (const p of useProjectStore.getState().projects) {
+    const a = p.agents.find((x) => x.id === agentId);
+    if (a) return a.goal ? { projectId: p.id, goal: a.goal } : undefined;
+  }
+  return undefined;
 }
 
 /**

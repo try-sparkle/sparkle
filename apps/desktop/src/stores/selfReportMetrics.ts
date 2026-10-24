@@ -32,6 +32,9 @@ export type ControlOp =
   // myself" somewhere the concierge can see it. See services/mergeGuard/types.ts for the incident.
   | "set_agent_goal"
   | "set_agent_goal_met"
+  // The agent's own "the ladder cannot move this goal" (engine/agentGoal `GoalPark`). Op name only —
+  // never the reason or ref, which name the caller's real work.
+  | "set_agent_goal_parked"
   // WHERE AN AGENT'S WORK ACTUALLY LANDED, when that is a repository other than the one its project
   // is bound to (bead `sparkle-pgh1ue`). The op NAME only — never the repo, the PR number or the
   // note, all of which name the caller's real work and, for a cross-repo agent, a repository this
@@ -114,6 +117,7 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   set_agent_landed: 0,
   set_agent_goal: 0,
   set_agent_goal_met: 0,
+  set_agent_goal_parked: 0,
   set_agent_escalation: 0,
   claim_pr: 0,
   release_pr: 0,

@@ -221,6 +221,16 @@ async function sweptSomething(): Promise<boolean> {
     });
     return false;
   }
+  // A remoteless project still holding tracked PRs (bead sparkle-5i7e8x.4): those PRs were not
+  // re-read either. Local repo config, not a GitHub failure — but still not an all-clear. Absent on
+  // an older backend, which probed such a project and counted it in `unreadable` above.
+  const noRemote = s["noRemote"];
+  if (noRemote !== undefined && (typeof noRemote !== "number" || noRemote > 0)) {
+    log.debug("conflict", "a project with tracked PRs has no git remote; an empty list is not an all-clear", {
+      noRemote,
+    });
+    return false;
+  }
   return true;
 }
 

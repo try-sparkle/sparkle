@@ -228,7 +228,83 @@ export interface AgentGoal {
    *  sentence a person can see and fix, and the cost of refreshing a non-copy is losing what they
    *  wrote — which is the failure this whole feature is trying not to commit. */
   fromEpicGoalAt?: number;
+  /** The agent's own declaration that this goal is one the resume ladder cannot move — see
+   *  {@link GoalPark} and {@link parkGoal}. Absent on every goal that never parked, which is every
+   *  goal persisted before this field: absence means "resume as usual", the safe direction. */
+  park?: GoalPark;
+  /** `waiting-on` parks spent on this goal, bounded by {@link MAX_WAIT_PARKS}. Read as `?? 0` at
+   *  both the compare and the write — the same `ttlRearms` rule above, for the same reason. An
+   *  un-park does NOT refill it: the agent is the party this bound defends against. */
+  waitParks?: number;
 }
+
+/**
+ * THE THREE SHAPES OF "THE LADDER CANNOT MOVE THIS GOAL", as the agent itself declares them
+ * (epic `sparkle-5i7e8x`).
+ *
+ * WHY THE AGENT DECLARES IT. Every shape below was measured re-firing to the 20-continue ceiling,
+ * re-billing the whole context each time, then paging a human with a false alarm — and in every one
+ * the AGENT KNEW, and said so in prose nothing reads:
+ *
+ *   • `awaiting-human` — its part is done and only a person can act: a `{kind:"human"}` goal it is
+ *     refused permission to close (`goal_not_self_markable`), a deployment whose every remaining step
+ *     is founder-owned, a plan-mode research goal whose answer is delivered but whose
+ *     `set_agent_goal_met` plan mode refuses. Not resumed; the blocker is surfaced to the human.
+ *   • `superseded` — another lineage already delivered it (a sibling commit, a peer's PR). Requires
+ *     a `ref` naming what did, so "someone else did it" is checkable rather than asserted. Not resumed.
+ *   • `waiting-on` — an external clock: a worker's 40-minute verify, a CI run on a PR that is not on
+ *     this agent's own branch (the open-PR gate cannot see that one). Requires `until`; the ladder
+ *     resumes the moment it passes and names the gate back in the banner.
+ *
+ * WHAT KEEPS THIS FROM BECOMING A HOLE IN THE LADDER. A genuinely stalled agent emits nothing, so it
+ * never parks — the park can only be set by an agent that is awake and choosing to stand down. The
+ * timed kind is bounded twice ({@link MAX_GOAL_WAIT_PARK_MS} per park, {@link MAX_WAIT_PARKS} per
+ * goal), the untimed kinds are bounded by the goal's own TTL, and a NEW goal never inherits a park
+ * (it is not part of {@link GoalDebt}). And it closes nothing: `metAt` is untouched, so a parked
+ * goal is still the person's to close — which is why it is reversible and plan-mode-safe where
+ * `set_agent_goal_met` is not.
+ */
+export type GoalParkKind = "awaiting-human" | "superseded" | "waiting-on";
+
+export interface GoalPark {
+  kind: GoalParkKind;
+  /** One sentence for the human: what is blocking, or what delivered it. */
+  reason: string;
+  /** The commit / PR / worker the park is about. Required for `superseded`. */
+  ref?: string;
+  /** Epoch ms the park was set. */
+  at: number;
+  /** Epoch ms a `waiting-on` park lapses. Only present on that kind. */
+  until?: number;
+}
+
+/** The longest one `waiting-on` park may run. Two hours: above a worker's full build-and-verify on a
+ *  contended box (20-60 min measured, bead `sparkle-1n6o5u`) and below `DEFAULT_GOAL_TTL_MS`, so a
+ *  park can never outlive the goal it belongs to. The same pinning `IN_MOTION_GRACE_MS` uses. */
+export const MAX_GOAL_WAIT_PARK_MS = 2 * 60 * 60_000;
+
+/** `waiting-on` parks allowed on one goal. Three × two hours already exceeds the TTL, so this is the
+ *  bound that matters only for an agent re-parking in short increments — the loop shape. */
+export const MAX_WAIT_PARKS = 3;
+
+/** Longest `reason` kept. The reason is quoted to a human, not stored as a log. */
+const MAX_PARK_REASON = 500;
+
+export type ParkRequest = { kind: GoalParkKind; reason: string; ref?: string; untilMs?: number };
+
+export type ParkResult =
+  | { ok: true; goal: AgentGoal }
+  | {
+      ok: false;
+      code:
+        | "goal_not_parkable"
+        | "park_needs_reason"
+        | "park_needs_ref"
+        | "park_needs_until"
+        | "park_too_long"
+        | "park_budget_spent";
+      message: string;
+    };
 
 /** Where a goal is in its life. `none` is the absence of a goal, kept in the union so every
  *  consumer branches over one exhaustive vocabulary rather than juggling `undefined`. */
@@ -847,6 +923,86 @@ export function markGoalMet(goal: AgentGoal, now: number): AgentGoal {
   return { ...goal, metAt: now };
 }
 
+/**
+ * Park the goal — the agent's declaration that the ladder cannot move it. See {@link GoalPark}.
+ *
+ * Refuses rather than clamps, and says why, because the caller is a model that will read the code
+ * and the sentence: a silently shortened `until` would leave it believing it is parked past a time
+ * at which it is in fact resumed.
+ *
+ * Only an `unmet` goal parks. A met, discharged or expired goal is not being resumed anyway, and an
+ * ESCALATED one already belongs to a person — re-labelling it would overwrite the record of why.
+ */
+export function parkGoal(goal: AgentGoal | undefined, req: ParkRequest, now: number): ParkResult {
+  if (goal === undefined || baseGoalStateOf(goal, now) !== "unmet") {
+    return {
+      ok: false,
+      code: "goal_not_parkable",
+      message: "Only a live, unmet goal can be parked — this one is absent, met, expired or already with a human.",
+    };
+  }
+  const reason = req.reason.trim().slice(0, MAX_PARK_REASON);
+  if (reason === "") {
+    return { ok: false, code: "park_needs_reason", message: "Say in one sentence what is blocking, or what delivered it." };
+  }
+  const ref = req.ref?.trim() || undefined;
+  if (req.kind === "superseded" && ref === undefined) {
+    return {
+      ok: false,
+      code: "park_needs_ref",
+      message: "A superseded park must name what delivered the goal — a commit sha or a PR number — in `ref`.",
+    };
+  }
+  if (req.kind !== "waiting-on") {
+    return { ok: true, goal: { ...goal, park: { kind: req.kind, reason, ...(ref ? { ref } : {}), at: now } } };
+  }
+  const until = req.untilMs;
+  if (typeof until !== "number" || !Number.isFinite(until) || until <= now) {
+    return {
+      ok: false,
+      code: "park_needs_until",
+      message: "A waiting-on park needs `untilMs` — an epoch-ms time in the future at which to resume you.",
+    };
+  }
+  if (until - now > MAX_GOAL_WAIT_PARK_MS) {
+    return {
+      ok: false,
+      code: "park_too_long",
+      message: `A waiting-on park may run at most ${MAX_GOAL_WAIT_PARK_MS / 60_000} minutes; park again when it lapses.`,
+    };
+  }
+  const spent = goal.waitParks ?? 0;
+  if (spent >= MAX_WAIT_PARKS) {
+    return {
+      ok: false,
+      code: "park_budget_spent",
+      message:
+        `This goal has used all ${MAX_WAIT_PARKS} waiting-on parks. If a person must act, park it ` +
+        `awaiting-human instead and name what you need.`,
+    };
+  }
+  return {
+    ok: true,
+    goal: { ...goal, waitParks: spent + 1, park: { kind: "waiting-on", reason, ...(ref ? { ref } : {}), at: now, until } },
+  };
+}
+
+/** Lift a park — the agent is back on the ladder. Leaves {@link AgentGoal.waitParks} spent. */
+export function unparkGoal(goal: AgentGoal): AgentGoal {
+  if (goal.park === undefined) return goal;
+  const { park: _p, ...rest } = goal;
+  return rest;
+}
+
+/** The park that is IN FORCE at `now`, or undefined. A `waiting-on` park whose `until` has passed is
+ *  not in force — that lapse is what guarantees a timed park can never strand an agent. */
+export function activeParkOf(goal: AgentGoal | undefined, now: number): GoalPark | undefined {
+  const park = goal?.park;
+  if (park === undefined) return undefined;
+  if (park.kind === "waiting-on" && !(typeof park.until === "number" && now < park.until)) return undefined;
+  return park;
+}
+
 /** Record that an auto-continue was just spent, against the mark it was spent at.
  *
  *  If the mark MOVED since the last continue the agent did something in between, so the consecutive
@@ -1062,6 +1218,10 @@ export function resetGoalRetries(goal: AgentGoal): AgentGoal {
     conciergeRearms: _cr,
     conciergeRearmedAt: _cra,
     conciergeRearmReason: _crr,
+    // An agent's park goes too: a human who released this row wants it working again, and a stale
+    // `awaiting-human` would leave their own release silently inert.
+    park: _pk,
+    waitParks: _wp,
     ...rest
   } = goal;
   // ⚠️ `rearmedAt` and `ttlMs` SURVIVE, and dropping them would be a regression rather than a

@@ -30,7 +30,9 @@ import {
   AWAITING_CLOSE_STATE,
   type AgentGoal,
   type AwaitingCloseEvidence,
+  type GoalPark,
   type MergeAuthorityEvidence,
+  activeParkOf,
   goalStateOf,
   unsatisfiableGoalRemedy,
 } from "./agentGoal";
@@ -41,6 +43,7 @@ import {
 // would achieve nothing. See the gate order in `decideContinuation`.
 import { RESUME_PROMPT_MARKER } from "./agentOriginated";
 import { type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
+import { agentClosableKind } from "@sparkle/core";
 // NOTE: this module deliberately does NOT import `CLOUD_MIN_START_CENTS`. It used to, to alias
 // CLOUD_MIN_CONTINUE_CENTS to it — and that alias was the last route by which the START bar could
 // reach a RESUME decision. The two floors answer different questions and the server states them
@@ -213,7 +216,23 @@ export type NoContinueReason =
    * The reason is carried out of this module alongside {@link ContinuationDecision}'s `remedy`,
    * which is the sentence that says so.
    */
-  | "goal-misspecified";
+  | "goal-misspecified"
+  /**
+   * THE AGENT PARKED ITS GOAL — `agentGoal.GoalPark`, epic `sparkle-5i7e8x`. One reason per kind,
+   * because the three say different things to whoever reads them out:
+   *
+   *   • `goal-awaiting-human` — its part is done and a PERSON must act. Carries a remedy naming the
+   *     blocker, which is how the row is surfaced to the human instead of being resumed at them.
+   *   • `goal-superseded` — another lineage delivered it. Carries a remedy naming the ref.
+   *   • `goal-waiting-on` — an external clock the agent named, still running. No remedy: it lifts
+   *     itself at `until`, so there is nothing for a person to do.
+   *
+   * Like `goal-misspecified`, NEITHER continued NOR escalated: the bounds never fire on a parked
+   * goal, because a park is the one case where an unmoving mark is the agent telling us the truth.
+   */
+  | "goal-awaiting-human"
+  | "goal-superseded"
+  | "goal-waiting-on";
 
 export type ContinuationDecision =
   | { action: "continue"; prompt: string; attempt: number }
@@ -613,6 +632,16 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
     return { action: "none", reason: "goal-misspecified", remedy: misspecified };
   }
 
+  // ══ THE AGENT PARKED ITS GOAL (epic `sparkle-5i7e8x`) ═══════════════════════════════════════════
+  // Same placement argument as the two gates above: a fact about the GOAL, so it is asked ahead of
+  // every status gate (its reason is the informative one) and ahead of the BOUNDS (below them it
+  // would be reached only after the ceiling had already spent twenty resumes and paged a human,
+  // which is the measured failure verbatim). A `waiting-on` park whose `until` has passed is not
+  // in force — `activeParkOf` drops it — so it falls through and the ordinary resume fires, with
+  // the banner naming the gate back (see `continuePrompt`).
+  const park = activeParkOf(live, now);
+  if (park !== undefined) return parkDecision(park);
+
   // `idle` OR `unmerged`. Not `waiting`/`approval`/`blocked`/`errored` — those are the red tier,
   // where the agent is genuinely stuck on the human and typing an unrelated "continue" would answer
   // a question it never read. Not `done`/`stopped` either: the process is gone, so there is no turn
@@ -830,6 +859,32 @@ function staleGateReason(goalText: string, input: ContinuationInput): string {
   );
 }
 
+/** The `none` decision for a park in force. Remedies only on the kinds a PERSON has to act on — a
+ *  `waiting-on` park lifts itself, and a remedy there would be a log line every sweep saying so. */
+function parkDecision(park: GoalPark): ContinuationDecision {
+  const ref = park.ref === undefined ? "" : ` (${park.ref})`;
+  switch (park.kind) {
+    case "awaiting-human":
+      return {
+        action: "none",
+        reason: "goal-awaiting-human",
+        remedy:
+          `The agent reports its part is done and a person must act${ref}: "${park.reason}". ` +
+          `Sparkle will not resume it — close the goal, or give the agent its next step.`,
+      };
+    case "superseded":
+      return {
+        action: "none",
+        reason: "goal-superseded",
+        remedy:
+          `The agent reports this goal was already delivered elsewhere${ref}: "${park.reason}". ` +
+          `Sparkle will not resume it — confirm and close the goal, or give the agent new work.`,
+      };
+    case "waiting-on":
+      return { action: "none", reason: "goal-waiting-on" };
+  }
+}
+
 /** The resting statuses an auto-continue may act on. See the note at the `not-idle` gate for why
  *  `unmerged` belongs here and the red tier does not. */
 function isRestingStatus(status: AgentTabStatus): boolean {
@@ -957,6 +1012,7 @@ export function continuePrompt(
     `${RESUME_PROMPT_MARKER} automatically. ` +
     `Do not stop to acknowledge this — pick up exactly where you left off and keep working.\n\n` +
     `GOAL: ${goal.text}\n\n` +
+    lapsedParkLine(goal) +
     repeatedResumeLine(attempt, externalWait, markBlind) +
     // NAME THE OP THAT EXISTS. This said `set_agent_goal with met: true`, which cannot work:
     // `set_agent_goal`'s schema is `{ targetAgentId?, goal, ttlMs? }` — there is no `met`, and
@@ -966,9 +1022,51 @@ export function continuePrompt(
     // resumed, and burned continues until the bound escalated to a human with a false "still
     // unmet" — the exact outcome this prompt exists to prevent. `set_agent_goal_met` is the op;
     // no `targetAgentId`, which agents are not offered.
+    exitLine(goal)
+  );
+}
+
+/**
+ * HOW TO STOP, said truthfully for THIS goal's check (bead `sparkle-ndmgv3`, `-0vp0xm`, `-7ynzky`).
+ *
+ * A goal whose check a person or a command owns REFUSES `set_agent_goal_met` with
+ * `goal_not_self_markable` — so telling that agent to self-mark is a dead instruction, and the
+ * agent that obeys it is refused, resumed, refused, until the ceiling pages a human. Its real exit
+ * is the park: `awaiting-human` stops the ladder and surfaces it to the person who owns the close.
+ * The park is offered to every goal, because `superseded` and `waiting-on` are true of any of them.
+ */
+function exitLine(goal: AgentGoal): string {
+  const park =
+    `If you cannot move it, PARK it so you stop being resumed (sparkle-control: ` +
+    `set_agent_goal_parked) — kind "awaiting-human" when only a person can act (name what you ` +
+    `need), "superseded" with a ref when another commit or PR already delivered it, or ` +
+    `"waiting-on" with untilMs when you are waiting on a clock (a worker's run, a CI queue).`;
+  if (goal.verify !== undefined && !agentClosableKind(goal.verify.kind)) {
+    return (
+      `This goal's check is owned by a ${goal.verify.kind === "human" ? "person" : "named command"}, ` +
+      `so you may NOT mark it met yourself (set_agent_goal_met is refused). When your part is done, ` +
+      `say so and park it awaiting-human. ` +
+      park
+    );
+  }
+  return (
     `If the goal IS in fact met, say so and mark it met (sparkle-control: set_agent_goal_met with ` +
-    `met: true) so you stop being resumed. If you are blocked on something only the human can ` +
-    `resolve, say what you need — do not sit idle.`
+    `met: true) so you stop being resumed. ` +
+    park +
+    ` Do not sit idle.`
+  );
+}
+
+/** The paragraph that names a LAPSED `waiting-on` park back to the agent (bead `sparkle-1n6o5u`:
+ *  "the nudge text should name the gate back instead of asking it to self-classify"). Present only
+ *  when one exists — an in-force park never reaches a resume, so a park on a resumed goal has lapsed. */
+function lapsedParkLine(goal: AgentGoal): string {
+  const park = goal.park;
+  if (park?.kind !== "waiting-on") return "";
+  const ref = park.ref === undefined ? "" : ` (${park.ref})`;
+  return (
+    `You parked this goal waiting on "${park.reason}"${ref}, and the time you gave has passed. ` +
+    `Check it now: if it has answered, carry on; if it is still pending, park again.\n\n`
   );
 }
 

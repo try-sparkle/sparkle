@@ -88,6 +88,8 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         // Intent signals (services/mergeGuard). The op NAME only — never the goal text or the
         // claim note, both of which are free text an agent wrote.
         "set_agent_goal", "set_agent_goal_met", "claim_pr", "release_pr",
+        // The goal park — the op name only, never its reason or ref (epic sparkle-5i7e8x).
+        "set_agent_goal_parked",
         // Where an agent's work landed, when that is another repository (bead `sparkle-pgh1ue`).
         // Same rule and it matters as much as the Chief entry above: the payload names a repository,
         // a PR number and a free-text note — for a cross-repo agent that repo name IS the

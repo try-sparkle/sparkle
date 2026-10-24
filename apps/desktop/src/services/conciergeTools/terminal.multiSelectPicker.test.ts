@@ -73,14 +73,24 @@ const scrollbackMock = vi.mocked(getAgentScrollback);
 const writeMock = vi.mocked(writePtyChainedStrict);
 
 /**
+ * How the widget treats a DIGIT. Two Claude Code builds have been measured, and they disagree:
+ *   • `"inert"`  — the sparkle-xkf6yl field report above: a digit does nothing.
+ *   • `"toggle"` — Claude Code 2.1.310, measured 2026-10-24 for bead sparkle-5i7e8x.2 (transcript
+ *     in the "NO-OP PRESS" block below): a digit toggles ITS OWN numbered row and leaves the cursor
+ *     where it was.
+ * In BOTH builds `\r` and space toggle the row under the cursor and the arrows move it.
+ */
+type DigitMode = "inert" | "toggle";
+
+/**
  * A Claude Code multi-select checkbox picker, driven by the bytes the production path writes.
  *
- * Its three rules are the three facts the field report above MEASURED, and nothing more:
+ * Its rules are the facts the field reports MEASURED, and nothing more:
  *   • `\x1b[B` / `\x1b[A` move the cursor (clamped at the ends, as an Ink list is).
- *   • `\r` TOGGLES the row under the cursor. It does not commit and it does not close the menu —
- *     step 3 of the report read the menu back afterwards, still open, with a row flipped OFF.
- *   • every other byte, INCLUDING A DIGIT, is inert. That is the whole defect: the digit that
- *     selects an option on a single-select numbered picker does nothing here.
+ *   • `\r` (and space) TOGGLES the row under the cursor. It does not commit and it does not close
+ *     the menu — step 3 of the report read the menu back afterwards, still open, with a row flipped.
+ *   • a DIGIT is inert or toggles its own row, per {@link DigitMode}.
+ *   • every other byte is inert.
  */
 class MultiSelectWidget {
   cursor: number;
@@ -89,6 +99,7 @@ class MultiSelectWidget {
     readonly question: string,
     readonly labels: readonly string[],
     cursor = 0,
+    readonly digits: DigitMode = "toggle",
   ) {
     this.cursor = cursor;
     this.checked = labels.map(() => false);
@@ -103,11 +114,15 @@ class MultiSelectWidget {
       } else if (bytes.startsWith("\x1b[A", i)) {
         this.cursor = Math.max(this.cursor - 1, 0);
         i += 3;
-      } else if (bytes[i] === "\r" || bytes[i] === "\n") {
+      } else if (bytes[i] === "\r" || bytes[i] === "\n" || bytes[i] === " ") {
         this.checked[this.cursor] = !this.checked[this.cursor];
         i += 1;
+      } else if (/[1-9]/.test(bytes[i]!) && this.digits === "toggle") {
+        const row = Number(bytes[i]) - 1;
+        if (row < this.labels.length) this.checked[row] = !this.checked[row];
+        i += 1;
       } else {
-        i += 1; // inert — a digit included
+        i += 1; // inert
       }
     }
   }
@@ -119,9 +134,9 @@ class MultiSelectWidget {
       this.question,
       ...this.labels.map(
         (l, i) =>
-          `${i === this.cursor ? "❯" : " "} ${i + 1}. [${this.checked[i] ? "✓" : " "}] ${l}`,
+          `${i === this.cursor ? "❯" : " "} ${i + 1}. [${this.checked[i] ? "✔" : " "}] ${l}`,
       ),
-      "Space to select · Enter to confirm · Esc to cancel",
+      "Enter to select · ↑/↓ to navigate · Esc to cancel",
     ].join("\n");
   }
 
@@ -163,7 +178,7 @@ beforeEach(() => {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 describe("the fake widget reproduces the measured field behaviour", () => {
   it("ignores the digit and toggles whatever row the cursor is on", () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 0);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, "inert");
 
     w.feed("1\r"); // report step 2: cursor on row 1 → row 1 checked
     expect(w.selected()).toEqual([0]);
@@ -174,6 +189,38 @@ describe("the fake widget reproduces the measured field behaviour", () => {
 
     w.feed("1\r"); // report step 4: row 1 checked again
     expect(w.selected()).toEqual([0]);
+  });
+
+  // ══ THE 2.1.310 MEASUREMENT (bead sparkle-5i7e8x.2) ══════════════════════════════════════════
+  // Measured by driving a REAL `claude` 2.1.310 in a PTY (pyte-rendered) through an
+  // AskUserQuestion multiSelect with options Apple/Banana/Cherry, cursor on row 1, one key at a time:
+  //   "1"        → row 1 [✔], cursor still on row 1       (the digit toggles ITS row)
+  //   "\r"       → row 1 [ ]                             (enter toggles the HIGHLIGHTED row)
+  //   " "        → row 1 [✔]                             (space does too)
+  //   "\x1b[B"   → cursor on row 2, nothing toggled
+  //   "\r"       → row 2 [✔]
+  //   "3"        → row 3 [✔], cursor still on row 2
+  //   "1\r"      → row 1 [ ] AND row 2 [ ]               (both halves toggle — two rows flipped)
+  // So the old press `"1\r"` with the cursor on row 1 toggles row 1 TWICE: nothing changes, the
+  // fingerprint is identical, and the op said ok — the exact symptom the bead reported.
+  it("on 2.1.310 a digit toggles its own row, so `N\\r` on the highlighted row is a no-op", () => {
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, "toggle");
+    w.feed("1");
+    expect([w.selected(), w.cursor]).toEqual([[0], 0]);
+    w.feed("\r");
+    expect(w.selected()).toEqual([]);
+    w.feed(" ");
+    expect(w.selected()).toEqual([0]);
+    w.feed("\x1b[B\r");
+    expect([w.selected(), w.cursor]).toEqual([[0, 1], 1]);
+    w.feed("3");
+    expect([w.selected(), w.cursor]).toEqual([[0, 1, 2], 1]);
+    w.feed("1\r");
+    expect(w.selected()).toEqual([2]);
+
+    const fresh = new MultiSelectWidget(QUESTION, LABELS, 0, "toggle");
+    fresh.feed("1\r");
+    expect(fresh.selected(), "the old press is a double toggle — nothing changes").toEqual([]);
   });
 
   it("renders a screen the picker detector reads as a live multi-select menu", () => {
@@ -192,12 +239,15 @@ describe("the fake widget reproduces the measured field behaviour", () => {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // THE DEFECT
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-describe("select_picker_option on a multi-select checkbox picker", () => {
+// Run against BOTH measured builds: the fix must not depend on which way a digit behaves.
+describe.each(["toggle", "inert"] as const)(
+  "select_picker_option on a multi-select checkbox picker (digits %s)",
+  (digits) => {
   // THE assertion this bead exists for. The highlighted row is index 0 and the caller asks for
   // index 2, so a press that lands on the highlighted row cannot pass by accident — and both halves
   // are asserted, because "something got selected" is exactly what the buggy code also does.
   it("selects the option at the REQUESTED index, not the highlighted one", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 0);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, digits);
     mount(w);
     const read = readPickerOptions(AGENT);
 
@@ -211,7 +261,7 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
   // The same property in the other direction: the cursor has to be able to walk UP as well, or an
   // index below the highlight is unreachable and the op silently answers the wrong question again.
   it("walks the cursor UP when the requested index is above the highlighted row", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 2);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 2, digits);
     mount(w);
     const read = readPickerOptions(AGENT);
 
@@ -225,7 +275,7 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
   // The index the cursor is ALREADY on still works, and is not double-toggled by a navigation step
   // that should not have happened.
   it("selects the highlighted row when that is the row asked for", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 1);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 1, digits);
     mount(w);
     const read = readPickerOptions(AGENT);
 
@@ -238,7 +288,7 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
   // Answering TWICE is the whole point of a multi-select, and it is where an off-by-one in the
   // navigation shows up: the second press starts from wherever the first one left the cursor.
   it("accumulates ticks across successive presses, each on its own index", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 0);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, digits);
     mount(w);
 
     const first = await selectPickerOption(AGENT, 2, readPickerOptions(AGENT).fingerprint, ALLOWED);
@@ -253,7 +303,7 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
   // way to know how far to walk, and pressing anyway is the original defect — a toggle landing on
   // an unknown row while the tool reports the requested label back as if it had been chosen.
   it("refuses rather than pressing blind when no row carries the cursor", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 0);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, digits);
     // A screen with the same options and NO cursor glyph on any row.
     scrollbackMock.mockImplementation(() => w.render().replace(/❯/g, " "));
     writeMock.mockImplementation(async (_id: string, bytes: string) => w.feed(bytes));
@@ -274,7 +324,7 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
   // the whole safety property here, becomes unreachable. The locator must stay inside the block the
   // PARSE used, so the answer is a refusal.
   it("does not take its highlight from an already-answered picker higher in the scrollback", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 0);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, digits);
     const stale = [
       "Do you want to proceed?",
       "❯ 1. Yes",
@@ -318,7 +368,7 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
   // `trial-spent` refusal was written first and failed — the press went through — which is what
   // established that, and why the production comment says so.)
   it("writes NOTHING, arrows included, when the press would be refused downstream", async () => {
-    const w = new MultiSelectWidget(QUESTION, LABELS, 0);
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, digits);
     mount(w);
     useProjectStore.setState({
       projects: [
@@ -345,5 +395,70 @@ describe("select_picker_option on a multi-select checkbox picker", () => {
     } finally {
       releasePass();
     }
+  });
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE NO-OP PRESS — bead sparkle-5i7e8x.2
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// The field report: `select_picker_option` index 0 on a plan-mode multi-select returned
+// `{ok: true, label: "1 · [ ] …"}` and NOTHING changed — checkbox still `[ ]`, cursor still on row
+// 1, the same fingerprint twice. Two defects, and these tests pin both:
+//   1. the press `"1\r"` toggles row 1 twice on 2.1.310 (see the measurement above);
+//   2. nothing re-read the screen after the press, so ANY press that changed nothing came back ok.
+describe("select_picker_option never reports a press that changed nothing as ok", () => {
+  it("ticks the HIGHLIGHTED row when it is the one asked for (the field report's exact shape)", async () => {
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, "toggle");
+    mount(w);
+
+    const r = await selectPickerOption(AGENT, 0, readPickerOptions(AGENT).fingerprint, ALLOWED);
+
+    expect(r.ok, r.detail ?? "press was refused").toBe(true);
+    expect(w.selected(), "row 1 must actually be ticked, not toggled twice").toEqual([0]);
+    expect(readPickerOptions(AGENT).options[0]?.label).toBe("1 · [✔] Local files");
+  });
+
+  it("un-ticks a ticked row when pressed again — a toggle, both ways", async () => {
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, "toggle");
+    mount(w);
+    await selectPickerOption(AGENT, 1, readPickerOptions(AGENT).fingerprint, ALLOWED);
+    expect(w.selected()).toEqual([1]);
+
+    const r = await selectPickerOption(AGENT, 1, readPickerOptions(AGENT).fingerprint, ALLOWED);
+
+    expect(r.ok, r.detail ?? "press was refused").toBe(true);
+    expect(w.selected()).toEqual([]);
+  });
+
+  // THE GENERAL GUARD, independent of which keystroke is right: a widget that swallows every byte
+  // (a frozen frame, a build whose keys we have not measured) must produce a REFUSAL, never ok.
+  it("returns ok:false / no-effect when the screen does not change after the press", async () => {
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, "toggle");
+    scrollbackMock.mockImplementation(() => w.render());
+    writeMock.mockImplementation(async () => {}); // the bytes go nowhere
+
+    const r = await selectPickerOption(AGENT, 2, readPickerOptions(AGENT).fingerprint, ALLOWED);
+
+    expect(r.ok, "a press that changed nothing is never ok").toBe(false);
+    expect(r.reason).toBe("no-effect");
+    expect(r.label).toBeUndefined();
+    expect(r.cursorMoved, "the walk was written, so the caller must be told").toBe(true);
+    expect(writeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns no-effect when the WRONG row flipped instead of the requested one", async () => {
+    const w = new MultiSelectWidget(QUESTION, LABELS, 0, "toggle");
+    scrollbackMock.mockImplementation(() => w.render());
+    // A widget that ignores the arrows: the toggle lands on row 0, not the requested row 2.
+    writeMock.mockImplementation(async (_id: string, bytes: string) =>
+      w.feed(bytes.replaceAll("\x1b[A", "").replaceAll("\x1b[B", "")),
+    );
+
+    const r = await selectPickerOption(AGENT, 2, readPickerOptions(AGENT).fingerprint, ALLOWED);
+
+    expect([r.ok, r.reason]).toEqual([false, "no-effect"]);
+    expect(w.selected(), "fixture: the stray toggle really did land on row 0").toEqual([0]);
   });
 });

@@ -2721,6 +2721,76 @@ describe("controlListener", () => {
         expect(err).toMatch(/Do NOT take the ancestry result to the concierge/i);
       });
 
+      // ── THE MERGED-THEN-DELETED BRANCH (sparkle-28ifhw, sparkle-t58ekc, sparkle-9vptk0) ─────────
+      // The window-local reading is resolved by the branch NAME and a merged-then-deleted (or
+      // differently-named) branch reads there as a bare cut: ahead 0, nothing pushed, no PR. So
+      // `authoredWorkSeen` is false and the arm above REFUSED git's ancestor — for the population
+      // whose work provably landed. The probe now proves it from git alone: a commit AUTHORED IN THIS
+      // WORKTREE (its own HEAD reflog) is an ancestor of origin/main.
+      it("MARKS MET when git proves a commit authored in this worktree is on origin/main", async () => {
+        seedNothingOutstanding();
+        expect(landedEvidenceFor(callerId)).toBe(false);
+        landedProbeReply = {
+          landed: true,
+          authoredLanded: true,
+          branch: "feature/other-name",
+          headSha: "1111111111111111111111111111111111111111",
+          baseRef: "refs/remotes/origin/main",
+          baseSha: "2222222222222222222222222222222222222222",
+          reason: "ok",
+        };
+        fire({ reqId: "al1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        expect(goalOf(callerId)!.metAt).toBeDefined();
+      });
+
+      // THE OPPOSITE DIRECTION, same fixture: git says ancestor but NOTHING authored here landed (a
+      // bare cut, or a commit reset away). That must still refuse — ancestry alone is satisfied most
+      // easily by a branch that did no work.
+      it("still REFUSES when git says ancestor but no commit authored here is on origin/main", async () => {
+        seedNothingOutstanding();
+        landedProbeReply = { landed: true, authoredLanded: false, reason: "ok" };
+        fire({ reqId: "al2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+        expect(refusalText()).toContain("arm: ancestry:git-probe-unproven");
+        expect(refusalText()).toContain("authoredOnOrigin (reflog): false");
+      });
+
+      // sparkle-q4r8z2: the refusal must NAME the branch it measured and BOTH shas it compared, or
+      // an agent whose work is landed cannot tell from outside what the app looked at.
+      it("names the measured branch and both compared shas in the refusal", async () => {
+        seedAheadTwo();
+        landedProbeReply = {
+          landed: false,
+          branch: "sparkle/agent-x",
+          headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          baseRef: "refs/remotes/origin/main",
+          baseSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          reason: "no",
+        };
+        fire({ reqId: "al3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        const err = refusalText();
+        expect(err).toContain(
+          "compared: branch sparkle/agent-x HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa against " +
+            "refs/remotes/origin/main bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        expect(refusalWarning()[0]).toContain("HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+      });
+
+      // …and when the probe could not resolve them, it says so rather than printing nothing.
+      it("says the comparison was not resolved when the probe returned no shas", async () => {
+        seedAheadTwo();
+        landedProbeError = "worktree is gone";
+        fire({ reqId: "al4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(refusalText()).toContain("compared: unresolved");
+      });
+
       // ── ARM 3: the probe RAN and could not tell — a third state, not a shade of git's no ───────
       it("names ancestry:probe-inconclusive and reports the reading it did NOT overwrite", async () => {
         seedAheadTwo();

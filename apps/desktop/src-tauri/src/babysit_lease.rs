@@ -941,6 +941,84 @@ pub fn list_at(
         .collect())
 }
 
+// ══ DOES THE TARGET REPO PROVIDE THE SKILL AT ALL? ══════════════════════════════════════════════
+//
+// Bead `sparkle-5i7e8x.5`. The sweep briefs every driver with `/babysit-pr <n>`, and that skill
+// lives in the SPARKLE repo's `.claude/skills/babysit-pr/SKILL.md`. Swept into a repo that does
+// not carry it (measured: eight drivers into `plow-pbc/tkmx-client`), claude prints
+// `Unknown command: /babysit-pr`, answers every nudge with "no task assigned" and idles — eight
+// agent slots held for 100+ minutes against a RAM-bound ceiling, doing nothing.
+//
+// So the dispatcher asks THIS before it spawns. The candidates are where Claude Code resolves a
+// slash command from: the project's own `.claude/skills/<name>/SKILL.md` (or the older
+// `.claude/commands/<name>.md`), and the same two under the user's `~/.claude`. Plugin-provided
+// skills are not looked for — none ships `babysit-pr` — so a plugin install would read as absent,
+// which costs a hold, never an inert agent.
+//
+// THREE STATES, the module's rule: `Some(true)` found, `Some(false)` every candidate was
+// AFFIRMATIVELY absent, `None` we could not tell (a stat error, or no project root). Only
+// `Some(false)` may hold a dispatch; an unknown must not silently mute the sweep.
+
+/// The skill the sweep briefs its drivers with. One constant, so the path checked and the prompt
+/// sent cannot name two different skills.
+pub const BABYSIT_SKILL_NAME: &str = "babysit-pr";
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillAvailability {
+    /// `Some(true)` found, `Some(false)` affirmatively absent everywhere, `None` could not tell.
+    pub available: Option<bool>,
+    /// The first candidate that exists, when one does.
+    pub found_at: Option<String>,
+    /// Every candidate looked at, in order — so a hold can say WHERE it looked.
+    pub checked: Vec<String>,
+    /// Why the answer is unknown, when it is.
+    pub error: Option<String>,
+}
+
+fn skill_candidates(base: &Path, name: &str) -> [PathBuf; 2] {
+    let claude = base.join(".claude");
+    [
+        claude.join("skills").join(name).join("SKILL.md"),
+        claude.join("commands").join(format!("{name}.md")),
+    ]
+}
+
+/// Pure over its inputs so a test can point it at temp dirs instead of the real `$HOME`.
+pub fn skill_availability_at(project_root: &Path, home: Option<&Path>, name: &str) -> SkillAvailability {
+    let mut out = SkillAvailability { available: None, found_at: None, checked: Vec::new(), error: None };
+    if project_root.as_os_str().is_empty() {
+        out.error = Some("no project root".to_string());
+        return out;
+    }
+    let mut bases: Vec<&Path> = vec![project_root];
+    if let Some(h) = home.filter(|h| !h.as_os_str().is_empty()) {
+        bases.push(h);
+    }
+    let mut unsure: Option<String> = None;
+    for base in bases {
+        for cand in skill_candidates(base, name) {
+            out.checked.push(cand.display().to_string());
+            match cand.try_exists() {
+                Ok(true) if cand.is_file() => {
+                    out.available = Some(true);
+                    out.found_at = Some(cand.display().to_string());
+                    return out;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    unsure.get_or_insert_with(|| format!("{}: {e}", cand.display()));
+                }
+            }
+        }
+    }
+    match unsure {
+        Some(e) => out.error = Some(e),
+        None => out.available = Some(false),
+    }
+    out
+}
+
 // ══ TAURI COMMANDS ══════════════════════════════════════════════════════════════════════════════
 //
 // Thin wrappers that resolve the app-data dir, the process epoch and the real clock, then delegate.
@@ -1002,6 +1080,16 @@ pub async fn babysit_lease_release(
 }
 
 #[tauri::command]
+pub async fn babysit_skill_available(project_root: String) -> Result<SkillAvailability, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        skill_availability_at(Path::new(&project_root), home.as_deref(), BABYSIT_SKILL_NAME)
+    })
+    .await
+    .map_err(|e| format!("babysit_skill_available task failed: {e}"))
+}
+
+#[tauri::command]
 pub async fn babysit_leases(app: AppHandle) -> Result<Vec<BabysitLeaseView>, LeaseError> {
     let app_data = crate::dev_identity::app_data_dir(&app).map_err(LeaseError::unknown)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -1014,6 +1102,54 @@ pub async fn babysit_leases(app: AppHandle) -> Result<Vec<BabysitLeaseView>, Lea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── skill availability (sparkle-5i7e8x.5) ──
+    fn write(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x").unwrap();
+    }
+
+    #[test]
+    fn skill_absent_everywhere_is_affirmatively_false() {
+        let (root, home) = (tmp(), tmp());
+        let got = skill_availability_at(root.path(), Some(home.path()), "babysit-pr");
+        assert_eq!(got.available, Some(false));
+        assert_eq!(got.checked.len(), 4, "both candidates under both bases: {:?}", got.checked);
+        assert!(got.found_at.is_none());
+    }
+
+    #[test]
+    fn skill_in_the_project_is_found() {
+        let (root, home) = (tmp(), tmp());
+        write(&root.path().join(".claude/skills/babysit-pr/SKILL.md"));
+        let got = skill_availability_at(root.path(), Some(home.path()), "babysit-pr");
+        assert_eq!(got.available, Some(true));
+        assert!(got.found_at.unwrap().ends_with("SKILL.md"));
+    }
+
+    #[test]
+    fn skill_at_user_level_or_as_a_command_is_found() {
+        let (root, home) = (tmp(), tmp());
+        write(&home.path().join(".claude/skills/babysit-pr/SKILL.md"));
+        assert_eq!(skill_availability_at(root.path(), Some(home.path()), "babysit-pr").available, Some(true));
+        let (root2, home2) = (tmp(), tmp());
+        write(&root2.path().join(".claude/commands/babysit-pr.md"));
+        assert_eq!(skill_availability_at(root2.path(), Some(home2.path()), "babysit-pr").available, Some(true));
+    }
+
+    #[test]
+    fn a_directory_named_like_the_skill_file_is_not_the_skill() {
+        let (root, home) = (tmp(), tmp());
+        std::fs::create_dir_all(root.path().join(".claude/skills/babysit-pr/SKILL.md")).unwrap();
+        assert_eq!(skill_availability_at(root.path(), Some(home.path()), "babysit-pr").available, Some(false));
+    }
+
+    #[test]
+    fn no_project_root_is_unknown_not_absent() {
+        let got = skill_availability_at(Path::new(""), None, "babysit-pr");
+        assert_eq!(got.available, None);
+        assert!(got.error.is_some());
+    }
 
     const EPOCH_A: &str = "launch-a";
     const EPOCH_B: &str = "launch-b";

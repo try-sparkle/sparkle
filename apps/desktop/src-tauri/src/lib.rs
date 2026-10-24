@@ -1653,6 +1653,8 @@ pub fn run() {
             babysit_lease::babysit_lease_heartbeat,
             babysit_lease::babysit_lease_release,
             babysit_lease::babysit_leases,
+            // Asked before every spawn: is `/babysit-pr` resolvable in the target repo (sparkle-5i7e8x.5).
+            babysit_lease::babysit_skill_available,
             autoscaler_claim::autoscaler_claim_acquire,
             autoscaler_claim::autoscaler_claim_heartbeat,
             autoscaler_claim::autoscaler_claim_release,

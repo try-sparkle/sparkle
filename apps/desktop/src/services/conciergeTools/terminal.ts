@@ -1457,7 +1457,7 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "select_picker_option",
     description:
-      "Press one of an agent's live menu options. Takes the index AND the `fingerprint` from read_picker_options, and refuses if the menu changed underneath — pressing a button the human never read is not something to guess at. An EMPTY fingerprint is refused as `unreadable-picker`: the question could not be read, so there is nothing to match against. A MULTI-SELECT checkbox menu (every option reads `[ ] …`) is answered by moving the highlight to the requested row and toggling it, so the index is honoured there too — one call ticks ONE box and leaves the menu open, so call it again per box. IT CANNOT SUBMIT THE SET: there is no op that confirms a multi-select, and `send_control_key enter` is refused while any menu is up. So tick the boxes and then RELAY TO THE HUMAN to confirm — do not go looking for a submit route, there isn't one. If no row on that menu carries the selection cursor it is refused as `cursor-unknown` rather than toggling a checkbox on a guess. Requires an authorized tool policy, like any other write to a terminal.",
+      "Press one of an agent's live menu options. Takes the index AND the `fingerprint` from read_picker_options, and refuses if the menu changed underneath — pressing a button the human never read is not something to guess at. An EMPTY fingerprint is refused as `unreadable-picker`: the question could not be read, so there is nothing to match against. A MULTI-SELECT checkbox menu (every option reads `[ ] …`) is answered by moving the highlight to the requested row and toggling it, so the index is honoured there too — one call ticks ONE box and leaves the menu open, so call it again per box. It reports ok ONLY when the re-read screen shows that box flipped; a press that changed nothing comes back `no-effect`, and then the box is NOT ticked — relay it to the human rather than reporting it answered. IT CANNOT SUBMIT THE SET: there is no op that confirms a multi-select, and `send_control_key enter` is refused while any menu is up. So tick the boxes and then RELAY TO THE HUMAN to confirm — do not go looking for a submit route, there isn't one. If no row on that menu carries the selection cursor it is refused as `cursor-unknown` rather than toggling a checkbox on a guess. Requires an authorized tool policy, like any other write to a terminal.",
     write: true,
   },
   {
@@ -1550,17 +1550,20 @@ export interface SelectPickerResult {
   /** Why it was refused, machine-readable. `cursor-unknown` is the multi-select-only one: the
    *  menu parsed and the fingerprint matched, but no row on screen carries the selection cursor,
    *  so there is no way to know how far to walk to reach the requested index. See
-   *  {@link selectPickerOption}. */
+   *  {@link selectPickerOption}. `no-effect` is the other multi-select-only one: the toggle WAS
+   *  written but the requested row's checkbox did not change on the re-read screen, so nothing is
+   *  known to have been ticked (bead sparkle-5i7e8x.2). */
   reason?:
     | "no-picker"
     | "out-of-range"
     | "changed"
     | "unreadable-picker"
     | "cursor-unknown"
+    | "no-effect"
     | ConciergeSendPath;
   detail?: string;
-  /** TRUE when a multi-select cursor walk DID land and the press was then refused — the menu's
-   *  highlight moved and nothing was toggled. Reported because the caller cannot infer it: a
+  /** TRUE when a multi-select cursor walk DID land and the press then had no confirmed effect
+   *  (`no-effect`) — the menu's highlight moved and nothing is known to have been toggled. Reported because the caller cannot infer it: a
    *  refusal otherwise reads as "nothing happened", and the next press built on an earlier read
    *  would compute its walk from a highlight that has since moved (roborev 74100). Absent, never
    *  `false`, so a caller cannot mistake "this build does not report it" for "it did not move". */
@@ -1638,10 +1641,10 @@ export async function selectPickerOption(
   // `2 · [ ] Already-hosted URLs`. That silent wrong-label report is the dangerous half — the
   // concierge could not answer a multi-select question truthfully, and left agents blocked.
   //
-  // THE REMEDY IS NAVIGATION, NOT A DIFFERENT KEYSTROKE. The arrows move the highlight and commit
-  // nothing, so walking `|index - highlighted|` rows and then pressing exactly as before makes the
-  // existing toggle land on the row that was asked for. The press itself is untouched: it is still
-  // the ordinary authority-gated send below, carrying the same re-derived fingerprint.
+  // THE REMEDY IS NAVIGATION. The arrows move the highlight and commit nothing, so walking
+  // `|index - highlighted|` rows and then toggling makes the toggle land on the row that was asked
+  // for. (The toggle itself is a bare `\r`, not the option's `N\r` — see the block that writes it,
+  // bead sparkle-5i7e8x.2.)
   //
   // ══ WHY THE ARROWS MAY BE WRITTEN HERE AT ALL ═════════════════════════════════════════════════
   // `send_control_key` REFUSES the arrows while a menu is live (`ambiguous-picker`), and that
@@ -1679,7 +1682,6 @@ export async function selectPickerOption(
   // all. Pre-checking it here would refuse a navigation whose press would have succeeded — the
   // second-copy drift these pre-checks are written to avoid. (A test asserting a trial-spent refusal
   // was written and failed green-side: the press went through.)
-  let cursorMoved = false;
   const navigable =
     isMultiSelectPicker(live) &&
     isDispatchAuthority(authority) &&
@@ -1706,21 +1708,63 @@ export async function selectPickerOption(
           "the question directly.",
       };
     }
-    if (highlighted !== index) {
-      const key = index > highlighted ? CONTROL_KEYS.down : CONTROL_KEYS.up;
-      try {
-        // ONE CHAINED WRITE, not one per row: the arrows and the press that follows share the
-        // per-agent queue, so nothing can land between them — and a single write cannot be
-        // interleaved with another operation's paste→CR window part-way through the walk.
-        await writePtyChainedStrict(agentId, key.repeat(Math.abs(index - highlighted)));
-        cursorMoved = true;
-      } catch (e) {
-        if (e instanceof PtyGoneError) {
-          return { ok: false, agentId, reason: "pty-gone", detail: sendDetail("pty-gone", agentId) };
-        }
-        throw e;
+    // ── THE TOGGLE IS A BARE `\r`, NEVER THE OPTION'S `N\r` (bead sparkle-5i7e8x.2) ──────────
+    //
+    // `chosen.value` is `"N\n"`, framed by the dispatcher to `"N\r"`, and that is TWO toggles on
+    // Claude Code 2.1.310 — measured against a real `claude` in a PTY (transcript in
+    // `terminal.multiSelectPicker.test.ts`): there a DIGIT toggles its own numbered row, and the
+    // carriage return toggles the highlighted one. With the cursor already walked onto the
+    // requested row, both land on the SAME row and cancel out: checkbox unchanged, fingerprint
+    // unchanged, and this function used to return ok — the field report, exactly. (The earlier
+    // build sparkle-xkf6yl measured had an inert digit, which is why that fix looked complete.)
+    //
+    // A bare `\r` after the walk is the one press that toggles exactly the requested row on BOTH
+    // measured builds, so it is written in the SAME chained write as the walk: nothing can land
+    // between the arrows and the toggle. It does not go through the dispatcher, whose only
+    // keystroke for an option is `N\r`; every refusal this press could meet there is pre-checked
+    // in `navigable` above, and the fingerprint was matched two statements ago. Nor is it reported
+    // to the dispatcher as an ANSWER: a tick leaves the menu open, so the question is still asked.
+    const walk =
+      highlighted === index
+        ? ""
+        : (index > highlighted ? CONTROL_KEYS.down : CONTROL_KEYS.up).repeat(
+            Math.abs(index - highlighted),
+          );
+    const before = checkboxTicked(chosen.label);
+    try {
+      await writePtyChainedStrict(agentId, walk + CONTROL_KEYS.enter);
+    } catch (e) {
+      if (e instanceof PtyGoneError) {
+        return { ok: false, agentId, reason: "pty-gone", detail: sendDetail("pty-gone", agentId) };
       }
+      throw e;
     }
+    // ── AND OK MEANS THE SCREEN SAYS SO, NOT THAT THE BYTES WERE WRITTEN ─────────────────────────
+    // A press that changed nothing must never come back ok — the bead's whole complaint is a
+    // success indistinguishable from a real press. So re-read the menu until the requested row's
+    // checkbox has flipped, bounded; anything else is `no-effect`.
+    if (await multiSelectToggleLanded(agentId, index, before)) {
+      log.info("concierge", "multi-select toggle confirmed on screen", { agentId, index });
+      return { ok: true, agentId, label: chosen.label };
+    }
+    log.warn("concierge", "multi-select press changed nothing on screen", {
+      agentId,
+      index,
+      walked: walk !== "",
+    });
+    return {
+      ok: false,
+      agentId,
+      reason: "no-effect",
+      detail:
+        "I pressed that checkbox, but the menu didn't change — the row you asked for is not " +
+        "ticked (or un-ticked) on screen, so I can't say it was answered. " +
+        (walk !== ""
+          ? "I did move the highlight, so read the options again before pressing anything. "
+          : "") +
+        "Open its terminal pane and tick it directly.",
+      ...(walk !== "" ? { cursorMoved: true as const } : {}),
+    };
   }
   // The option's own `value` is the exact string the human's click would inject, so this presses the
   // button the same way the UI does — through the ordinary authority-gated send, not a second path.
@@ -1738,21 +1782,47 @@ export async function selectPickerOption(
     pickerPress: { fingerprint: now },
   });
   if (sent.ok) return { ok: true, agentId, label: chosen.label };
-  // SAY THAT THE HIGHLIGHT MOVED, when it did. The gates this layer owns run above the walk, so a
-  // refusal reaching here is one only the dispatcher could make — and the caller has to be told,
-  // or it re-reads the menu, sees the same options, and computes its next walk from the highlight
-  // it remembers rather than the one on screen.
-  return {
-    ok: false,
-    agentId,
-    reason: sent.path,
-    detail: cursorMoved
-      ? `${sent.detail} I had already moved that menu's highlight to the option you asked for, ` +
-        `so nothing was ticked but the highlighted row is no longer where you last read it — ` +
-        `read the options again before pressing anything.`
-      : sent.detail,
-    ...(cursorMoved ? { cursorMoved: true as const } : {}),
-  };
+  return { ok: false, agentId, reason: sent.path, detail: sent.detail };
+}
+
+/** How long {@link multiSelectToggleLanded} waits for the PTY's echo to repaint the menu. Ink
+ *  repaints a toggle within one frame; this is generous for a loaded machine without stalling a
+ *  tool call. */
+const TOGGLE_CONFIRM_MS = 1500;
+const TOGGLE_CONFIRM_POLL_MS = 50;
+
+/** A `N · [✔] label` / `N · [ ] label` option label. The tick glyphs are Claude Code's output,
+ *  MATCHED here, never rendered — held as a bare regex constant so glyphIcons.test.ts reads it so. */
+const CHECKBOX_LABEL = /^\d{1,2}[ \t]*[·.)][ \t]*\[([ xX✓✔]?)\]/;
+
+/** `true`/`false` for a {@link CHECKBOX_LABEL} option label, `null` for any other shape. */
+function checkboxTicked(label: string): boolean | null {
+  const m = label.match(CHECKBOX_LABEL);
+  if (!m) return null;
+  return (m[1] ?? "").trim() !== "";
+}
+
+/**
+ * Did the toggle just written to a multi-select land on row `index`? Re-reads the live menu until
+ * that row's checkbox differs from `before`, or the bound expires.
+ *
+ * FAILS CLOSED: an unreadable `before`, a menu that vanished, or a row that never flipped are all
+ * `false`, because each means the screen does not show the answer the caller asked for.
+ */
+async function multiSelectToggleLanded(
+  agentId: string,
+  index: number,
+  before: boolean | null,
+): Promise<boolean> {
+  if (before === null) return false;
+  const deadline = Date.now() + TOGGLE_CONFIRM_MS;
+  for (;;) {
+    const row = liveOptionsFor(agentId)[index];
+    const after = row ? checkboxTicked(row.label) : null;
+    if (after !== null && after !== before) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, TOGGLE_CONFIRM_POLL_MS));
+  }
 }
 
 

@@ -35,7 +35,11 @@ import {
   mayRearmGoal,
   newGoal,
   noteContinue,
+  parkGoal,
+  type ParkRequest,
+  type ParkResult,
   resetGoalRetries,
+  unparkGoal,
   unraiseGoal,
 } from "../engine/agentGoal";
 import { assignmentRepos, type LandedElsewhere } from "../engine/crossRepo";
@@ -324,6 +328,11 @@ export interface ProjectState {
   /** Mark the current goal met (or un-mark it). This is the only thing that makes an idle agent
    *  legitimately finished, so it is the agent's own way to stop being resumed. */
   setAgentGoalMet: (projectId: string, agentId: string, met: boolean) => void;
+  /** PARK the goal (`req`) or lift the park (`null`) — the agent's declaration that the resume
+   *  ladder cannot move it (engine/agentGoal `GoalPark`). Applied to the LIVE goal inside one `set`,
+   *  so a concurrent counter write is never clobbered by a stale snapshot, and the verdict is
+   *  returned rather than inferred: a refused park writes nothing. */
+  parkAgentGoal: (projectId: string, agentId: string, req: ParkRequest | null, now: number) => ParkResult;
   /** Record that an auto-continue was just spent, against the progress mark it was spent at.
    *  Advances the retry counters the escalation bound is read from. */
   noteAgentGoalContinue: (projectId: string, agentId: string, mark: string) => void;
@@ -2015,6 +2024,24 @@ export const useProjectStore = create<ProjectState>()(
             }),
           ),
         })),
+
+      parkAgentGoal: (projectId, agentId, req, now) => {
+        let result: ParkResult = {
+          ok: false,
+          code: "goal_not_parkable",
+          message: "no goal to park — set one with set_agent_goal first.",
+        };
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => {
+              if (!a.goal) return a;
+              result = req === null ? { ok: true, goal: unparkGoal(a.goal) } : parkGoal(a.goal, req, now);
+              return result.ok ? { ...a, goal: result.goal } : a;
+            }),
+          ),
+        }));
+        return result;
+      },
 
       noteAgentGoalContinue: (projectId, agentId, mark) =>
         set((s) => ({

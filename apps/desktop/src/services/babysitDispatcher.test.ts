@@ -64,6 +64,7 @@ import {
   BABYSIT_LEASE_REASON_INVALID,
   BABYSIT_LEASE_REASON_UNKNOWN,
   BABYSIT_LEASE_RELEASE_COMMAND,
+  BABYSIT_SKILL_AVAILABLE_COMMAND,
   mintDispatchHolderId,
   _resetBabysitDispatcherForTests,
   babysitPrompt,
@@ -162,6 +163,8 @@ function wireInvoke(opts: {
   review?: { pr_reviewer?: string; require_review?: boolean };
   /** Make `get_config` throw, so the fail-closed path in `readReviewPolicy` is drivable. */
   configThrows?: boolean;
+  /** The Rust `SkillAvailability` reply. Omitted = found in the project. `"throw"` = the call fails. */
+  skill?: unknown;
 }): void {
   invokeMock.mockImplementation(async (cmd: string) => {
     if (cmd === "get_config") {
@@ -186,8 +189,22 @@ function wireInvoke(opts: {
       };
     }
     if (cmd === BABYSIT_LEASE_RELEASE_COMMAND) return null;
+    if (cmd === BABYSIT_SKILL_AVAILABLE_COMMAND) {
+      if (opts.skill === "throw") throw new Error("bridge down");
+      return opts.skill ?? skillReply(true);
+    }
     throw new Error(`unexpected command ${cmd}`);
   });
+}
+
+/** `SkillAvailability` exactly as serde puts it on the wire — every `None` is `null`, never absent. */
+function skillReply(available: boolean | null) {
+  return {
+    available,
+    foundAt: available ? "/repo/.claude/skills/babysit-pr/SKILL.md" : null,
+    checked: ["/repo/.claude/skills/babysit-pr/SKILL.md", "/home/.claude/skills/babysit-pr/SKILL.md"],
+    error: available === null ? "EACCES" : null,
+  };
 }
 
 /** Run the sweep TWICE — the two-observation rule means one sweep can never dispatch. */
@@ -2314,5 +2331,67 @@ describe("the fence after the heartbeat await", () => {
     // …and it went on to judge the PR, holding it because a live driver already owns it.
     expect(out.holds).toEqual({ "driver-alive": 1 });
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("a repo that does not provide /babysit-pr gets no driver (sparkle-5i7e8x.5)", () => {
+  // MEASURED: eight drivers spawned into a foreign repo, each printing `Unknown command:
+  // /babysit-pr` and idling 100+ minutes. An inert agent is strictly worse than no agent — it holds
+  // a slot AND reads as "this PR has a driver" to every later sweep.
+  it("holds with `skill-missing` and never acquires or spawns when the skill is affirmatively absent", async () => {
+    wireInvoke({ leases: [], skill: skillReply(false) });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+    expect(out.holds["skill-missing"]).toBe(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+    const cmds = invokeMock.mock.calls.map((c) => c[0]);
+    expect(cmds).not.toContain(BABYSIT_LEASE_ACQUIRE_COMMAND);
+    // It asked about THIS project's checkout, not the app's own repo.
+    expect(invokeMock).toHaveBeenCalledWith(BABYSIT_SKILL_AVAILABLE_COMMAND, { projectRoot: "/repo" });
+  });
+
+  it("says so at WARN, naming the project and where it looked — once, not every sweep", async () => {
+    wireInvoke({ leases: [], skill: skillReply(false) });
+    await sweepTwice();
+    await babysitSweepProject(PROJECT, T0 + 120_000, CONFIG);
+    const warns = logWarnMock.mock.calls.filter((c) => String(c[1]).includes("/babysit-pr"));
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.[2]).toMatchObject({
+      project: "p1",
+      checked: expect.arrayContaining(["/repo/.claude/skills/babysit-pr/SKILL.md"]),
+    });
+  });
+
+  it("is a decision, not a refusal — it never counts toward WEDGED", async () => {
+    wireInvoke({ leases: [], skill: skillReply(false) });
+    let wedged = 0;
+    for (let i = 0; i < BABYSIT_REFUSAL_STREAK_WEDGED + 2; i += 1) {
+      const out = await babysitSweepProject(PROJECT, T0 + i * 60_000, CONFIG);
+      wedged += out.wedged;
+      if (i > 0) expect(out.holds["lease-lost-or-spawn-refused"]).toBeUndefined();
+    }
+    expect(wedged).toBe(0);
+  });
+
+  it("dispatches again once the skill appears, and re-warns if it disappears later", async () => {
+    wireInvoke({ leases: [], skill: skillReply(false) });
+    await sweepTwice();
+    wireInvoke({ leases: [], skill: skillReply(true) });
+    const out = await babysitSweepProject(PROJECT, T0 + 120_000, CONFIG);
+    expect(out.dispatched).toHaveLength(1);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("an UNKNOWN answer does not mute the sweep — only affirmative absence holds", async () => {
+    wireInvoke({ leases: [], skill: skillReply(null) });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(1);
+    expect(out.holds["skill-missing"]).toBeUndefined();
+  });
+
+  it("a FAILED check does not mute the sweep either", async () => {
+    wireInvoke({ leases: [], skill: "throw" });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(1);
   });
 });

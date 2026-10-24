@@ -293,6 +293,7 @@ export const APP_TOOL_NAMES = [
   "append_communication_guideline",
   "set_agent_goal",
   "set_agent_goal_met",
+  "set_agent_goal_parked",
   "set_agent_landed",
   "set_agent_escalation",
   "claim_pr",
@@ -337,6 +338,7 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   // repo — the claim only makes `merge_pr` pause and point at the claimant.
   set_agent_goal: "routine",
   set_agent_goal_met: "routine",
+  set_agent_goal_parked: "routine",
   // ROUTINE, same class and same reasoning: one short field about who did what, written by the only
   // party that can know it. Nothing is destructive and nothing reaches a repo — the stamp is a
   // POINTER (`owner/repo#N`) whose whole value is that a human can check it in one click, and it is
@@ -386,6 +388,7 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   append_communication_guideline: "Save a rule about how Sparkle should talk to you.",
   set_config: "Write Sparkle's machine-wide configuration.",
   set_agent_goal: "Set an agent's current objective (what it is trying to finish).",
+  set_agent_goal_parked: "An agent parks its OWN goal as awaiting a person, superseded, or waiting on a clock; the concierge has no row to park.",
   set_agent_goal_met: "Mark a stalled-but-finished agent's goal met — the only thing that makes an idle agent count as done.",
   set_agent_escalation: "Hand an agent to you, or put one back to work after auto-continue gave up on it (twice at most).",
   claim_pr: "Record that you will land a pull request yourself, so nothing merges around you.",

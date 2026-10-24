@@ -1619,7 +1619,9 @@ describe("pr-conflicting could-not-ask", () => {
     const c = report(...budgetSkippedRepo(2));
     const bullets = c.text.split("\n").filter((l) => l.trimStart().startsWith("- "));
     expect(bullets.length).toBe(2);
-    expect(lineFor(c.text, 3000)).toContain("COULD NOT ASK GITHUB");
+    // A budget-skipped row: we never asked, so it must not claim GitHub could not be asked
+    // (bead sparkle-5i7e8x.3 — this line used to pin exactly that misreport).
+    expect(lineFor(c.text, 3000)).toContain("NOT REACHED THIS SWEEP");
   });
 
   // THE CASE THE BEAD IS ABOUT. All three shapes in ONE report, and all three read differently.
@@ -1830,6 +1832,76 @@ describe("pr-conflicting could-not-ask", () => {
     const line = lineFor(c.text, 1953);
     expect(line).toContain("We could not re-read it: sweep-budget.");
     expect(line).not.toContain("Blocked by: sweep-budget.");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // ── NAME THE REAL CAUSE, NOT "GITHUB" (beads sparkle-5i7e8x.3, sparkle-5i7e8x.4) ─────────────
+  //
+  // Two of the producer's refusal reasons are not GitHub failures at all, and narrating them as one
+  // sends the reader to re-authenticate a `gh` that is perfectly healthy:
+  //   * `sweep-budget` — OUR sweep ran out of time before reaching the repo. GitHub was never asked;
+  //     the rotation starts the next sweep with it. Measured: 23 PRs reported "GitHub could not be
+  //     asked" while gh had 5000/5000 GraphQL budget and answered in 0.34s.
+  //   * `no-git-remote` — the project's checkout has NO remote, so there is no GitHub repo to ask.
+  //     Local repo config; no retry and no login will ever change it.
+  // Every case mounts a genuine gh failure beside them so a rule that relabelled EVERY row would red.
+  const NOT_REACHED: ConflictingPr = { ...COULD_NOT_ASK, pr: 4100, branch: "tkmx/late", blockedBy: "sweep-budget" };
+  const NO_REMOTE: ConflictingPr = { ...COULD_NOT_ASK, pr: 4200, branch: "local/only", blockedBy: "no-git-remote" };
+
+  it("says a budget-skipped row was never asked, and does not blame GitHub", () => {
+    const c = report(NOT_REACHED);
+    const line = lineFor(c.text, 4100);
+    const head = c.text.split("\n")[0]!;
+    expect(line).not.toContain("COULD NOT ASK GITHUB");
+    expect(line).toContain("NOT REACHED THIS SWEEP");
+    expect(line).toContain("ran out of time");
+    expect(line).toContain("the next sweep starts with it");
+    expect(head).not.toContain("GitHub could not be asked");
+    expect(head).toContain("ran out of time");
+    // The gh remedy is advice to fix a gh that is not broken.
+    expect(c.text).not.toContain("an expired login or a spent rate limit");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  it("says a remoteless project has no remote — local config, not a GitHub failure", () => {
+    const c = report(NO_REMOTE);
+    const line = lineFor(c.text, 4200);
+    const head = c.text.split("\n")[0]!;
+    expect(line).not.toContain("COULD NOT ASK GITHUB");
+    expect(line).toContain("NO GIT REMOTE");
+    expect(line).toContain("not a GitHub failure");
+    expect(head).not.toContain("GitHub could not be asked");
+    expect(head).toContain("no git remote");
+    expect(c.text).not.toContain("an expired login or a spent rate limit");
+    expect(c.text).toContain("add a git remote");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // THE PAIRED DIRECTION: a genuine gh failure keeps the GitHub wording and the gh remedy, in the
+  // same report as the two rows that must not get it.
+  it("keeps the GitHub wording for a real gh failure beside the other two causes, and counts each", () => {
+    // The gh row is last-known CONFLICTING so three unread stale rows do not hit the collapse
+    // threshold — every row must be on its own line for this case to say anything.
+    const c = report({ ...COULD_NOT_ASK, kind: "conflicting" }, NOT_REACHED, NO_REMOTE);
+    expect(lineFor(c.text, 1953)).toContain("COULD NOT ASK GITHUB");
+    expect(lineFor(c.text, 4100)).toContain("NOT REACHED THIS SWEEP");
+    expect(lineFor(c.text, 4200)).toContain("NO GIT REMOTE");
+    const head = c.text.split("\n")[0]!;
+    expect(head).toContain("3 open PRs could not be read");
+    expect(head).toContain("1 not reached before our sweep ran out of time");
+    expect(head).toContain("1 in a project with no git remote");
+    expect(head).toContain("1 where GitHub could not be asked");
+    expect(c.text).toContain("an expired login or a spent rate limit");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  it("does not blame GitHub for a whole collapsed budget-skipped repo", () => {
+    const c = report(...budgetSkippedRepo(25));
+    const head = c.text.split("\n")[0]!;
+    expect(head).not.toContain("GitHub could not be asked");
+    expect(head).toContain("ran out of time");
+    expect(c.text).not.toContain("an expired login or a spent rate limit");
+    expect(c.text).toContain("the next sweep starts with them");
     expect(citable(c.text, c.measured)).toBe(true);
   });
 });

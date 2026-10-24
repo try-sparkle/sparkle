@@ -1269,6 +1269,74 @@ export const COULD_NOT_ASK_SENTENCE =
   "mergeable right now.";
 
 /**
+ * WHY a row was not read — and only one of the three answers is "GitHub" (beads sparkle-5i7e8x.3,
+ * sparkle-5i7e8x.4).
+ *
+ * The producer refuses a look for reasons that send a reader to completely different places, and
+ * the words above used to cover all of them. Two are not GitHub failures at all:
+ *
+ *   • `sweep-budget` (`conflict_watch::SWEEP_BUDGET_REASON`) — OUR sweep ran out of wall clock
+ *     before it reached the repo. GitHub was NEVER ASKED, nothing failed, and the producer's
+ *     rotation starts the next sweep with that repo. Measured: 23 PRs were narrated "GitHub could
+ *     not be asked" while gh held 5000/5000 GraphQL budget and answered in 0.34s — so the reader was
+ *     invited to re-authenticate a healthy CLI.
+ *   • `no-git-remote` (`conflict_watch::NO_GIT_REMOTE_REASON`) — the project's checkout has no git
+ *     remote, so there is no GitHub repository to ask. A PERMANENT local-config fact: no retry and
+ *     no login changes it.
+ *
+ * Everything else is a genuine gh failure and keeps the GitHub wording and the gh remedy. Keyed on
+ * `blockedBy`, which is the field the producer designates for quoting the reason; `evidence` still
+ * decides WHETHER a row is unread ({@link couldNotAsk}), this only decides how to say why.
+ */
+type UnreadCause = "gh" | "not-reached" | "no-remote";
+const unreadCause = (c: ConflictingPr): UnreadCause =>
+  c.blockedBy === "sweep-budget" ? "not-reached" : c.blockedBy === "no-git-remote" ? "no-remote" : "gh";
+const UNREAD_LABEL: Record<UnreadCause, string> = {
+  gh: COULD_NOT_ASK_LABEL,
+  "not-reached": "NOT REACHED THIS SWEEP",
+  "no-remote": "NO GIT REMOTE",
+};
+const UNREAD_SENTENCE: Record<UnreadCause, string> = {
+  gh: COULD_NOT_ASK_SENTENCE,
+  "not-reached":
+    "Our own conflict sweep ran out of time before it reached this repo, so GitHub was never asked — " +
+    "nothing failed, and the next sweep starts with it. It may be green and mergeable right now.",
+  "no-remote":
+    "This project's checkout has no git remote, so there is no GitHub repository to ask. That is local " +
+    "repo configuration, not a GitHub failure, and retrying will not change it.",
+};
+
+/** How many unread rows fall under each cause. */
+function unreadCauseCounts(unread: readonly ConflictingPr[]): Record<UnreadCause, number> {
+  const n: Record<UnreadCause, number> = { gh: 0, "not-reached": 0, "no-remote": 0 };
+  for (const c of unread) n[unreadCause(c)] += 1;
+  return n;
+}
+
+/**
+ * The clause after "could not be read —", naming the real cause. One cause gets one plain phrase;
+ * a mix is broken down BY COUNT, and every count it prints is quoted in `measured` by the caller.
+ */
+function unreadWhyPhrase(n: Record<UnreadCause, number>): string {
+  const causes = (Object.keys(n) as UnreadCause[]).filter((k) => n[k] > 0);
+  if (causes.length === 1) {
+    switch (causes[0]) {
+      case "not-reached":
+        return "our own sweep ran out of time before reaching them, so GitHub was never asked; the next sweep starts with them";
+      case "no-remote":
+        return "their project has no git remote, so there is no GitHub repository to ask";
+      default:
+        return "GitHub could not be asked";
+    }
+  }
+  const parts: string[] = [];
+  if (n["not-reached"] > 0) parts.push(`${n["not-reached"]} not reached before our sweep ran out of time`);
+  if (n["no-remote"] > 0) parts.push(`${n["no-remote"]} in a project with no git remote`);
+  if (n.gh > 0) parts.push(`${n.gh} where GitHub could not be asked`);
+  return parts.join("; ");
+}
+
+/**
  * A reading old enough to be worth saying out loud — one minute.
  *
  * Below it the phrase would render "last read 0h 0m ago", which is noise, and noise on a qualifier
@@ -1506,7 +1574,7 @@ export function conflictCondition(
       const lastRead =
         c.kind === "conflicting" ? "conflicting, and therefore untested" : "last known to be mergeable";
       return (
-        `  - #${c.pr} ${c.branch} — ${COULD_NOT_ASK_LABEL}${why}. ${COULD_NOT_ASK_SENTENCE} ` +
+        `  - #${c.pr} ${c.branch} — ${UNREAD_LABEL[unreadCause(c)]}${why}. ${UNREAD_SENTENCE[unreadCause(c)]} ` +
         `The last look that got an answer says ${lastRead} — that verdict is NOT current, because nothing ` +
         `about this commit could be confirmed on the last look${agePhrase(c)}. ${behind} when we last ` +
         `managed to look, flagged for ${h}h ${m}m. ${who}.`
@@ -1532,6 +1600,13 @@ export function conflictCondition(
   const nU = unread.length;
   const nUC = unreadConflicting.length;
   const nUS = unreadStale.length;
+  // WHY the unread rows were not read — see {@link unreadCause}. Only the `gh` share is a GitHub
+  // failure; the headline names the real cause and the gh remedy is offered for that share alone.
+  const byCause = unreadCauseCounts(unread);
+  const whyUnread = unreadWhyPhrase(byCause);
+  const notEvidence =
+    `${byCause.gh === nU ? "A failed gh call" : "An unread PR"} is not evidence that something is wrong, ` +
+    `and it is not evidence that nothing is.`;
   // AN AGGREGATE MAY BE NO STRONGER THAN THE WEAKEST ROW IT COVERS. "Never been tested" is licensed
   // by the directly-observed absence and nothing else: a `checks-are-stale` row DID run CI, and an
   // inherited or unread row is a verdict nobody re-read — so the old absolute headline contradicted
@@ -1553,7 +1628,7 @@ export function conflictCondition(
       : "";
   const unreadClause =
     nU > 0
-      ? ` ${nU} more could not be read at all — GitHub could not be asked, so ${nU === 1 ? "that row is" : "those rows are"} ` +
+      ? ` ${nU} more could not be read at all — ${whyUnread}, so ${nU === 1 ? "that row is" : "those rows are"} ` +
         `the last answer we got and not a verdict about the pull ${nU === 1 ? "request" : "requests"}.` +
         lastKnownConflictingClause
       : "";
@@ -1576,7 +1651,7 @@ export function conflictCondition(
             // last read CONFLICTING carry a real, recent verdict, and the absolute "any of these may be
             // green and mergeable right now" would contradict every one of them. The conflict keeps its
             // count and, in `remedy`, its catch-up advice — conditioned, never withdrawn.
-            `${nU} open ${nU === 1 ? "PR" : "PRs"} could not be read — GitHub could not be asked, so nothing below is a ` +
+            `${nU} open ${nU === 1 ? "PR" : "PRs"} could not be read — ${whyUnread}, so nothing below is a ` +
             `CURRENT verdict about the pull ${nU === 1 ? "request" : "requests"}. That is not the same as knowing nothing: ` +
             `${nUC} ${nUC === 1 ? "was" : "were"} last known to be conflicting and therefore untested, on a look that DID ` +
             `get an answer, and we could not re-check ${nUC === 1 ? "it" : "them"} — keep acting on that conflict until a ` +
@@ -1584,16 +1659,15 @@ export function conflictCondition(
             (nUS > 0
               ? ` The other ${nUS} ${nUS === 1 ? "was" : "were"} last known to merge, and may be green right now.`
               : "") +
-            ` A failed gh call is not evidence that something is wrong, and it is not evidence that nothing is.`
+            ` ${notEvidence}`
           : // NOTHING WAS READ, AND THE LAST THING EVERY ROW SAID WAS "MERGEABLE". The report still goes
             // out — silence here is the failure the producer's fail-closed path exists to prevent — but
             // it says what it is: an outage on our side, and not one word about whether any of these
             // pull requests can merge. THE ABSOLUTE WORDING BELONGS TO THIS SHAPE AND NO OTHER: it is
             // only true when no unread row was last known to be conflicting.
-            `${nU} open ${nU === 1 ? "PR" : "PRs"} could not be read — GitHub could not be asked. ` +
+            `${nU} open ${nU === 1 ? "PR" : "PRs"} could not be read — ${whyUnread}. ` +
             `That is a fact about our own read, not about the pull ${nU === 1 ? "request" : "requests"}: nothing below is a ` +
-            `verdict, and ${nU === 1 ? "this PR" : "any of these"} may be green and mergeable right now. A failed gh call is ` +
-            `not evidence that something is wrong, and it is not evidence that nothing is.`;
+            `verdict, and ${nU === 1 ? "this PR" : "any of these"} may be green and mergeable right now. ${notEvidence}`;
 
   // Only when there IS a conflict to resolve. A remedy sentence about conflicts appended to a
   // stale-only report is advice about a situation the report just said does not hold.
@@ -1624,9 +1698,17 @@ export function conflictCondition(
         `and if still conflicting, catching the branch up onto main is what clears it. Merge origin/main when the branch ` +
         `carries merge commits; rebase onto it otherwise. Then push.`
       : "") +
-    // TRUE OF EVERY UNREAD ROW, whichever half it fell in: the read itself is what broke.
-    (nU > 0
+    // ONLY FOR THE SHARE WHERE gh ITSELF BROKE. Offered over a budget-skipped or remoteless row it
+    // is advice to re-authenticate a healthy CLI (beads sparkle-5i7e8x.3, sparkle-5i7e8x.4).
+    (byCause.gh > 0
       ? `\nAnd check gh itself — an expired login or a spent rate limit blinds every read until a person clears it.`
+      : "") +
+    (byCause["not-reached"] > 0
+      ? `\nThe PRs our sweep did not reach need nothing from anyone: the next sweep starts with them.`
+      : "") +
+    (byCause["no-remote"] > 0
+      ? `\nA project with no git remote cannot have its pull requests watched: add a git remote to its checkout ` +
+        `if it should have them; otherwise it is a local-only repo and there is nothing to fix.`
       : "");
 
   return {
@@ -1714,6 +1796,11 @@ export function conflictCondition(
       String(nU),
       String(nUC),
       String(nUS),
+      // The per-cause breakdown a MIXED unread set prints in the headline. Spare entries are
+      // harmless; a missing one would refuse the whole report as `fabricated-citation`.
+      String(byCause.gh),
+      String(byCause["not-reached"]),
+      String(byCause["no-remote"]),
       ...ordered.flatMap((c) => [String(c.pr), String(behindOf(c))]),
       ...ages.flatMap(({ h, m }) => [String(h), String(m)]),
       // The READING age, which is a DIFFERENT number from the conflict age above it. Emitted for

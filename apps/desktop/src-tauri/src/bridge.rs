@@ -897,6 +897,11 @@ const CONTROL_OPS: &[&str] = &[
     // claim/release let an agent say "I am landing this myself" somewhere the concierge's merge gate
     // can see it. The claimant is the bridge-stamped caller — no payload names it.
     "set_agent_goal_met",
+    // An agent PARKS its own goal — "the resume ladder cannot move this" (epic `sparkle-5i7e8x`):
+    // awaiting a person, superseded by another lineage, or waiting on an external clock. Self-report
+    // like `set_agent_goal_met`, and caller-stamped the same way: the frontend refuses any target
+    // but the caller (`goalParkControl.ts`). Without this entry it dies at "unknown op".
+    "set_agent_goal_parked",
     // The concierge's BOUNDED lever on a goal's `escalated` state (bead sparkle-hm4z9). Listed here
     // like every other op, but it is the one whose coarse existence gate is genuinely not enough:
     // the frontend narrows it to the reserved concierge caller id, because clearing an escalation
@@ -2544,6 +2549,8 @@ mod tests {
             // `set_agent_goal` is deliberately not repeated here — it is asserted once, in the
             // Phase-1 line above, matching where CONTROL_OPS lists it.
             "set_agent_goal_met", "claim_pr", "release_pr",
+            // An agent parking its own goal (epic `sparkle-5i7e8x`).
+            "set_agent_goal_parked",
             // Phase 5: agent-to-agent peer messaging (bead `sparkle-0vl92`).
             "send_peer_message",
             // The concierge's bounded lever on `escalated` — raise one, or clear one (twice at
@@ -2560,8 +2567,8 @@ mod tests {
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            23,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the cross-repo landing stamp, the concierge escalation lever, the peer send, the Chief tool op, and the preview op"
+            24,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the goal park, the cross-repo landing stamp, the concierge escalation lever, the peer send, the Chief tool op, and the preview op"
         );
     }
 

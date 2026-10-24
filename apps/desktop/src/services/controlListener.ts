@@ -68,6 +68,7 @@ import {
   processAliveFor,
 } from "./goalContinuationRunner";
 import { notifyAttention } from "./attention";
+import { handleSetGoalParked } from "./goalParkControl";
 import { sideOf } from "../engine/pairs";
 import { ZOOM_COLUMNS, isZoomColumn, type ZoomColumn } from "../engine/columnZoom";
 import {
@@ -148,7 +149,8 @@ import {
   awaitingCloseEvidenceFor,
   authoredWorkSeen,
   landedEvidenceFor,
-  probeLandedFromGit,
+  probeLandedDetailFromGit,
+  type LandedProbeDetail,
   shippedAfterGoalSet,
   stallEvidenceFor,
   stallReadingFor,
@@ -260,6 +262,7 @@ const TALLY: Record<ControlOp, boolean> = {
   // goal text or the claim note.
   set_agent_goal: true,
   set_agent_goal_met: true,
+  set_agent_goal_parked: true,
   // Where the work landed — the op name only, never the repo/PR/note. For a cross-repo agent the
   // repository name IS the identifying payload, so it is exactly the thing not to record.
   set_agent_landed: true,
@@ -368,6 +371,10 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // a target), because declaring a different live agent finished latches its `metAt` and renders a
   // possibly-stalled agent done.
   set_agent_goal_met: "free",
+  // FREE, like `set_agent_goal_met` beside it, and SELF-ONLY by its handler: an agent parks only its
+  // own goal. It closes nothing (`metAt` is untouched) and is reversible, so it is safe for an
+  // unattended worker — which is the agent most likely to be stuck on a goal it cannot close.
+  set_agent_goal_parked: "free",
   // FREE, and stated as a decision because the table demands one. It is SELF-REPORT — an agent
   // saying where its own work landed — the same class as `set_agent_activity`, and it has to be
   // reachable by an UNATTENDED worker, which is precisely the agent most likely to be doing
@@ -529,6 +536,7 @@ const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   navigate: true,
   set_agent_goal: true,
   set_agent_goal_met: true,
+  set_agent_goal_parked: true,
   set_agent_escalation: true,
   claim_pr: true,
   release_pr: true,
@@ -2179,7 +2187,7 @@ interface SelfMarkDecision {
   arm: SelfMarkArm;
   /** Did the git ancestry probe run at all? Separates "not asked" from "asked, could not tell". */
   probeRan: boolean;
-  /** What the probe answered. `undefined` = it could not tell (never "no" — see `probeLandedFromGit`). */
+  /** What the probe answered. `undefined` = it could not tell (never "no" — see `probeLandedDetailFromGit`). */
   probe: boolean | undefined;
   /** The reading `canSelfMarkMet` actually gated on. `undefined` = nobody looked. */
   landedReading: boolean | undefined;
@@ -2187,6 +2195,17 @@ interface SelfMarkDecision {
   authoredWorkSeen: boolean | undefined;
   /** The provenance `selfMarkRefusal` picked its copy from. `undefined` = unrecorded. */
   landedSource: GoalVerifyEvidence["landedSource"];
+  /** WHAT git compared — branch, both shas, and the reflog's authored-work proof. `undefined` = the
+   *  probe never ran. Printed so a refusal NAMES what it measured (bead sparkle-q4r8z2). */
+  probeDetail: LandedProbeDetail | undefined;
+}
+
+/** The one line naming what the ancestry probe compared, or why it cannot. */
+function comparedLine(p: LandedProbeDetail | undefined): string {
+  if (p === undefined) return "compared: not-run";
+  if (p.headSha === undefined || p.baseSha === undefined) return "compared: unresolved (the probe returned no shas)";
+  const branch = p.branch === undefined ? "(detached HEAD)" : `branch ${p.branch}`;
+  return `compared: ${branch} HEAD ${p.headSha} against ${p.baseRef ?? "origin/<default>"} ${p.baseSha}`;
 }
 
 /** `undefined` is NOT LOOKED UP and must never render as `false` — that is the distinction the whole
@@ -2201,6 +2220,14 @@ function selfMarkDecisionLines(d: SelfMarkDecision): string[] {
     `landedReading: ${d.landedReading === undefined ? "unread" : String(d.landedReading)}`,
     `authoredWorkSeen: ${d.authoredWorkSeen === undefined ? "not-consulted" : String(d.authoredWorkSeen)}`,
     `landedSource: ${d.landedSource ?? "unrecorded"}`,
+    comparedLine(d.probeDetail),
+    `authoredOnOrigin (reflog): ${
+      d.probeDetail === undefined
+        ? "not-run"
+        : d.probeDetail.authoredLanded === undefined
+          ? "could-not-tell"
+          : String(d.probeDetail.authoredLanded)
+    }`,
   ];
 }
 
@@ -2399,7 +2426,7 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
   //
   // THIS SEAM CAN AFFORD WHAT THE ROSTER CANNOT: one call, one agent, made by an agent that believes
   // it has finished. So when — and only when — the cheap reader declines AND the answer would change
-  // the outcome, ask git directly (`services/agentGoalReading.probeLandedFromGit` →
+  // the outcome, ask git directly (`services/agentGoalReading.probeLandedDetailFromGit` →
   // `goal_landed_probe.rs`). It resolves the branch from the worktree's own HEAD, refreshes and
   // compares against `refs/remotes/origin/<default>`, and decides by ancestry.
   //
@@ -2408,7 +2435,7 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
   // already answered `true` needs no second opinion, because that answer CLOSES the goal. Any of
   // those and the probe never runs, so no ordinary call pays for a subprocess.
   //
-  // ITS FAILURES ARE `undefined`, NEVER `false` — see `probeLandedFromGit`. A `false` here would emit
+  // ITS FAILURES ARE `undefined`, NEVER `false` — see `probeLandedDetailFromGit`. A `false` here would emit
   // "git says it is not on origin/main yet", which is the exact sentence the beads above report as a
   // lie; an unreadable git must keep producing the "nothing has read your branch yet" copy.
   //
@@ -2441,9 +2468,11 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
     goal.verify?.kind === "landed" ? "ancestry:probe-not-run" : "verify-kind-not-self-markable";
   let probeRan = false;
   let probeVerdict: boolean | undefined;
+  let probeDetail: LandedProbeDetail | undefined;
   let authoredSeen: boolean | undefined;
   if (goal.verify?.kind === "landed" && landedReading !== true && met && !isConcierge) {
-    const probed = await probeLandedFromGit(targetId);
+    probeDetail = await probeLandedDetailFromGit(targetId);
+    const probed = probeDetail.landed;
     probeRan = true;
     probeVerdict = probed;
     // READ ONCE, UNCONDITIONALLY, AND DECIDE ON THE SAME VALUE. `authoredWorkSeen` is a pure read of
@@ -2476,7 +2505,19 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
       // there is no `committedWorkSeen` input to consult and no window verdict being overruled;
       // requiring authored work there would refuse the very agent the probe exists to serve, and
       // its own test ("MARKS MET when git says the worktree's HEAD is an ancestor") pins that.
-    } else if (probed === true && (landedReading === undefined || authoredSeen)) {
+    } else if (
+      probed === true &&
+      // THREE ways past the no-op guard, and the third is git's own (sparkle-28ifhw, sparkle-t58ekc,
+      // sparkle-9vptk0). `authoredSeen` reads the WINDOW-LOCAL workflow state, which is resolved by
+      // the branch NAME `sparkle/agent-<id>` and which a merged-then-deleted branch drives back to a
+      // bare cut's values (ahead 0, unpushed, no PR) — so it answered `false` for exactly the agents
+      // whose work provably merged, and they were refused `git-probe-unproven` forever.
+      // `authoredLanded` is the probe's proof that a commit AUTHORED IN THIS WORKTREE (its private
+      // HEAD reflog) is an ancestor of origin/<default>. It is strictly the guard's own question —
+      // "did this branch do work, and is that work there" — answered without the name lookup, and
+      // `false` for a bare cut or a commit reset away, so the no-op hole stays shut.
+      (landedReading === undefined || authoredSeen || probeDetail.authoredLanded === true)
+    ) {
       landedReading = true;
       landedSource = "git-probe";
       // NO ARM NAME IS RECORDED HERE, deliberately: this branch CLOSES the goal, and the diagnostic
@@ -2494,7 +2535,7 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
       selfMarkArm = "ancestry:git-probe-unproven";
     } else {
       // THE PROBE ANSWERED `undefined` — it ran and could not tell. That is a THIRD state, not a
-      // shade of git's no: `probeLandedFromGit` answers `undefined` on every failure path precisely
+      // shade of git's no: `probeLandedDetailFromGit` answers `undefined` on every failure path precisely
       // so a dead worktree or a failed fetch can never be reported as "git says it is not on
       // origin/main". The reading is left exactly as it was, which is what the arm has always done;
       // only its name is new.
@@ -2546,6 +2587,7 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
       landedReading,
       authoredWorkSeen: authoredSeen,
       landedSource,
+      probeDetail: probeRan ? probeDetail : undefined,
     };
     const decisionLine = selfMarkDecisionLines(decision).join(", ");
     console.warn(`[control] goal_not_self_markable ${targetId} (${goal.verify.kind}): ${decisionLine}`);
@@ -5038,6 +5080,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "set_agent_goal_met":
         result = await handleSetGoalMet(req);
+        break;
+      case "set_agent_goal_parked":
+        result = handleSetGoalParked(req);
         break;
       case "set_agent_escalation":
         result = handleSetEscalation(req);
