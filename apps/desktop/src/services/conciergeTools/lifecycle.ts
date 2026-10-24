@@ -77,6 +77,8 @@ import { classifyStartError } from "../cloudAgents/startError";
 import type { CategoryId } from "../../stores/uiStore";
 import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { closeDecision, worktreeRiskOf, type WorktreeRisk } from "../../engine/closeAgent";
+import { feedbackDraftCardIsOnlyAsk } from "../../engine/feedbackDraftCard";
+import { getAgentViewport } from "../terminalViewport";
 import { agentBranchName } from "./workflow";
 import {
   agentBranchStatus,
@@ -1701,6 +1703,14 @@ const DEFAULT_RETIRE_DEPS: RetireDeps = {
 export function liveActivityOf(agentId: string): LiveActivity {
   const status = useRuntimeStore.getState().status[agentId];
   if (status === undefined) return "unknown";
+  // A `waiting` painted by a drafted-feedback card is not an open exchange (bead sparkle-eou3y0.5).
+  // The status map may still hold it from before the engine learned the card, or from a pane that
+  // has not re-settled. So the LIVE viewport is asked here too. Only `waiting` is lowered: the card
+  // never produces `approval` or `questions`, and an unreadable viewport keeps the busy answer.
+  if (status === "waiting") {
+    const viewport = getAgentViewport(agentId);
+    if (viewport && !viewport.alternateBuffer && feedbackDraftCardIsOnlyAsk(viewport.text)) return "quiet";
+  }
   if (status === "working" || status === "questions" || status === "waiting" || status === "approval")
     return "working";
   return "quiet";

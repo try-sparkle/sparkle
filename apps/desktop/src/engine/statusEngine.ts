@@ -35,6 +35,7 @@ import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { isSessionLimitPicker, isStoppedResumeBanner, screenAwaitsInput } from "./screenClassifier";
 import { parseDelegatedWorkCount } from "./backgroundTaskFooter";
+import { feedbackDraftCardIsOnlyAsk, screenAwaitsHuman } from "./feedbackDraftCard";
 import {
   noteBackgroundTasks,
   forgetBackgroundTasks,
@@ -1129,7 +1130,9 @@ export class StatusEngine {
     // healthy delegating session. Runs on every settle, so Claude's follow-up-turn-on-task-finish
     // self-corrects the count down to zero through the ordinary turn cycle.
     this.noteBackgroundTasksFromScreen(snapshot);
-    const awaiting = blank ? false : screenAwaitsInput(snapshot);
+    // `screenAwaitsHuman`, not `screenAwaitsInput`: a drafted-feedback card alone is the agent's
+    // own optional report, not a question, so it settles gray (bead sparkle-eou3y0.5).
+    const awaiting = blank ? false : screenAwaitsHuman(snapshot);
     // The VIEWPORT is the only surface this question may be asked of — never the streamed lines
     // `ingest` scans. See isSessionLimitPicker's header: bottom-anchoring is what keeps prose that
     // quotes the screen out, and scrollback has no bottom.
@@ -1233,6 +1236,13 @@ export class StatusEngine {
     // never changes the status.
     if ((this.status === "waiting" || this.status === "approval") && this.statusReason === null) {
       const snapshot = this.opts.getScreen?.() ?? "";
+      // The mid-stream path cannot see that a streamed footer belongs to a drafted-feedback card
+      // when the card has not painted yet. This re-read can, and it LOWERS the band to idle: the
+      // card is not a question for a person (bead sparkle-eou3y0.5, feedbackDraftCard.ts).
+      if (feedbackDraftCardIsOnlyAsk(snapshot)) {
+        this.set("idle", "screen-recheck", "calm");
+        return;
+      }
       if (this.noteSessionLimitPicker(snapshot))
         this.set("waiting", "screen-recheck", undefined, "session-limit-picker");
       else if (screenAwaitsInput(snapshot))
@@ -1243,7 +1253,7 @@ export class StatusEngine {
     // terminal state (done/stopped), and a screen read must not resurrect it.
     if (this.status !== "working" && this.status !== "idle") return;
     const snapshot = this.opts.getScreen?.() ?? "";
-    if (!screenAwaitsInput(snapshot)) return;
+    if (!screenAwaitsHuman(snapshot)) return;
     // Same viewport, same question as settle — a session-limit picker that painted late is exactly
     // the case this re-read exists for, and it must arrive carrying its reason or the router has
     // nothing to pierce with.
@@ -1532,6 +1542,11 @@ export class StatusEngine {
         this.lastSpinnerTokens = tokens;
       }
     }
+
+    // A streamed footer that belongs to a drafted-feedback card on the viewport is not a prompt for a
+    // person (bead sparkle-eou3y0.5). Drop it here so the turn settles normally. If the card has not
+    // painted yet this reads nothing, and the late re-check lowers the band instead.
+    if (prompt && feedbackDraftCardIsOnlyAsk(this.opts.getScreen?.() ?? "")) prompt = false;
 
     // 1. An input prompt always wins: the agent is asking for you.
     if (prompt) {

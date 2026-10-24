@@ -27,6 +27,7 @@
 //      the composer prompt, status bars) plus a small allowance — so a card QUOTED in output that
 //      has since scrolled on is never read as one that is still waiting.
 import { AMBIENT_CHROME_LINE } from "../services/sessionLimitScreen";
+import { screenAwaitsInput } from "./screenClassifier";
 
 export interface FeedbackDraftOption {
   /** The single keystroke the card takes for this option. */
@@ -114,4 +115,35 @@ export function findFeedbackDraftCard(lines: readonly string[]): FeedbackDraftCa
     return { titleIdx, footerIdx: i, options };
   }
   return null;
+}
+
+// ══ A DRAFTED BUG REPORT IS NOT A QUESTION FOR A HUMAN (bead sparkle-eou3y0.5) ═════════════════
+// The card's footer is shaped like a picker's, so `screenAwaitsInput` matches it and the status
+// engine painted the row `waiting`. That is the red "Needs you" band, and `retire_agent` reads it
+// as an exchange in progress (`agent-busy`). The card is the agent's OWN feedback about Sparkle,
+// offered for optional review. Nobody is blocked on it, and the turn that drew it has ended. So a
+// finished agent whose only open thing was that card could be neither ignored nor retired.
+//
+// The answer is narrow. It does not say "a card is on screen, so nothing is asked". It removes the
+// card's own footer row and asks `screenAwaitsInput` again. A real prompt drawn beside the card
+// (a permission dialog, a shell `(y/n)`) still answers yes, so it still paints red.
+//
+// The STATUS question only. A write guard must still treat the card as a live dialog: its options
+// are single keystrokes, and free text typed into it could press `2 send`. So this is used by the
+// status engine and the retire predicate's activity read. `screenAwaitsInput` itself is unchanged.
+
+/** True when a live feedback-draft card is the only thing on `snapshot` asking for input. */
+export function feedbackDraftCardIsOnlyAsk(snapshot: string): boolean {
+  if (!snapshot.trim()) return false;
+  const lines = snapshot.replace(/\r/g, "\n").split("\n");
+  const card = findFeedbackDraftCard(lines);
+  if (!card) return false;
+  const withoutCard = lines.map((l, i) => (i === card.footerIdx ? "" : l)).join("\n");
+  return !screenAwaitsInput(withoutCard);
+}
+
+/** `screenAwaitsInput` for the STATUS band: true when something on screen waits on a person.
+ *  A drafted-feedback card on its own does not count. See the block above. */
+export function screenAwaitsHuman(snapshot: string): boolean {
+  return screenAwaitsInput(snapshot) && !feedbackDraftCardIsOnlyAsk(snapshot);
 }

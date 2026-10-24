@@ -9,7 +9,7 @@
 // one line that supplies the real recorder — is exercised by the suite. A seam every test overrides
 // is a seam whose production call site is covered by nothing, and deleting it would leave the suite
 // green while the bug came back (bead sparkle-lgbwf, seen 4×).
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../../pty", () => ({ killPty: vi.fn(async () => {}) }));
 vi.mock("../tasks", () => ({ createBeadFull: vi.fn(async () => "bd-new") }));
@@ -84,6 +84,8 @@ import {
   unstaffedEpicsFromReleases,
 } from "../epicStaffing";
 import { closeAgent, retireAgent } from "./lifecycle";
+import { registerViewport, resetViewportRegistry } from "../terminalViewport";
+import { FEEDBACK_DRAFT_CARD_SCREEN } from "../../engine/incidentScreens.fixture";
 import { evaluateToolPolicy, NO_TOOL_POLICY_OVERRIDES } from "./policy";
 import {
   onConciergeActionReceipt,
@@ -456,6 +458,51 @@ describe("retire_agent and a live status that cannot be read", () => {
     const id = seedBuild(p, { status: "waiting" as AgentTabStatus });
     const r = await retireAgent(id, { reason: REASON });
     expect(r.ok === false && r.reason).toBe("agent-busy");
+  });
+
+  // ── A DRAFTED-FEEDBACK CARD IS NOT AN OPEN QUESTION (bead sparkle-eou3y0.5) ────────────────────
+  // A finished agent answered a status check by drafting SendFeedback. Its card left the row on
+  // `waiting`, so retire refused `agent-busy` and only a keypress in the pane could clear it.
+  describe("an agent whose only pending UI is a feedback-draft card", () => {
+    let unregister: () => void = () => {};
+    afterEach(() => {
+      unregister();
+      resetViewportRegistry();
+    });
+    const showing = (id: string, text: string) => {
+      unregister = registerViewport(id, () => ({ text, alternateBuffer: false }));
+    };
+
+    it("is retired, and its row is torn down", async () => {
+      const p = seedProject();
+      const id = seedBuild(p, { status: "waiting" as AgentTabStatus });
+      showing(id, FEEDBACK_DRAFT_CARD_SCREEN);
+      const r = await retireAgent(id, { reason: REASON });
+      expect(r.ok).toBe(true);
+      expect(rowExists(p, id)).toBe(false);
+    });
+
+    it("PAIRED: a card with a real question beside it still refuses agent-busy", async () => {
+      const p = seedProject();
+      const id = seedBuild(p, { status: "waiting" as AgentTabStatus });
+      showing(
+        id,
+        FEEDBACK_DRAFT_CARD_SCREEN.replace(
+          "  1 to review · 2 to send · 0 to dismiss",
+          "  1 to review · 2 to send · 0 to dismiss\n  Overwrite existing file? (y/n)",
+        ),
+      );
+      const r = await retireAgent(id, { reason: REASON });
+      expect(r.ok === false && r.reason).toBe("agent-busy");
+      expect(rowExists(p, id)).toBe(true);
+    });
+
+    it("PAIRED: an unreadable viewport keeps the busy answer", async () => {
+      const p = seedProject();
+      const id = seedBuild(p, { status: "waiting" as AgentTabStatus });
+      const r = await retireAgent(id, { reason: REASON });
+      expect(r.ok === false && r.reason).toBe("agent-busy");
+    });
   });
 
   it("a deadClaim backed only by a stale tier is refused, and nothing is torn down", async () => {
