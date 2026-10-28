@@ -71,6 +71,7 @@ import { localAgentCapacity } from "./agentCapacity";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { ownsProjectInThisWindow, processAliveFor } from "./goalContinuationRunner";
+import { wasProjectVisited } from "./sessionProjects";
 import { log } from "../logger";
 import type { AgentTab, Project } from "../types";
 
@@ -1334,6 +1335,14 @@ export interface BabysitSweepDeps {
   ownsProject: (projectId: string) => boolean;
   projects: () => readonly Project[];
   /**
+   * Whether a BACKGROUND spawn into this project could succeed at all. `buildAgentSpawn` refuses a
+   * background spawn into a project the human has not opened this session (no pane would mount),
+   * so sweeping such a project can only choose a PR, have its spawn refused, and repeat every 180 s
+   * — measured as dozens of paired refusal/"keeps choosing" warns a day per unopened project, each
+   * after a `gh` probe per open PR. Omitted means "every project is spawnable".
+   */
+  projectSpawnable?: (projectId: string) => boolean;
+  /**
    * The REAL clock, for the hourly-budget append only — see `babysitSweepProject`'s `dispatchClock`.
    *
    * It lives on the injectable deps rather than being written inline at the call site so the
@@ -1354,6 +1363,7 @@ const PRODUCTION_DEPS: BabysitSweepDeps = {
   sweepClock: () => Date.now(),
   ownsProject: ownsProjectInThisWindow,
   projects: () => useProjectStore.getState().projects,
+  projectSpawnable: wasProjectVisited,
 };
 
 export async function sweepAllProjects(
@@ -1377,6 +1387,10 @@ export async function sweepAllProjects(
     // still `BABYSIT_DISPATCHES_PER_HOUR` EACH. The lease stops two drivers on one PR; nothing here
     // bounds total spend across windows, and a durable counter is what would.
     if (!deps.ownsProject(project.id)) continue;
+    // A project whose background spawn is refused by construction is not swept: every dispatch it
+    // chose would be refused, so the sweep would spend a probe per PR to produce a false "wedged".
+    // It is picked up on the first sweep after the human opens the project.
+    if (deps.projectSpawnable && !deps.projectSpawnable(project.id)) continue;
     try {
       if (!isCurrent()) return;
       const outcome = await babysitSweepProject(project, now, resolved, isCurrent, deps.dispatchClock);

@@ -88,6 +88,7 @@ import { log } from "../logger";
 import { resolveBabysitConfig } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { markProjectVisited } from "./sessionProjects";
 import type { AgentTab, Project } from "../types";
 
 // `agents: []` is REQUIRED on the fixture, not defaulted away in the source. Project.agents is a
@@ -214,6 +215,9 @@ async function sweepTwice() {
 }
 
 beforeEach(() => {
+  // The production sweep skips a project no background spawn can reach (never opened this
+  // session); the tick-level tests drive production deps, so PROJECT must count as opened.
+  markProjectVisited(PROJECT.id);
   invokeMock.mockReset();
   spawnMock.mockReset();
   fetchOpenPrsMock.mockReset();
@@ -529,6 +533,37 @@ describe("sweepAllProjects — the single-owner election", () => {
     wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
     await sweepAllProjects(CONFIG, {
       ownsProject: () => true,
+      projects: () => [PROJECT, projectB],
+      dispatchClock: () => T0,
+      sweepClock: () => T0,
+    });
+    expect(fetchOpenPrsMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// A background spawn into a project not opened this session is refused by `buildAgentSpawn`, so
+// sweeping it could only produce a refusal every tick and a false "wedged" warn.
+describe("sweepAllProjects — a project no background spawn can reach is not swept", () => {
+  const projectB = { id: "p2", name: "other", rootPath: "/repo2", agents: [] } as unknown as Project;
+
+  it("SKIPS an unspawnable project and still sweeps the spawnable one", async () => {
+    wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
+    await sweepAllProjects(CONFIG, {
+      ownsProject: () => true,
+      projectSpawnable: (id) => id === PROJECT.id,
+      projects: () => [PROJECT, projectB],
+      dispatchClock: () => T0,
+      sweepClock: () => T0,
+    });
+    expect(fetchOpenPrsMock).toHaveBeenCalledTimes(1);
+    expect(fetchOpenPrsMock.mock.calls[0]?.[0]).toBe(PROJECT.rootPath);
+  });
+
+  it("sweeps BOTH when both are spawnable — the gate is a filter, not an off switch", async () => {
+    wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
+    await sweepAllProjects(CONFIG, {
+      ownsProject: () => true,
+      projectSpawnable: () => true,
       projects: () => [PROJECT, projectB],
       dispatchClock: () => T0,
       sweepClock: () => T0,
