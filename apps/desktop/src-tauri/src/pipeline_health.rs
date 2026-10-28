@@ -1166,6 +1166,80 @@ fn read_oldest_queued_age_secs(json: &str, now_epoch: i64) -> Option<u64> {
     Some(now_epoch.saturating_sub(oldest).max(0) as u64)
 }
 
+/// JOB-LESS QUEUED RUNS ARE NOT WORK (bead `sparkle-35on1g`). `actions/runs?status=queued` counts
+/// RUNS, and a run can sit `queued` forever having created ZERO jobs — measured: a `workflow_run`
+/// Release-reconcile run, queued 20+ days, that neither cancel nor delete would clear. Counted, it
+/// pinned queued=1 at a 20-day age, so the idle-floor arm (queued==0, `sparkle-hwhheg`) and the
+/// boot-grace arm (age < grace, `sparkle-eou3y0.7`) were both unreachable and every normal ~3-minute
+/// cold start of the scale-to-zero pool read as BLOCKING. A run with no jobs has nothing for a runner
+/// to take, so it is not waiting on the pool; the autoscaler already gets this right by counting JOBS.
+///
+/// Only runs OLDER than [`CI_BOOT_GRACE_SECS`] are probed, oldest first, at most this many — one jobs
+/// read each. A younger run already lands in the boot-grace WARNING, never BLOCKING, and the cap
+/// bounds the extra reads during a merge burst. Mirrored by `drop_jobless_queued_runs` in
+/// `scripts/pipeline-health-scan.sh` (`PH_CI_JOBLESS_PROBE_MAX`) — keep the two in step.
+const CI_JOBLESS_PROBE_MAX: usize = 5;
+
+/// Ids of the queued runs on the page worth probing for jobs: past the boot grace, oldest first,
+/// capped at [`CI_JOBLESS_PROBE_MAX`]. Empty for any shape we do not understand.
+fn jobless_probe_candidates(json: &str, now_epoch: i64) -> Vec<u64> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim()) else { return Vec::new() };
+    let Some(runs) = value.get("workflow_runs").and_then(|v| v.as_array()) else { return Vec::new() };
+    let mut aged: Vec<(i64, u64)> = runs
+        .iter()
+        .filter_map(|run| {
+            let id = run.get("id")?.as_u64()?;
+            let ts = run
+                .get("run_started_at")
+                .and_then(|v| v.as_str())
+                .or_else(|| run.get("created_at").and_then(|v| v.as_str()))?;
+            let started = github_ts_to_epoch(ts)?;
+            (now_epoch.saturating_sub(started) >= CI_BOOT_GRACE_SECS as i64).then_some((started, id))
+        })
+        .collect();
+    aged.sort_unstable();
+    aged.into_iter().take(CI_JOBLESS_PROBE_MAX).map(|(_, id)| id).collect()
+}
+
+/// Read `.total_count` from `gh api "repos/<repo>/actions/runs/<id>/jobs?per_page=1"`. `None` for any
+/// shape we do not understand — which the caller treats as "could not see its jobs", never as zero.
+fn read_run_job_count(json: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    Some(value.get("total_count")?.as_u64()? as usize)
+}
+
+/// The queued-runs page with every PROVEN job-less run removed and `.total_count` lowered to match,
+/// so [`read_queued_runs`] and [`read_oldest_queued_age_secs`] read it unchanged. `job_count` answers
+/// one run's job count, `None` when unreadable; only `Some(0)` drops a run, so a failed jobs read
+/// keeps it counted — "could not see its jobs" must never read as "has no jobs", or a real stuck run
+/// would vanish from the queue. An unparseable page is returned as-is.
+fn drop_jobless_queued_runs(
+    json: &str,
+    now_epoch: i64,
+    mut job_count: impl FnMut(u64) -> Option<usize>,
+) -> String {
+    let drop: Vec<u64> = jobless_probe_candidates(json, now_epoch)
+        .into_iter()
+        .filter(|&id| job_count(id) == Some(0))
+        .collect();
+    if drop.is_empty() {
+        return json.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+        return json.to_string();
+    };
+    let mut removed = 0u64;
+    if let Some(runs) = value.get_mut("workflow_runs").and_then(|v| v.as_array_mut()) {
+        let before = runs.len();
+        runs.retain(|run| !run.get("id").and_then(|v| v.as_u64()).is_some_and(|id| drop.contains(&id)));
+        removed = (before - runs.len()) as u64;
+    }
+    if let Some(total) = value.get("total_count").and_then(|v| v.as_u64()) {
+        value["total_count"] = serde_json::Value::from(total.saturating_sub(removed));
+    }
+    value.to_string()
+}
+
 /// The BOOT GRACE for an empty pool with work queued (bead `sparkle-eou3y0.7`). `linux-ci` scales to
 /// ZERO by design, and booting a Spot VM from zero takes the measured ~175s create->runner-online
 /// (`scripts/lib/ci-autoscale.sh`); the autoscaler itself waits `CIA_SATURATED_QUEUE_GRACE_S` /
@@ -3161,6 +3235,7 @@ fn runner_components(
     root: &str,
 ) -> (Vec<ComponentHealth>, Option<bool>) {
     let gh_program_for_queue = gh_program.clone();
+    let gh_program_for_jobs = gh_program.clone();
     // One network read feeds both pools. `--paginate` + `--slurp` mirrors `pr_query_runners` in
     // `scripts/lib/pick-runner.sh`, and it is a CORRECTNESS fix rather than tuning: registrations
     // exceed the live-VM ceiling because stale/offline ghosts accrue until the reaper clears them, so
@@ -3199,9 +3274,24 @@ fn runner_components(
             _ => None,
         }
     });
-    let queued_age = queued_json
-        .as_deref()
-        .and_then(|j| read_oldest_queued_age_secs(j, now_epoch_secs()));
+    // Drop queued runs that created ZERO jobs before anything reads the page (bead
+    // `sparkle-35on1g`): one never-schedulable zombie otherwise pins the queue at a weeks-old age.
+    let now = now_epoch_secs();
+    let queued_json = queued_json.map(|page| {
+        drop_jobless_queued_runs(&page, now, |id| {
+            let program = gh_program_for_jobs.as_deref()?;
+            let mut cmd = Command::new(program);
+            cmd.arg("api")
+                .arg(format!("repos/{RELEASE_REPO}/actions/runs/{id}/jobs?per_page=1"))
+                .current_dir(root);
+            apply_noninteractive(&mut cmd);
+            match crate::worktree::output_with_timeout(cmd, RUNNER_QUERY_TIMEOUT) {
+                Ok(o) if o.status.success() => read_run_job_count(&String::from_utf8_lossy(&o.stdout)),
+                _ => None,
+            }
+        })
+    });
+    let queued_age = queued_json.as_deref().and_then(|j| read_oldest_queued_age_secs(j, now));
     let queued = queued_json.as_deref().and_then(read_queued_runs);
 
     let ci = json.as_deref().and_then(|j| read_runner_pool(j, CI_RUNNER_LABEL));
@@ -5090,6 +5180,62 @@ mod tests {
         // A local clock behind GitHub's is "just queued", not a wrapped huge age.
         let future = r#"{"workflow_runs":[{"created_at":"2026-10-23T12:20:00Z"}]}"#;
         assert_eq!(read_oldest_queued_age_secs(future, now), Some(0));
+    }
+
+    /// bead `sparkle-35on1g`: a queued run that created ZERO jobs is not work. Measured: a
+    /// `workflow_run` Release-reconcile run sat queued 20+ days with no jobs, pinning queued=1 at a
+    /// 20-day age, so with an EMPTY pool every ~3-minute cold start fired a false BLOCKING. Composed
+    /// exactly as `runner_components` composes it: drop, then count + age, then classify.
+    #[test]
+    fn a_jobless_twenty_day_queued_run_never_reads_as_blocking() {
+        let now = github_ts_to_epoch("2026-10-28T12:00:00Z").unwrap();
+        let zombie = r#"{"id":37655512958,"name":"Release reconcile","event":"workflow_run",
+            "created_at":"2026-10-08T12:00:00Z","run_started_at":"2026-10-08T12:00:00Z"}"#;
+        let young = r#"{"id":42,"created_at":"2026-10-28T11:59:00Z","run_started_at":"2026-10-28T11:59:00Z"}"#;
+        let only_zombie = format!(r#"{{"total_count":1,"workflow_runs":[{zombie}]}}"#);
+        let zombie_and_young = format!(r#"{{"total_count":2,"workflow_runs":[{young},{zombie}]}}"#);
+        let empty = runners_json(&[("sparkle-release", "online", false)]);
+        let pool = read_runner_pool(&empty, CI_RUNNER_LABEL);
+        let classify = |page: &str, jobs: Option<usize>| {
+            let mut probed = Vec::new();
+            let page = drop_jobless_queued_runs(page, now, |id| {
+                probed.push(id);
+                if id == 37655512958 { jobs } else { Some(4) }
+            });
+            assert_eq!(probed, vec![37655512958], "only runs past the boot grace are probed");
+            let (q, age) = (read_queued_runs(&page), read_oldest_queued_age_secs(&page, now));
+            (q, classify_ci_pool_aged(pool, q, age))
+        };
+
+        // Empty pool + only the zombie: the idle floor, HEALTHY.
+        let (q, (state, detail)) = classify(&only_zombie, Some(0));
+        assert_eq!(q, Some(0), "a job-less run is not queued work");
+        assert_eq!(state, HealthState::Healthy, "the idle floor, not an outage: {detail}");
+
+        // Empty pool + zombie + a run queued 60s ago: booting from zero, WARNING — never BLOCKING.
+        let (q, (state, detail)) = classify(&zombie_and_young, Some(0));
+        assert_eq!(q, Some(1), "the zombie drops while the real young run stays counted");
+        assert_eq!(state, HealthState::Warning, "a boot in progress: {detail}");
+        assert!(detail.contains("booting from zero"), "{detail}");
+
+        // PAIRED: the SAME old run WITH jobs is a real stuck run, and a jobs read that FAILS keeps it
+        // counted — "could not see its jobs" must never read as "has no jobs".
+        assert_eq!(classify(&only_zombie, Some(3)).1 .0, HealthState::Blocking);
+        assert_eq!(classify(&only_zombie, None).1 .0, HealthState::Blocking, "unreadable fails closed");
+    }
+
+    /// Never probe more than [`CI_JOBLESS_PROBE_MAX`] runs, oldest first; garbage pages probe nothing.
+    #[test]
+    fn jobless_probe_is_capped_oldest_first() {
+        let now = github_ts_to_epoch("2026-10-28T12:00:00Z").unwrap();
+        let runs: Vec<String> = (0..8)
+            .map(|i| format!(r#"{{"id":{i},"created_at":"2026-10-0{}T00:00:00Z"}}"#, 8 - i))
+            .collect();
+        let page = format!(r#"{{"total_count":8,"workflow_runs":[{}]}}"#, runs.join(","));
+        assert_eq!(jobless_probe_candidates(&page, now), vec![7, 6, 5, 4, 3]);
+        assert!(jobless_probe_candidates(r#"{"message":"Bad credentials"}"#, now).is_empty());
+        assert_eq!(read_run_job_count(r#"{"total_count":0,"jobs":[]}"#), Some(0));
+        assert_eq!(read_run_job_count(r#"{"message":"Not Found"}"#), None, "an error is not zero jobs");
     }
 
     /// bead `sparkle-ot4dxb`: HEALTHY SATURATION MUST NOT ALARM, but the SAME pool WITH a real
